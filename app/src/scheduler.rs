@@ -782,6 +782,26 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn unknown_widget_instance_is_not_shown_or_run_but_is_saved() {
+        let runs = Arc::new(Mutex::new(Vec::<String>::new()));
+        let r = runs.clone();
+        let mut orphan = inst(2, false);
+        orphan.widget = "gone".into();
+        let rig = Rig::start(data(vec![inst(1, false), orphan]), move |who| {
+            r.lock().unwrap().push(who.to_string());
+            Ok(out("x"))
+        });
+        advance(3).await;
+        assert_eq!(rig.last().slots.len(), 1);
+        assert_eq!(rig.last().slots[0].id, id(1));
+        assert!(runs.lock().unwrap().iter().all(|w| *w == id(1)));
+        rig.handle.set_hidden(&id(1), true);
+        assert!(rig.handle.flush_saves(Duration::from_secs(5)));
+        let saved = crate::instances::load(&rig.path);
+        assert!(saved.instances.iter().any(|i| i.id == id(2) && i.widget == "gone"));
+    }
+
     #[test]
     fn saver_writes_synchronously_when_its_thread_cannot_start() {
         let dir = tempfile::tempdir().unwrap();
