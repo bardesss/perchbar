@@ -237,13 +237,15 @@ enum SendError {
     Failed(String),
 }
 
-/// Every widget request goes through here: the allow-list is checked first.
+/// Every widget request goes through here: the URL allow-list and the header
+/// deny-list are checked first.
 async fn send(
     http: &dyn HttpClient,
     mut req: HttpRequest,
     allowed: &[String],
 ) -> Result<HttpResponse, SendError> {
     permissions::check_url(&req.url, allowed).map_err(SendError::Denied)?;
+    permissions::check_headers(&req.headers).map_err(SendError::Denied)?;
     req.allowed_hosts = allowed.to_vec();
     http.send(req).await.map_err(SendError::Failed)
 }
@@ -567,5 +569,17 @@ mod tests {
         let res = f.run().await;
         assert!(matches!(res, Err(RunError::Timeout)), "{res:?}");
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn forbidden_header_rejects_fetch_with_type_error() {
+        let mut f = Fixture::new(&returning(
+            "await (async () => { try { await fetch(\"https://api.example.com/x\",              { headers: { Host: \"evil.com\" } }); return \"sent\"; }              catch (e) { return e.name + \": \" + e.message; } })()",
+        ));
+        f.network = vec!["api.example.com".into()];
+        assert_eq!(
+            text(&f.run().await.unwrap()),
+            "TypeError: Perchbar: header not allowed: Host"
+        );
     }
 }
