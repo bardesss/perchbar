@@ -157,10 +157,23 @@ impl Instances {
             .retain(|g| has_id_shape(&g.id, "grp-") && seen.insert(g.id.clone()));
     }
 
-    /// Repairs the data against the installed widgets and itself.
+    /// Repairs the data against itself. Instances whose widget is not
+    /// installed (or failed to load) are kept, so a broken widget folder
+    /// never loses their settings on the next save; the scheduler leaves
+    /// them out of the strip and does not run them.
     pub fn normalize(&mut self, known_widgets: &HashSet<String>) {
         self.drop_malformed_ids();
-        self.instances.retain(|i| known_widgets.contains(&i.widget));
+        for i in self
+            .instances
+            .iter()
+            .filter(|i| !known_widgets.contains(&i.widget))
+        {
+            log::info!(
+                "instance {} uses widget {:?}, which is not loaded; keeping it hidden from the strip",
+                i.id,
+                i.widget
+            );
+        }
 
         let instance_ids: HashSet<String> = self.instances.iter().map(|i| i.id.clone()).collect();
         let mut grouped: HashSet<String> = HashSet::new();
@@ -256,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_drops_unknown_widget_and_empty_group() {
+    fn normalize_keeps_unknown_widget_instances_and_drops_empty_groups() {
         let mut data = Instances {
             instances: vec![
                 inst("inst-00000001", "weather"),
@@ -266,12 +279,37 @@ mod tests {
                 group("grp-00000001", &["inst-00000002", "inst-ffffffff"], 8),
                 group("grp-00000002", &[], 8),
             ],
-            order: vec!["inst-00000002".into(), "grp-00000001".into()],
+            order: vec!["grp-00000001".into()],
         };
         data.normalize(&known(&["weather"]));
-        assert_eq!(data.instances.len(), 1);
-        assert!(data.groups.is_empty());
-        assert_eq!(data.order, vec!["inst-00000001".to_string()]);
+        assert_eq!(data.instances.len(), 2);
+        assert_eq!(data.groups.len(), 1);
+        assert_eq!(data.groups[0].members, ["inst-00000002"]);
+        assert_eq!(
+            data.order,
+            vec!["grp-00000001".to_string(), "inst-00000001".to_string()]
+        );
+    }
+
+    #[test]
+    fn unknown_widget_instance_survives_load_save_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instances.json");
+        let mut data = Instances::default();
+        let kept = data.new_instance(&manifest("weather"));
+        let orphan = data.new_instance(&manifest("uninstalled"));
+        data.instances[1].settings.insert("city".into(), json!("Oslo"));
+        save(&path, &data).unwrap();
+
+        let mut loaded = load(&path);
+        loaded.normalize(&known(&["weather"]));
+        save(&path, &loaded).unwrap();
+
+        let again = load(&path);
+        let ids: Vec<&str> = again.instances.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, [kept.as_str(), orphan.as_str()]);
+        assert_eq!(again.instances[1].settings["city"], json!("Oslo"));
+        assert_eq!(again.order, vec![kept, orphan]);
     }
 
     #[test]
