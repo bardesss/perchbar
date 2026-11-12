@@ -6,12 +6,147 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use std::time::Duration;
+
 use chrono::{DateTime, Datelike, Offset, TimeZone, Timelike};
 use rquickjs::{Ctx, Exception, Function};
 use serde_json::{json, Map, Value};
 
+use super::{permissions, HttpClient, HttpFuture, HttpRequest, HttpResponse};
+
 /// Maximum serialized size of one instance's storage object.
 pub const STORAGE_MAX_BYTES: usize = 64 * 1024;
+
+/// Largest response body a widget can receive.
+pub const RESPONSE_MAX_BYTES: usize = 2 * 1024 * 1024;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+tokio::task_local! {
+    /// The hosts allowed for the request being sent on this task. The redirect
+    /// policy runs inside the polling task, so it reads the list from here.
+    /// Unset means nothing is allowed.
+    static ALLOWED_HOSTS: Vec<String>;
+}
+
+/// The real HTTPS client: rustls, a 10 s timeout, a 2 MB body cap, and a
+/// redirect policy that re-checks the allow-list on every hop (max 5).
+pub struct ReqwestClient {
+    client: reqwest::Client,
+}
+
+impl ReqwestClient {
+    pub fn new() -> Self {
+        let policy = reqwest::redirect::Policy::custom(|attempt| {
+            let mut chain = attempt.previous().to_vec();
+            chain.push(attempt.url().clone());
+            let allowed = ALLOWED_HOSTS.try_with(Clone::clone).unwrap_or_default();
+            if permissions::redirect_allowed(&chain, &allowed) {
+                attempt.follow()
+            } else {
+                attempt.error("Perchbar: redirect blocked")
+            }
+        });
+        let client = reqwest::Client::builder()
+            .use_rustls_tls()
+            .timeout(REQUEST_TIMEOUT)
+            .user_agent(concat!("Perchbar/", env!("CARGO_PKG_VERSION")))
+            .redirect(policy)
+            .build()
+            .expect("http client configuration is valid");
+        ReqwestClient { client }
+    }
+
+    async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse, String> {
+        let method = reqwest::Method::from_bytes(req.method.as_bytes())
+            .map_err(|_| format!("invalid method {:?}", req.method))?;
+        let mut builder = self.client.request(method, &req.url);
+        for (name, value) in &req.headers {
+            builder = builder.header(name, value);
+        }
+        if let Some(body) = req.body {
+            builder = builder.body(body);
+        }
+        let mut resp = builder.send().await.map_err(|e| describe(&e))?;
+        let status = resp.status().as_u16();
+        let headers = resp
+            .headers()
+            .iter()
+            .filter_map(|(k, v)| Some((k.to_string(), v.to_str().ok()?.to_string())))
+            .collect();
+        let mut body = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|e| describe(&e))? {
+            if body.len() + chunk.len() > RESPONSE_MAX_BYTES {
+                return Err(format!("response larger than {RESPONSE_MAX_BYTES} bytes"));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(HttpResponse {
+            status,
+            headers,
+            body: String::from_utf8_lossy(&body).into_owned(),
+        })
+    }
+}
+
+impl Default for ReqwestClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HttpClient for ReqwestClient {
+    fn send(&self, req: HttpRequest) -> HttpFuture<'_> {
+        let allowed = req.allowed_hosts.clone();
+        Box::pin(ALLOWED_HOSTS.scope(allowed, self.fetch(req)))
+    }
+}
+
+/// An error message that includes the cause chain (reqwest hides redirect and
+/// TLS causes behind a generic top-level message).
+fn describe(e: &reqwest::Error) -> String {
+    let mut msg = e.to_string();
+    let mut source = std::error::Error::source(e);
+    while let Some(cause) = source {
+        msg.push_str(": ");
+        msg.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    msg
+}
+
+/// Each log message is cut to this many bytes.
+pub const LOG_MESSAGE_MAX_BYTES: usize = 1024;
+/// Log calls beyond this many per run are dropped.
+pub const LOG_MAX_CALLS: usize = 200;
+
+/// Caps widget logging per run so a noisy widget cannot flood the log.
+#[derive(Debug, Default)]
+pub struct LogLimiter {
+    calls: usize,
+}
+
+impl LogLimiter {
+    /// The text to log for this call, or `None` if it must be dropped.
+    pub fn admit(&mut self, msg: &str) -> Option<String> {
+        self.calls += 1;
+        match self.calls {
+            n if n <= LOG_MAX_CALLS => Some(truncate_to_boundary(msg, LOG_MESSAGE_MAX_BYTES)),
+            n if n == LOG_MAX_CALLS + 1 => Some("log limit reached".to_string()),
+            _ => None,
+        }
+    }
+}
+
+fn truncate_to_boundary(msg: &str, max: usize) -> String {
+    if msg.len() <= max {
+        return msg.to_string();
+    }
+    let mut end = max;
+    while !msg.is_char_boundary(end) {
+        end -= 1;
+    }
+    msg[..end].to_string()
+}
 
 /// One instance's persisted key/value store (a single JSON object on disk).
 #[derive(Debug)]
@@ -140,8 +275,11 @@ pub fn install<'js>(
     )?;
     globals.set("__host_storage_set", set)?;
 
+    let limiter = Mutex::new(LogLimiter::default());
     let log = Function::new(ctx.clone(), move |msg: String| {
-        log::info!(target: "widget", "[{instance_id}] {msg}");
+        if let Some(line) = limiter.lock().unwrap().admit(&msg) {
+            log::info!(target: "widget", "[{instance_id}] {line}");
+        }
     })?;
     globals.set("__host_log", log)?;
 
@@ -160,6 +298,87 @@ pub fn install<'js>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serves one canned raw HTTP response to each of `n` connections.
+    async fn serve(response: Vec<u8>, n: usize) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..n {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(&response).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    fn get(url: &str, allowed: &[&str]) -> HttpRequest {
+        HttpRequest {
+            method: "GET".into(),
+            url: url.into(),
+            headers: Vec::new(),
+            body: None,
+            allowed_hosts: allowed.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn client_returns_small_body() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+        let url = serve(raw.to_vec(), 1).await;
+        let resp = ReqwestClient::new().send(get(&url, &[])).await.unwrap();
+        assert_eq!((resp.status, resp.body.as_str()), (200, "hi"));
+    }
+
+    #[tokio::test]
+    async fn client_rejects_body_over_2mb() {
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            RESPONSE_MAX_BYTES + 1
+        );
+        let mut raw = head.into_bytes();
+        raw.extend(std::iter::repeat_n(b'a', RESPONSE_MAX_BYTES + 1));
+        let url = serve(raw, 1).await;
+        let err = ReqwestClient::new().send(get(&url, &[])).await.unwrap_err();
+        assert!(err.contains("larger than"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn client_blocks_redirect_to_undeclared_host() {
+        let raw = "HTTP/1.1 302 Found\r\nLocation: https://evil.com/x\r\nContent-Length: 0\r\n\r\n";
+        let url = serve(raw.as_bytes().to_vec(), 1).await;
+        let err = ReqwestClient::new()
+            .send(get(&url, &["127.0.0.1"]))
+            .await
+            .unwrap_err();
+        assert!(err.contains("redirect blocked"), "{err}");
+    }
+
+    #[test]
+    fn log_messages_are_truncated_on_a_char_boundary() {
+        let mut l = LogLimiter::default();
+        let long = "a".repeat(5000);
+        assert_eq!(l.admit(&long).unwrap().len(), LOG_MESSAGE_MAX_BYTES);
+        // 1023 ASCII bytes then a 2-byte char straddling the limit.
+        let tricky = format!("{}é{}", "a".repeat(1023), "b".repeat(10));
+        assert_eq!(l.admit(&tricky).unwrap().len(), 1023);
+        assert_eq!(l.admit("short").as_deref(), Some("short"));
+    }
+
+    #[test]
+    fn log_calls_are_capped_per_run() {
+        let mut l = LogLimiter::default();
+        for i in 0..LOG_MAX_CALLS {
+            assert_eq!(l.admit("x").as_deref(), Some("x"), "call {i}");
+        }
+        assert_eq!(l.admit("x").as_deref(), Some("log limit reached"));
+        assert_eq!(l.admit("x"), None);
+        assert_eq!(l.admit("x"), None);
+    }
 
     #[test]
     fn storage_cap_rejects_and_keeps_previous_value() {
