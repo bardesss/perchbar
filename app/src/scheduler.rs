@@ -72,17 +72,39 @@ struct SaverState {
 /// among them) never wait for the disk. Snapshots are submitted in the order
 /// the state changed; the thread always writes the newest one and skips any
 /// it was too slow to write, so the file ends up matching the last change.
+///
+/// If the thread cannot start, `submit` writes synchronously instead: disk
+/// I/O on the caller is the lesser evil next to losing changes.
 struct Saver {
     state: Arc<(Mutex<SaverState>, Condvar)>,
+    /// Set only when the thread failed to start.
+    fallback: Option<(PathBuf, Writer)>,
 }
+
+/// Starts a job on a new thread. Injectable so tests can make it fail.
+type SpawnJob = Box<dyn FnOnce() + Send>;
 
 impl Saver {
     fn start(path: PathBuf, writer: Writer) -> Saver {
+        Self::start_with(path, writer, |job: SpawnJob| {
+            std::thread::Builder::new()
+                .name("perchbar-saver".into())
+                .spawn(job)
+                .map(|_| ())
+        })
+    }
+
+    fn start_with(
+        path: PathBuf,
+        writer: Writer,
+        spawn: impl FnOnce(SpawnJob) -> std::io::Result<()>,
+    ) -> Saver {
         let state: Arc<(Mutex<SaverState>, Condvar)> = Arc::default();
         let shared = Arc::clone(&state);
-        let spawned = std::thread::Builder::new()
-            .name("perchbar-saver".into())
-            .spawn(move || {
+        let (thread_path, thread_writer) = (path.clone(), writer.clone());
+        let spawned = spawn(Box::new(move || {
+            let (path, writer) = (thread_path, thread_writer);
+            {
                 let (lock, cv) = &*shared;
                 let mut s = lock.lock().unwrap_or_else(|p| p.into_inner());
                 loop {
@@ -101,15 +123,27 @@ impl Saver {
                         s = cv.wait(s).unwrap_or_else(|p| p.into_inner());
                     }
                 }
-            });
-        if let Err(e) = spawned {
-            log::warn!("cannot start the instances saver: {e}");
-        }
-        Saver { state }
+            }
+        }));
+        let fallback = match spawned {
+            Ok(()) => None,
+            Err(e) => {
+                log::warn!("cannot start the instances saver ({e}); saving synchronously");
+                Some((path, writer))
+            }
+        };
+        Saver { state, fallback }
     }
 
-    /// Queues a snapshot. Never blocks on the disk.
+    /// Queues a snapshot. Never blocks on the disk, except in the fallback
+    /// mode where there is no saver thread.
     fn submit(&self, snapshot: Instances) {
+        if let Some((path, writer)) = &self.fallback {
+            if let Err(e) = writer(path, &snapshot) {
+                log::warn!("cannot save instances: {e}");
+            }
+            return;
+        }
         let (lock, cv) = &*self.state;
         lock.lock().unwrap_or_else(|p| p.into_inner()).latest = Some(snapshot);
         cv.notify_all();
@@ -745,6 +779,30 @@ mod tests {
                 .unwrap()
                 .hidden
         );
+    }
+
+    #[test]
+    fn saver_writes_synchronously_when_its_thread_cannot_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instances.json");
+        let writes = Arc::new(AtomicUsize::new(0));
+        let w = writes.clone();
+        let writer: Writer = Arc::new(move |p: &Path, d: &Instances| {
+            w.fetch_add(1, Ordering::SeqCst);
+            instances::save(p, d)
+        });
+        let saver = Saver::start_with(path.clone(), writer, |_job| {
+            Err(std::io::Error::other("no threads"))
+        });
+        saver.submit(data(vec![inst(1, true)]));
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+        assert!(instances::load(&path).instances[0].hidden);
+        saver.submit(data(vec![inst(1, false)]));
+        assert!(!instances::load(&path).instances[0].hidden);
+        // Nothing is pending, so a flush (and shutdown) returns at once.
+        let t0 = std::time::Instant::now();
+        assert!(saver.flush(Duration::from_secs(5)));
+        assert!(t0.elapsed() < Duration::from_millis(500));
     }
 
     #[test]

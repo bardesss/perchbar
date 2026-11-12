@@ -52,6 +52,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_LAYERED,
     WS_EX_NOACTIVATE, WS_EX_NOPARENTNOTIFY, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
+use windows::Win32::UI::WindowsAndMessaging::{PA_NOACTIVATE, WM_POINTERACTIVATE};
 
 use crate::display::Block;
 use crate::scheduler::SchedulerHandle;
@@ -1550,6 +1551,9 @@ unsafe extern "system" fn strip_proc(
 ) -> LRESULT {
     match msg {
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        // The touch and pen version of WM_MOUSEACTIVATE: DefWindowProc asks
+        // the parent (Explorer) the same way.
+        WM_POINTERACTIVATE => LRESULT(PA_NOACTIVATE as isize),
         WM_MOUSEMOVE => {
             let x = lparam_x(lparam);
             with_state(|s| s.on_mouse_move(x));
