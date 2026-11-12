@@ -86,7 +86,10 @@ impl FileLogger {
 impl FileLogger {
     /// How many times rotation was tried (for tests and diagnostics).
     pub fn rotation_attempts(&self) -> u32 {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).attempts
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .attempts
     }
 }
 

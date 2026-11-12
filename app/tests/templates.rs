@@ -207,13 +207,20 @@ async fn bitcoin_template_only_calls_coinbase() {
 #[tokio::test]
 async fn bitcoin_template_reports_missing_price_clearly() {
     let w = Installed::new();
-    for body in [r#"{"errors":[{"id":"not_found"}]}"#, "null", r#"{"data":null}"#] {
+    for body in [
+        r#"{"errors":[{"id":"not_found"}]}"#,
+        "null",
+        r#"{"data":null}"#,
+    ] {
         let res = w
             .run("bitcoin-price", json!({}), FakeHttp::with(&[body]))
             .await;
         match res {
             Err(RunError::Script(m)) => {
-                assert!(m.contains("Coinbase sent no price for BTC-USD"), "{body}: {m}")
+                assert!(
+                    m.contains("Coinbase sent no price for BTC-USD"),
+                    "{body}: {m}"
+                )
             }
             other => panic!("{body}: expected Script error, got {other:?}"),
         }
