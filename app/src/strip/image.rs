@@ -17,6 +17,10 @@ pub const MAX_ICON_BYTES: u64 = 256 * 1024;
 const MAX_PNG_SIDE: u32 = 1024;
 /// Decoder allocation cap for PNGs (guards against decompression bombs).
 const MAX_PNG_DECODE_BYTES: usize = 8 * 1024 * 1024;
+/// usvg nesting limit; its converter recurses once per level.
+const SVG_MAX_DEPTH: u32 = 32;
+/// Stack for the SVG worker thread.
+const SVG_THREAD_STACK: usize = 16 * 1024 * 1024;
 /// Entries kept before the cache is emptied (old mtimes pile up otherwise).
 const MAX_ENTRIES: usize = 256;
 
@@ -125,7 +129,7 @@ fn load(path: &Path, size_px: u32) -> Result<Bitmap, String> {
         .and_then(|e| e.to_str())
         .map(str::to_ascii_lowercase);
     let pixmap = match ext.as_deref() {
-        Some("svg") => rasterize_svg(&data, size_px)?,
+        Some("svg") => rasterize_svg_isolated(data, size_px)?,
         Some("png") => scale_png(&data, size_px)?,
         _ => return Err("not .svg or .png".into()),
     };
@@ -141,9 +145,23 @@ fn svg_tree(data: &[u8]) -> Option<usvg::Tree> {
             resolve_data: Box::new(|_, _, _| None),
             resolve_string: Box::new(|_, _| None),
         },
+        max_depth: SVG_MAX_DEPTH,
         ..usvg::Options::default()
     };
     usvg::Tree::from_data(data, &opt).ok()
+}
+
+/// Parses and rasterizes on a fresh thread with a large stack, so a deeply
+/// nested file can never overflow the caller's stack (an overflow aborts the
+/// process and cannot be caught). Loads are rare and cached.
+fn rasterize_svg_isolated(data: Vec<u8>, size: u32) -> Result<Pixmap, String> {
+    std::thread::Builder::new()
+        .name("svg-icon".into())
+        .stack_size(SVG_THREAD_STACK)
+        .spawn(move || rasterize_svg(&data, size))
+        .map_err(|e| format!("cannot start SVG thread: {e}"))?
+        .join()
+        .map_err(|_| "SVG rasterizer panicked".to_string())?
 }
 
 /// Uniform scale and offset that fit `w` x `h` centered in a square.
@@ -379,6 +397,50 @@ mod tests {
         assert!(c.get(dir.path(), "missing.svg", 16, None).is_none());
         assert!(c.get(dir.path(), "bad.svg", 16, None).is_none());
         assert!(c.get(dir.path(), "bad.png", 16, None).is_none());
+    }
+
+    #[test]
+    fn deeply_nested_svg_is_rejected_without_crashing() {
+        // Runs on the test thread: a stack overflow here would abort the
+        // whole test binary, so passing proves the caller's stack is safe.
+        let depth = 1000;
+        let mut svg = String::from(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 4">"#);
+        svg.push_str(&r#"<g opacity=".9">"#.repeat(depth));
+        svg.push_str(r#"<rect width="4" height="4"/>"#);
+        svg.push_str(&"</g>".repeat(depth));
+        svg.push_str("</svg>");
+        assert!(svg.len() < MAX_ICON_BYTES as usize);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("deep.svg"), svg).unwrap();
+        let mut c = ImageCache::new();
+        if let Some(b) = c.get(dir.path(), "deep.svg", 16, None) {
+            assert_eq!((b.width, b.height), (16, 16));
+        }
+    }
+
+    #[test]
+    fn use_fan_out_svg_finishes() {
+        // Each level references the previous one ten times: 10^8 rects if
+        // expanded naively.
+        let mut svg = String::from(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 4 4"><defs><rect id="l0" width="1" height="1"/>"#,
+        );
+        for level in 1..=8 {
+            svg.push_str(&format!(r#"<g id="l{level}">"#));
+            for _ in 0..10 {
+                svg.push_str(&format!(r##"<use xlink:href="#l{}"/>"##, level - 1));
+            }
+            svg.push_str("</g>");
+        }
+        svg.push_str(r##"</defs><use xlink:href="#l8"/></svg>"##);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("fan.svg"), svg).unwrap();
+        let start = std::time::Instant::now();
+        let mut c = ImageCache::new();
+        if let Some(b) = c.get(dir.path(), "fan.svg", 16, None) {
+            assert_eq!((b.width, b.height), (16, 16));
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]

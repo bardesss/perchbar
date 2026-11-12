@@ -19,8 +19,8 @@ pub const DEFAULT_BAR_WIDTH_DIP: f32 = 32.0;
 pub const BAR_HEIGHT_DIP: f32 = 4.0;
 pub const SPARK_WIDTH_DIP: f32 = 32.0;
 pub const SPARK_HEIGHT_DIP: f32 = 14.0;
-pub const NORMAL_TEXT_PT: f32 = 12.0;
-pub const SMALL_TEXT_PT: f32 = 9.0;
+pub const NORMAL_TEXT_DIP: f32 = 12.0;
+pub const SMALL_TEXT_DIP: f32 = 9.0;
 pub const PLUS_N_PAD_DIP: f32 = 8.0;
 /// Minimum gap between the strip and the app buttons; applied by the caller
 /// when it computes `Metrics::available_dip`.
