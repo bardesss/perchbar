@@ -15,6 +15,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 rand = "0.9"
+rquickjs = { version = "0.14", features = ["futures", "parallel"] }
+chrono-tz = "0.10"
+chrono = "0.4"
+log = "0.4"
+tokio = { version = "1", features = ["time"] }
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
