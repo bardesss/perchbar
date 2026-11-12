@@ -1,5 +1,7 @@
 // Wired up by later tasks.
 #[allow(dead_code)]
+mod display;
+#[allow(dead_code)]
 mod manifest;
 #[allow(dead_code)]
 mod paths;
