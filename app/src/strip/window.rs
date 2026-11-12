@@ -70,6 +70,8 @@ const WM_APP_EVENTS: u32 = WM_APP;
 const WM_APP_TICK: u32 = WM_APP + 1;
 /// The UI Automation worker stored a result.
 const WM_APP_BUTTONS: u32 = WM_APP + 2;
+/// The icon worker finished a custom icon.
+const WM_APP_ICONS: u32 = WM_APP + 3;
 /// The strip-creation warning is logged at most this often.
 const CREATE_WARN_INTERVAL: Duration = Duration::from_secs(60);
 /// Not exported by the `windows` features in use.
@@ -317,7 +319,7 @@ fn setup(
             None,
         )?
     };
-    let renderer = Renderer::new()?;
+    let renderer = Renderer::with_icon_notify(std::sync::Arc::new(|| post_to_ctl(WM_APP_ICONS)))?;
     let (dark, palette) = theme::current();
     STATE.with(|s| {
         *s.borrow_mut() = Some(State {
@@ -393,6 +395,8 @@ impl State {
         }
         if let Some(m) = latest {
             let old = std::mem::replace(&mut self.model, m);
+            // Widget files may have changed; icons re-resolve off-thread.
+            self.renderer.invalidate_icons();
             note_updates(&old, &self.model, Local::now(), &mut self.updated);
             self.rot.tick(&self.model, Instant::now() + ROTATE_SLACK);
             self.update_rotation_timer();
@@ -494,6 +498,14 @@ impl State {
             }
         }
         self.refresh();
+    }
+
+    /// Redraws when the icon worker delivered something visible.
+    fn on_icons(&mut self) {
+        if self.renderer.poll_icons() {
+            self.key = None;
+            self.refresh();
+        }
     }
 
     /// Applies a finished UI Automation search.
@@ -1539,6 +1551,13 @@ unsafe extern "system" fn ctl_proc(
             if with_state(State::on_buttons).is_none() {
                 // Busy: try again from the loop.
                 post_to_ctl(WM_APP_BUTTONS);
+            }
+            LRESULT(0)
+        }
+        WM_APP_ICONS => {
+            if with_state(State::on_icons).is_none() {
+                // Busy: try again from the loop.
+                post_to_ctl(WM_APP_ICONS);
             }
             LRESULT(0)
         }

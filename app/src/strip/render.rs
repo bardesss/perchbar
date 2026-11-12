@@ -310,7 +310,15 @@ fn text_format(
 }
 
 impl Renderer {
+    /// A renderer whose custom icons are rasterized without notification
+    /// (offline renders and tests call `settle_icons`).
     pub fn new() -> windows::core::Result<Self> {
+        Self::with_icon_notify(std::sync::Arc::new(|| {}))
+    }
+
+    /// A renderer that calls `notify` from the icon worker thread whenever
+    /// a custom icon finished rasterizing; the strip then redraws.
+    pub fn with_icon_notify(notify: crate::strip::image::Notify) -> windows::core::Result<Self> {
         // SAFETY: factory creation and font lookups with valid arguments.
         unsafe {
             let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
@@ -337,9 +345,24 @@ impl Renderer {
                 dwrite,
                 round,
                 target: None,
-                images: ImageCache::new(),
+                images: ImageCache::with_notify(notify),
             })
         }
+    }
+
+    /// Takes finished icons; true when a redraw would show something new.
+    pub fn poll_icons(&mut self) -> bool {
+        self.images.poll()
+    }
+
+    /// Re-resolves every icon on its next draw, off the strip thread.
+    pub fn invalidate_icons(&mut self) {
+        self.images.invalidate();
+    }
+
+    /// Waits for pending icons. Never call this on the strip thread.
+    pub fn settle_icons(&mut self, timeout: std::time::Duration) -> bool {
+        self.images.settle(timeout)
     }
 
     fn format(&self, size: TextSize) -> &IDWriteTextFormat {
