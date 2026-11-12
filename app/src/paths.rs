@@ -2,12 +2,26 @@
 
 use std::path::PathBuf;
 
-/// `%APPDATA%\Perchbar` (falls back to `.\Perchbar` if APPDATA is unset).
+/// Development and test override for the data directory.
+pub const DATA_DIR_ENV: &str = "PERCHBAR_DATA_DIR";
+
+/// `%PERCHBAR_DATA_DIR%` when set, otherwise `%APPDATA%\Perchbar` (falling
+/// back to `.\Perchbar` if APPDATA is unset).
 pub fn data_dir() -> PathBuf {
-    std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("Perchbar")
+    resolve_data_dir(std::env::var_os(DATA_DIR_ENV), std::env::var_os("APPDATA"))
+}
+
+fn resolve_data_dir(
+    overridden: Option<std::ffi::OsString>,
+    appdata: Option<std::ffi::OsString>,
+) -> PathBuf {
+    match overridden.filter(|o| !o.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => appdata
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Perchbar"),
+    }
 }
 
 pub fn widgets_dir() -> PathBuf {
@@ -33,9 +47,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn override_wins_over_appdata() {
+        let r = |o: Option<&str>, a: Option<&str>| {
+            resolve_data_dir(o.map(Into::into), a.map(Into::into))
+        };
+        assert_eq!(
+            r(None, Some("C:\\A")),
+            PathBuf::from("C:\\A").join("Perchbar")
+        );
+        assert_eq!(r(Some("D:\\t"), Some("C:\\A")), PathBuf::from("D:\\t"));
+        assert_eq!(
+            r(Some(""), Some("C:\\A")),
+            PathBuf::from("C:\\A").join("Perchbar")
+        );
+        assert_eq!(r(None, None), PathBuf::from(".").join("Perchbar"));
+    }
+
+    #[test]
     fn layout_is_under_data_dir() {
         let d = data_dir();
-        assert!(d.ends_with("Perchbar"));
         assert_eq!(widgets_dir(), d.join("widgets"));
         assert_eq!(instances_file(), d.join("instances.json"));
         assert_eq!(storage_file("abc"), d.join("storage").join("abc.json"));

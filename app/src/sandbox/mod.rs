@@ -2,6 +2,7 @@
 //! memory limits and a minimal host API (fetch, storage, log, time, format).
 
 mod host;
+pub use host::ReqwestClient;
 mod permissions;
 
 use std::future::Future;
