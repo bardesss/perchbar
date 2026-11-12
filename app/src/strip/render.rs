@@ -42,7 +42,7 @@ use crate::display::{Block, Color, Output, TextSize};
 use crate::strip::icons;
 use crate::strip::layout::{
     block_width, px, Measure, Metrics, PlacedSlot, StripLayout, BAR_HEIGHT_DIP, BLOCK_GAP_DIP,
-    ICON_DIP, NORMAL_TEXT_PT, RING_DIP, SLOT_PAD_DIP, SMALL_TEXT_PT, SPARK_HEIGHT_DIP,
+    ICON_DIP, NORMAL_TEXT_DIP, RING_DIP, SLOT_PAD_DIP, SMALL_TEXT_DIP, SPARK_HEIGHT_DIP,
 };
 use crate::strip::model::{SlotKind, SlotState, StripModel};
 use crate::strip::theme::{resolve, Palette};
@@ -330,8 +330,8 @@ impl Renderer {
                 None,
             )?;
             Ok(Renderer {
-                normal: text_format(&dwrite, &text, NORMAL_TEXT_PT)?,
-                small: text_format(&dwrite, &text, SMALL_TEXT_PT)?,
+                normal: text_format(&dwrite, &text, NORMAL_TEXT_DIP)?,
+                small: text_format(&dwrite, &text, SMALL_TEXT_DIP)?,
                 icon: text_format(&dwrite, &icon, ICON_GLYPH_DIP)?,
                 d2d,
                 dwrite,
