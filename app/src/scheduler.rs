@@ -203,6 +203,9 @@ struct Inner {
 }
 
 struct Shared {
+    /// The runtime the scheduler started in. Loops are spawned through it,
+    /// so handle methods work from threads outside the runtime (the strip).
+    runtime: tokio::runtime::Handle,
     widgets: HashMap<String, (Arc<Manifest>, Arc<PathBuf>)>,
     http: Arc<dyn HttpClient>,
     runner: Runner,
@@ -334,6 +337,7 @@ impl Scheduler {
         publish: impl Fn(StripModel) + Send + Sync + 'static,
     ) -> SchedulerHandle {
         let shared = Arc::new(Shared {
+            runtime: tokio::runtime::Handle::current(),
             widgets: widgets
                 .into_iter()
                 .map(|(id, (m, dir))| (id, (m, Arc::new(dir))))
@@ -382,7 +386,7 @@ fn spawn_instance(shared: &Arc<Shared>, inner: &mut Inner, id: String) {
     inner.states.insert(id.clone(), SlotState::Loading);
     let notify = Arc::new(Notify::new());
     let guard = inner.guards.entry(id.clone()).or_default().clone();
-    let task = tokio::spawn(instance_loop(
+    let task = shared.runtime.spawn(instance_loop(
         shared.clone(),
         id.clone(),
         notify.clone(),
@@ -800,6 +804,38 @@ mod tests {
         assert!(rig.handle.flush_saves(Duration::from_secs(5)));
         let saved = crate::instances::load(&rig.path);
         assert!(saved.instances.iter().any(|i| i.id == id(2) && i.widget == "gone"));
+    }
+
+    #[test]
+    fn showing_an_instance_from_a_plain_thread_does_not_panic() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let published: Published = Arc::default();
+        let sink = published.clone();
+        let handle = rt.block_on(async {
+            Scheduler::start_with_runner(
+                HashMap::from([("w".to_string(), (manifest(), PathBuf::from("wdir")))]),
+                data(vec![inst(1, true)]),
+                Arc::new(NoHttp),
+                Arc::new(|_| Box::pin(async { Ok(out("x")) })),
+                dir.path().join("i.json"),
+                move |m| sink.lock().unwrap().push(m),
+            )
+        });
+        // No runtime context on this thread, like the strip thread.
+        let handle = std::thread::spawn(move || {
+            handle.set_hidden(&id(1), false);
+            handle
+        })
+        .join()
+        .expect("set_hidden panicked off the runtime");
+        let last = published.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(last.slots.len(), 1);
+        handle.shutdown();
+        rt.shutdown_background();
     }
 
     #[test]
