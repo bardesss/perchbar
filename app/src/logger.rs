@@ -165,4 +165,16 @@ mod tests {
         assert!(!logger.enabled(&meta("reqwest::connect", log::Level::Info)));
         assert!(logger.enabled(&meta("tao::platform", log::Level::Warn)));
     }
+
+    #[test]
+    fn widget_log_records_pass_at_the_default_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger =
+            FileLogger::open(&dir.path().join("a.log"), MAX_BYTES, LevelFilter::Info).unwrap();
+        let meta = Metadata::builder()
+            .target(crate::sandbox::WIDGET_LOG_TARGET)
+            .level(log::Level::Info)
+            .build();
+        assert!(logger.enabled(&meta));
+    }
 }

@@ -286,7 +286,7 @@ pub fn install<'js>(
     let limiter = Mutex::new(LogLimiter::default());
     let log = Function::new(ctx.clone(), move |msg: String| {
         if let Some(line) = limiter.lock().unwrap().admit(&msg) {
-            log::info!(target: "widget", "[{instance_id}] {line}");
+            log::info!(target: super::WIDGET_LOG_TARGET, "[{instance_id}] {line}");
         }
     })?;
     globals.set("__host_log", log)?;
