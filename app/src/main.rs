@@ -73,6 +73,10 @@ fn main() {
 
     let widgets = load_widgets(&paths::widgets_dir());
     let known: HashSet<String> = widgets.keys().cloned().collect();
+    let names: HashMap<PathBuf, String> = widgets
+        .values()
+        .map(|(m, dir)| (dir.clone(), m.name.clone()))
+        .collect();
     let mut data = instances::load(&paths::instances_file());
     data.normalize(&known);
     log::info!(
@@ -97,23 +101,26 @@ fn main() {
             },
         )
     });
-    let mut strip_thread = Some(strip::spawn(rx, sched));
-
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .build(tauri::generate_context!())
-        .expect("failed to build Perchbar")
-        .run(move |_app, event| match event {
-            // Perchbar has no windows; only an explicit exit (code Some) quits.
-            tauri::RunEvent::ExitRequested { api, code, .. } if code.is_none() => {
-                api.prevent_exit();
+        .expect("failed to build Perchbar");
+    let handle = app.handle().clone();
+    // "Quit Perchbar" in the strip's menu: an explicit exit code, which the
+    // ExitRequested handler below lets through.
+    let mut strip_thread = Some(strip::spawn(rx, sched, names, move || handle.exit(0)));
+
+    app.run(move |_app, event| match event {
+        // Perchbar has no windows; only an explicit exit (code Some) quits.
+        tauri::RunEvent::ExitRequested { api, code, .. } if code.is_none() => {
+            api.prevent_exit();
+        }
+        tauri::RunEvent::Exit => {
+            let _ = tx.send(StripEvent::Quit);
+            strip::wake();
+            if let Some(t) = strip_thread.take() {
+                join_for(t, STRIP_JOIN_TIMEOUT);
             }
-            tauri::RunEvent::Exit => {
-                let _ = tx.send(StripEvent::Quit);
-                strip::wake();
-                if let Some(t) = strip_thread.take() {
-                    join_for(t, STRIP_JOIN_TIMEOUT);
-                }
-            }
-            _ => {}
-        });
+        }
+        _ => {}
+    });
 }

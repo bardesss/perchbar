@@ -168,6 +168,42 @@ impl RotationState {
         self.prune(model);
     }
 
+    /// Steps a slot by `delta` (negative: backwards): a group to another
+    /// member, otherwise the shown instance to another frame. Returns false
+    /// when there is nothing to step to.
+    pub fn advance(&mut self, slot_id: &str, delta: i32, model: &StripModel) -> bool {
+        if delta == 0 {
+            return false;
+        }
+        let Some(slot) = model.slots.iter().find(|s| s.id == slot_id) else {
+            return false;
+        };
+        let step =
+            |idx: usize, n: usize| (idx as i64 + i64::from(delta)).rem_euclid(n as i64) as usize;
+        let (id, out) = match &slot.kind {
+            SlotKind::Single {
+                instance_id, state, ..
+            } => (instance_id, state_output(state)),
+            SlotKind::Group { members, .. } if members.len() > 1 => {
+                let n = members.len();
+                let idx = self.group_index.get(slot_id).copied().unwrap_or(0) % n;
+                self.group_index.insert(slot_id.to_string(), step(idx, n));
+                return true;
+            }
+            SlotKind::Group { members, .. } => match members.first() {
+                Some(m) => (&m.instance_id, state_output(&m.state)),
+                None => return false,
+            },
+        };
+        let n = out.map_or(0, |o| o.frames.len());
+        if n < 2 {
+            return false;
+        }
+        let idx = self.frame_index.get(id).copied().unwrap_or(0) % n;
+        self.frame_index.insert(id.clone(), step(idx, n));
+        true
+    }
+
     fn tick_frames(&mut self, id: &str, out: Option<&Output>, now: Instant, paused: bool) {
         let n = out.map_or(0, |o| o.frames.len());
         if n < 2 {
@@ -361,6 +397,27 @@ pub fn layout(
         overflow,
         overflow_item,
     }
+}
+
+/// What the pointer is over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Hit {
+    Slot(String),
+    Overflow,
+}
+
+/// The slot or "+N" item at `x_dip` from the strip's left edge; `None` in
+/// the gaps between them and outside the strip.
+pub fn hit_test(layout: &StripLayout, x_dip: f32) -> Option<Hit> {
+    let inside = |x: f32, w: f32| x_dip >= x && x_dip < x + w;
+    if let Some(p) = layout.items.iter().find(|p| inside(p.x_dip, p.width_dip)) {
+        return Some(Hit::Slot(p.slot_id.clone()));
+    }
+    layout
+        .overflow_item
+        .as_ref()
+        .filter(|o| inside(o.x_dip, o.width_dip))
+        .map(|_| Hit::Overflow)
 }
 
 #[cfg(test)]
@@ -723,6 +780,82 @@ mod tests {
         rot.tick(&m, Instant::now());
         assert_eq!(rot.group_index["g"], 0);
         assert!(rot.frame_index["a"] < 2);
+    }
+
+    #[test]
+    fn hit_test_finds_slot() {
+        // s1 at [0, 85), s2 at [97, 182).
+        let l = run(&model(vec![btc("s1"), btc("s2")]), 500.0);
+        assert_eq!(hit_test(&l, 0.0), Some(Hit::Slot("s1".into())));
+        assert_eq!(hit_test(&l, 84.9), Some(Hit::Slot("s1".into())));
+        assert_eq!(hit_test(&l, 97.0), Some(Hit::Slot("s2".into())));
+        assert_eq!(hit_test(&l, 181.0), Some(Hit::Slot("s2".into())));
+    }
+
+    #[test]
+    fn hit_test_overflow_item() {
+        // s1 at [0, 85), "+2" at [97, 119).
+        let l = run(&model(vec![btc("s1"), btc("s2"), btc("s3")]), 150.0);
+        assert_eq!(hit_test(&l, 97.0), Some(Hit::Overflow));
+        assert_eq!(hit_test(&l, 118.0), Some(Hit::Overflow));
+        assert_eq!(hit_test(&l, 119.0), None);
+    }
+
+    #[test]
+    fn hit_test_gap_is_none() {
+        let l = run(&model(vec![btc("s1"), btc("s2")]), 500.0);
+        assert_eq!(hit_test(&l, 85.0), None);
+        assert_eq!(hit_test(&l, 90.0), None);
+        assert_eq!(hit_test(&l, -1.0), None);
+        assert_eq!(hit_test(&l, 182.0), None);
+        assert_eq!(hit_test(&StripLayout::default(), 0.0), None);
+    }
+
+    #[test]
+    fn advance_moves_group_members_both_ways() {
+        let g = group(
+            "g",
+            5,
+            vec![
+                member("a", SlotState::Ok(out(&["one"]))),
+                member("b", SlotState::Ok(out(&["two"]))),
+                member("c", SlotState::Ok(out(&["three"]))),
+            ],
+        );
+        let m = model(vec![g]);
+        let mut rot = RotationState::default();
+        assert!(rot.advance("g", 1, &m));
+        assert_eq!(rot.group_index["g"], 1);
+        assert!(rot.advance("g", 1, &m));
+        assert!(rot.advance("g", 1, &m));
+        assert_eq!(rot.group_index["g"], 0);
+        assert!(rot.advance("g", -1, &m));
+        assert_eq!(rot.group_index["g"], 2);
+    }
+
+    #[test]
+    fn advance_moves_frames_of_a_single_slot() {
+        let m = model(vec![single("s", SlotState::Ok(out(&["a", "b"])), None)]);
+        let mut rot = RotationState::default();
+        assert!(rot.advance("s", -1, &m));
+        assert_eq!(rot.frame_index["s"], 1);
+        assert!(rot.advance("s", 1, &m));
+        assert_eq!(rot.frame_index["s"], 0);
+    }
+
+    #[test]
+    fn advance_does_nothing_without_alternatives() {
+        let m = model(vec![
+            btc("one-frame"),
+            single("loading", SlotState::Loading, None),
+            group("solo", 5, vec![member("a", SlotState::Ok(out(&["x"])))]),
+        ]);
+        let mut rot = RotationState::default();
+        for id in ["one-frame", "loading", "solo", "missing"] {
+            assert!(!rot.advance(id, 1, &m), "{id}");
+        }
+        assert!(!rot.advance("one-frame", 0, &m));
+        assert!(rot.frame_index.is_empty());
     }
 
     #[test]

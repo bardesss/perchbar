@@ -10,6 +10,8 @@ pub mod theme;
 mod uia;
 mod window;
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::thread::JoinHandle;
 
@@ -22,11 +24,18 @@ pub enum StripEvent {
 }
 
 /// Starts the strip thread. Send events on the channel's sender, then call
-/// [`wake`] so the thread notices them.
-pub fn spawn(rx: Receiver<StripEvent>, sched: SchedulerHandle) -> JoinHandle<()> {
+/// [`wake`] so the thread notices them. `names` maps widget folders to their
+/// manifest names (for the "+N" menu); `on_quit` runs on the strip thread
+/// when the user picks "Quit Perchbar", before the strip tears down.
+pub fn spawn(
+    rx: Receiver<StripEvent>,
+    sched: SchedulerHandle,
+    names: HashMap<PathBuf, String>,
+    on_quit: impl FnOnce() + Send + 'static,
+) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("perchbar-strip".into())
-        .spawn(move || window::run(rx, sched))
+        .spawn(move || window::run(rx, sched, names, Box::new(on_quit)))
         .expect("cannot spawn the strip thread")
 }
 
@@ -45,6 +54,8 @@ pub(crate) struct RenderKey {
     /// Sorted (instance id, shown frame).
     pub frames: Vec<(String, usize)>,
     pub hover: Option<String>,
+    /// The slot dimmed briefly after a click.
+    pub pressed: Option<String>,
     pub dark: bool,
     pub dpi: u32,
     /// Taskbar height in pixels.

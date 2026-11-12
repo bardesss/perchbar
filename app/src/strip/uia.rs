@@ -11,7 +11,7 @@
 
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows::core::{Interface, PCWSTR};
 use windows::Win32::Foundation::{HWND, RECT};
@@ -23,6 +23,9 @@ use windows::Win32::UI::Accessibility::{
     CUIAutomation8, IUIAutomation, IUIAutomation2, IUIAutomationCacheRequest,
     IUIAutomationCondition, TreeScope_Descendants, UIA_BoundingRectanglePropertyId,
     UIA_ButtonControlTypeId, UIA_ControlTypePropertyId,
+};
+use windows::Win32::UI::HiDpi::{
+    SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowExW, GetWindowThreadProcessId, IsWindowVisible,
@@ -52,39 +55,54 @@ pub struct ButtonResult {
     pub buttons_right: Option<i32>,
 }
 
+/// How long a request may stay in flight with no result before the
+/// coalescer forgets it, so a lost notify message cannot stop searches.
+const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// At most one request in flight and one pending; a newer pending request
 /// replaces an older one.
 #[derive(Debug)]
 struct Coalescer<T> {
-    in_flight: bool,
+    /// When the in-flight request was sent; `None` when idle.
+    in_flight_since: Option<Instant>,
     pending: Option<T>,
 }
 
 impl<T> Default for Coalescer<T> {
     fn default() -> Self {
         Coalescer {
-            in_flight: false,
+            in_flight_since: None,
             pending: None,
         }
     }
 }
 
 impl<T> Coalescer<T> {
-    /// Returns the request to send now, or `None` if it was parked.
-    fn request(&mut self, q: T) -> Option<T> {
-        if self.in_flight {
-            self.pending = Some(q);
-            None
-        } else {
-            self.in_flight = true;
-            Some(q)
+    /// Returns the request to send now, or `None` if it was parked. A request
+    /// in flight for [`IN_FLIGHT_TIMEOUT`] counts as lost.
+    fn request(&mut self, q: T, now: Instant) -> Option<T> {
+        match self.in_flight_since {
+            Some(t) if now.saturating_duration_since(t) < IN_FLIGHT_TIMEOUT => {
+                self.pending = Some(q);
+                None
+            }
+            stuck => {
+                if stuck.is_some() {
+                    log::debug!(
+                        "no UI Automation result within {IN_FLIGHT_TIMEOUT:?}; sending again"
+                    );
+                }
+                self.pending = None;
+                self.in_flight_since = Some(now);
+                Some(q)
+            }
         }
     }
 
     /// The in-flight request finished. Returns the pending one to send next.
-    fn complete(&mut self) -> Option<T> {
+    fn complete(&mut self, now: Instant) -> Option<T> {
         let next = self.pending.take();
-        self.in_flight = next.is_some();
+        self.in_flight_since = next.as_ref().map(|_| now);
         next
     }
 }
@@ -118,7 +136,7 @@ impl UiaWorker {
 
     /// Asks for a search; coalesced with any search already running.
     pub fn request(&mut self, q: ButtonQuery) {
-        if let Some(q) = self.queue.request(q) {
+        if let Some(q) = self.queue.request(q, Instant::now()) {
             self.send(q);
         }
     }
@@ -136,7 +154,7 @@ impl UiaWorker {
     pub fn take_result(&mut self) -> Option<ButtonResult> {
         let result = self.slot.lock().unwrap_or_else(|p| p.into_inner()).take();
         if result.is_some() {
-            if let Some(next) = self.queue.complete() {
+            if let Some(next) = self.queue.complete(Instant::now()) {
                 self.send(next);
             }
         }
@@ -151,6 +169,14 @@ impl UiaWorker {
 }
 
 fn worker(rx: Receiver<ButtonQuery>, slot: Arc<Mutex<Option<ButtonResult>>>, notify: impl Fn()) {
+    // Button rects must be in the same physical pixels as the taskbar rect
+    // the strip thread (per-monitor v2) reads.
+    // SAFETY: thread-level setting with a constant argument.
+    let previous =
+        unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    if previous.0.is_null() {
+        log::warn!("cannot make the UI Automation worker per-monitor DPI aware");
+    }
     // SAFETY: thread-level COM setup, paired with CoUninitialize below.
     let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     if let Err(e) = com.ok() {
@@ -333,15 +359,33 @@ mod tests {
 
     #[test]
     fn coalescer_keeps_one_in_flight_and_the_newest_pending() {
+        let now = Instant::now();
         let mut c = Coalescer::default();
-        assert_eq!(c.request(1), Some(1));
-        assert_eq!(c.request(2), None);
-        assert_eq!(c.request(3), None);
-        assert_eq!(c.complete(), Some(3));
-        assert_eq!(c.complete(), None);
+        assert_eq!(c.request(1, now), Some(1));
+        assert_eq!(c.request(2, now), None);
+        assert_eq!(c.request(3, now), None);
+        assert_eq!(c.complete(now), Some(3));
+        assert_eq!(c.complete(now), None);
         // Idle again: the next request goes straight out.
-        assert_eq!(c.request(4), Some(4));
-        assert_eq!(c.complete(), None);
+        assert_eq!(c.request(4, now), Some(4));
+        assert_eq!(c.complete(now), None);
+    }
+
+    #[test]
+    fn coalescer_forgets_a_request_with_no_result_after_the_timeout() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut c = Coalescer::default();
+        assert_eq!(c.request(1, at(0)), Some(1));
+        // Still waiting just before the timeout: parked.
+        assert_eq!(c.request(2, at(9_999)), None);
+        // The notify message was lost: after 10 s the next request goes out.
+        assert_eq!(c.request(3, at(10_000)), Some(3));
+        // The timeout restarts from the new send.
+        assert_eq!(c.request(4, at(19_000)), None);
+        assert_eq!(c.complete(at(19_500)), Some(4));
+        assert_eq!(c.complete(at(19_600)), None);
+        assert_eq!(c.request(5, at(19_700)), Some(5));
     }
 
     #[test]
