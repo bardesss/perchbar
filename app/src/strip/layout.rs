@@ -215,7 +215,7 @@ fn state_output(state: &SlotState) -> Option<&Output> {
     out.filter(|o| !o.frames.is_empty())
 }
 
-fn block_width(b: &Block, m: &dyn Measure) -> f32 {
+pub(crate) fn block_width(b: &Block, m: &dyn Measure) -> f32 {
     match b {
         Block::Text { value, size, .. } => m.text_width(value, *size),
         Block::Icon { .. } => ICON_DIP,
