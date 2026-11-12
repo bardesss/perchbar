@@ -73,6 +73,12 @@ Perchbar is in early development. The taskbar strip, the sandbox and the first t
 2. A catalog in this repo, browsable from the app, plus a Share button that turns your widget into a pull request.
 3. The remaining templates and a guide for writing widgets with AI.
 
+## Install
+
+Download the latest installer (`Perchbar-x.y.z-setup.exe`) or the portable exe from [Releases](https://github.com/bardesss/perchbar/releases). The installer needs no admin rights. Each release lists SHA-256 checksums in `SHA256SUMS.txt`.
+
+The builds are not code-signed yet, so Windows SmartScreen may say "Windows protected your PC" the first time. Choose **More info**, then **Run anyway**.
+
 ## Build from source
 
 You need Windows 11 and [Rust](https://rustup.rs).

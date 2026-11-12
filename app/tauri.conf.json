@@ -13,7 +13,15 @@
     }
   },
   "bundle": {
-    "active": false,
-    "icon": ["icons/icon.png", "icons/icon.ico"]
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/icon.png", "icons/icon.ico"],
+    "publisher": "Perchbar",
+    "shortDescription": "Live widgets on your Windows 11 taskbar",
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
   }
 }
