@@ -24,6 +24,42 @@ pub fn check_url(url: &str, allowed: &[String]) -> Result<Url, String> {
     Ok(parsed)
 }
 
+const BLOCKED_HEADERS: &[&str] = &[
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "upgrade",
+    "te",
+    "trailer",
+    "keep-alive",
+    "expect",
+    "via",
+    "forwarded",
+    "cookie",
+    "origin",
+    "referer",
+];
+const BLOCKED_HEADER_PREFIXES: &[&str] = &["proxy-", "sec-", "x-forwarded-"];
+
+/// Rejects headers a widget must not control (Host and friends could bypass
+/// the allow-list; framing and proxy headers enable request smuggling).
+pub fn check_headers(headers: &[(String, String)]) -> Result<(), String> {
+    for (name, value) in headers {
+        let lower = name.to_ascii_lowercase();
+        let has_crlf = |t: &str| t.contains(['\r', '\n']);
+        let blocked = BLOCKED_HEADERS.contains(&lower.as_str())
+            || BLOCKED_HEADER_PREFIXES.iter().any(|p| lower.starts_with(p))
+            || has_crlf(name)
+            || has_crlf(value);
+        if blocked {
+            let shown: String = name.chars().filter(|c| !c.is_control()).collect();
+            return Err(format!("Perchbar: header not allowed: {shown}"));
+        }
+    }
+    Ok(())
+}
+
 /// True if the whole chain (original URL first) is permitted and short enough.
 pub fn redirect_allowed(chain: &[Url], allowed: &[String]) -> bool {
     chain.len() <= MAX_CHAIN && chain.iter().all(|u| check_url(u.as_str(), allowed).is_ok())
@@ -86,6 +122,49 @@ mod tests {
     fn rejects_ip_literal_unless_declared() {
         assert!(check_url("https://127.0.0.1/", &allow()).is_err());
         assert!(check_url("https://127.0.0.1/", &["127.0.0.1".to_string()]).is_ok());
+    }
+
+    fn hdr(n: &str, v: &str) -> Vec<(String, String)> {
+        vec![(n.to_string(), v.to_string())]
+    }
+
+    #[test]
+    fn host_header_override_rejected() {
+        for n in ["Host", "host", "HOST", "Cookie", "Content-Length", "Origin"] {
+            let err = check_headers(&hdr(n, "evil.com")).unwrap_err();
+            assert_eq!(err, format!("Perchbar: header not allowed: {n}"));
+        }
+    }
+
+    #[test]
+    fn proxy_header_rejected() {
+        for n in [
+            "Proxy-Authorization",
+            "Sec-Fetch-Mode",
+            "X-Forwarded-For",
+            "Via",
+        ] {
+            assert!(check_headers(&hdr(n, "x")).is_err(), "{n}");
+        }
+    }
+
+    #[test]
+    fn crlf_in_header_rejected() {
+        assert!(check_headers(&hdr("X-Ok", "a\r\nHost: evil.com")).is_err());
+        assert!(check_headers(&hdr("X-Bad\nName", "a")).is_err());
+    }
+
+    #[test]
+    fn normal_headers_allowed() {
+        let h: Vec<(String, String)> = [
+            ("Authorization", "Bearer t"),
+            ("Accept", "application/json"),
+            ("X-Api-Key", "k"),
+        ]
+        .iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect();
+        assert!(check_headers(&h).is_ok());
     }
 
     #[test]
