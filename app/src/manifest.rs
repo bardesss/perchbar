@@ -94,8 +94,10 @@ fn default_refresh() -> u32 {
 /// Reads `dir/widget.json`, validates it and requires `dir/widget.js`.
 pub fn load(dir: &Path) -> Result<Manifest, ManifestError> {
     let text = std::fs::read_to_string(dir.join("widget.json"))?;
+    // Some Windows editors save UTF-8 with a byte order mark.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     let mut manifest: Manifest =
-        serde_json::from_str(&text).map_err(|e| ManifestError::Json(e.to_string()))?;
+        serde_json::from_str(text).map_err(|e| ManifestError::Json(e.to_string()))?;
     if !dir.join("widget.js").is_file() {
         return Err(ManifestError::MissingWidgetJs);
     }
@@ -189,6 +191,17 @@ mod tests {
         assert_eq!(m.refresh, 60);
         assert_eq!(m.permissions.network, vec!["api.coinbase.com"]);
         assert!(m.permissions.files.is_empty());
+    }
+
+    #[test]
+    fn leading_byte_order_mark_is_accepted() {
+        let dir = fixture(base(), true);
+        fs::write(
+            dir.path().join("widget.json"),
+            format!("\u{feff}{}", base()),
+        )
+        .unwrap();
+        assert_eq!(load(dir.path()).unwrap().id, "btc");
     }
 
     #[test]
