@@ -8,8 +8,21 @@
 
 #[path = "../src/display.rs"]
 mod display;
-#[path = "../src/strip/mod.rs"]
-mod strip;
+/// The drawing half of `src/strip` (the window half needs the scheduler).
+mod strip {
+    #[path = "../../src/strip/icons.rs"]
+    pub mod icons;
+    #[path = "../../src/strip/image.rs"]
+    pub mod image;
+    #[path = "../../src/strip/layout.rs"]
+    pub mod layout;
+    #[path = "../../src/strip/model.rs"]
+    pub mod model;
+    #[path = "../../src/strip/render.rs"]
+    pub mod render;
+    #[path = "../../src/strip/theme.rs"]
+    pub mod theme;
+}
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

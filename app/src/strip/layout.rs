@@ -27,7 +27,8 @@ pub const PLUS_N_PAD_DIP: f32 = 8.0;
 pub const MIN_APP_GAP_DIP: f32 = 8.0;
 /// Width of a slot with no output yet (loading dot, or error icon plus padding).
 pub const EMPTY_SLOT_DIP: f32 = 24.0;
-const DEFAULT_ROTATE_SECS: u32 = 6;
+/// Frame rotation period when a widget does not set `rotate`.
+pub const DEFAULT_ROTATE_SECS: u32 = 6;
 
 /// DIPs to device pixels.
 pub fn px(dip: f32, scale: f32) -> i32 {
