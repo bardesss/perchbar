@@ -244,7 +244,9 @@ async fn send(
     mut req: HttpRequest,
     allowed: &[String],
 ) -> Result<HttpResponse, SendError> {
-    permissions::check_url(&req.url, allowed).map_err(SendError::Denied)?;
+    let checked = permissions::check_url(&req.url, allowed).map_err(SendError::Denied)?;
+    // Hand the client the URL that was checked, not the raw widget string.
+    req.url = checked.into();
     permissions::check_headers(&req.headers).map_err(SendError::Denied)?;
     req.allowed_hosts = allowed.to_vec();
     http.send(req).await.map_err(SendError::Failed)

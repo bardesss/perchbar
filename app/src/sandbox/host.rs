@@ -39,8 +39,7 @@ impl ReqwestClient {
         let policy = reqwest::redirect::Policy::custom(|attempt| {
             let mut chain = attempt.previous().to_vec();
             chain.push(attempt.url().clone());
-            let allowed = ALLOWED_HOSTS.try_with(Clone::clone).unwrap_or_default();
-            if permissions::redirect_allowed(&chain, &allowed) {
+            if policy_decision(&chain) {
                 attempt.follow()
             } else {
                 attempt.error("Perchbar: redirect blocked")
@@ -51,6 +50,8 @@ impl ReqwestClient {
             .timeout(REQUEST_TIMEOUT)
             .user_agent(concat!("Perchbar/", env!("CARGO_PKG_VERSION")))
             .redirect(policy)
+            // Never leak a previous URL (or its query string) via Referer.
+            .referer(false)
             .build()
             .expect("http client configuration is valid");
         ReqwestClient { client }
@@ -86,6 +87,13 @@ impl ReqwestClient {
             body: String::from_utf8_lossy(&body).into_owned(),
         })
     }
+}
+
+/// Whether a redirect chain may continue, using the allow-list scoped to the
+/// current request. Outside any scope nothing is allowed.
+fn policy_decision(chain: &[url::Url]) -> bool {
+    let allowed = ALLOWED_HOSTS.try_with(Clone::clone).unwrap_or_default();
+    permissions::redirect_allowed(chain, &allowed)
 }
 
 impl Default for ReqwestClient {
@@ -324,6 +332,24 @@ mod tests {
             body: None,
             allowed_hosts: allowed.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    fn chain(urls: &[&str]) -> Vec<url::Url> {
+        urls.iter().map(|u| url::Url::parse(u).unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn policy_decision_reads_scoped_allow_list() {
+        let ok = chain(&["https://api.coinbase.com/a", "https://api.coinbase.com/b"]);
+        let evil = chain(&["https://api.coinbase.com/a", "https://evil.com/b"]);
+        let (ok_in, evil_in) = ALLOWED_HOSTS
+            .scope(vec!["api.coinbase.com".to_string()], async {
+                (policy_decision(&ok), policy_decision(&evil))
+            })
+            .await;
+        assert!(ok_in);
+        assert!(!evil_in);
+        assert!(!policy_decision(&ok), "no scope must deny everything");
     }
 
     #[tokio::test]
