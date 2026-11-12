@@ -17,6 +17,8 @@ mod strip;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use manifest::Manifest;
 use sandbox::ReqwestClient;
@@ -46,6 +48,23 @@ fn load_widgets(dir: &Path) -> HashMap<String, (Arc<Manifest>, PathBuf)> {
         }
     }
     widgets
+}
+
+/// How long exit waits for the strip thread to tear down.
+const STRIP_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Joins `t` if it finishes within `timeout`; otherwise leaves it running
+/// (the process is exiting anyway) so a hung Explorer cannot hang exit.
+fn join_for(t: JoinHandle<()>, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while !t.is_finished() {
+        if Instant::now() >= deadline {
+            log::warn!("strip thread did not stop within {timeout:?}");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = t.join();
 }
 
 fn main() {
@@ -92,7 +111,7 @@ fn main() {
                 let _ = tx.send(StripEvent::Quit);
                 strip::wake();
                 if let Some(t) = strip_thread.take() {
-                    let _ = t.join();
+                    join_for(t, STRIP_JOIN_TIMEOUT);
                 }
             }
             _ => {}

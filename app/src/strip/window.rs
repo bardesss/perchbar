@@ -18,7 +18,6 @@ use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, AC_SRC_ALPHA,
     AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS,
 };
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::HiDpi::{
@@ -27,14 +26,14 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, GetWindow,
-    GetWindowThreadProcessId, IsWindow, IsWindowVisible, KillTimer, LoadCursorW, PostMessageW,
-    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetTimer, SetWindowPos, ShowWindow,
-    TranslateMessage, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE,
-    GW_CHILD, HWND_TOP, IDC_ARROW, MA_NOACTIVATE, MSG, OBJID_CARET, OBJID_CURSOR, SWP_NOACTIVATE,
-    SWP_SHOWWINDOW, SW_HIDE, ULW_ALPHA, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP,
-    WM_DPICHANGED, WM_DPICHANGED_AFTERPARENT, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_SETTINGCHANGE,
-    WM_TIMER, WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_POPUP,
+    GetWindowThreadProcessId, IsChild, IsWindow, IsWindowVisible, KillTimer, LoadCursorW,
+    PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetTimer, SetWindowPos,
+    ShowWindow, TranslateMessage, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY,
+    EVENT_OBJECT_LOCATIONCHANGE, GW_CHILD, HWND_TOP, IDC_ARROW, MA_NOACTIVATE, MSG, OBJID_CLIENT,
+    OBJID_WINDOW, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, ULW_ALPHA, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS, WM_APP, WM_DPICHANGED, WM_DPICHANGED_AFTERPARENT, WM_MOUSEACTIVATE,
+    WM_MOUSEMOVE, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_NOPARENTNOTIFY, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use crate::scheduler::SchedulerHandle;
@@ -43,12 +42,17 @@ use crate::strip::model::StripModel;
 use crate::strip::placement::{self, TaskbarInfo};
 use crate::strip::render::{Bitmap, Renderer};
 use crate::strip::theme::{self, Palette};
+use crate::strip::uia::{ButtonQuery, UiaWorker};
 use crate::strip::{rotation_secs, RenderKey, StripEvent};
 
 /// Drain the event channel.
 const WM_APP_EVENTS: u32 = WM_APP;
 /// Something on the taskbar may have moved: run a debounced placement tick.
 const WM_APP_TICK: u32 = WM_APP + 1;
+/// The UI Automation worker stored a result.
+const WM_APP_BUTTONS: u32 = WM_APP + 2;
+/// The strip-creation warning is logged at most this often.
+const CREATE_WARN_INTERVAL: Duration = Duration::from_secs(60);
 /// Not exported by the `windows` features in use.
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
@@ -68,6 +72,8 @@ const STRIP_CLASS: PCWSTR = w!("PerchbarStrip");
 static CTL: AtomicIsize = AtomicIsize::new(0);
 /// The registered `TaskbarCreated` message.
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+/// The current taskbar HWND, for the WinEvent filter. 0 when unknown.
+static TASKBAR: AtomicIsize = AtomicIsize::new(0);
 
 /// Wakes the strip thread so it drains the channel. Non-blocking.
 pub fn wake() {
@@ -102,6 +108,20 @@ struct State {
     pos: Option<(i32, i32, i32, i32)>,
     rotate_secs: Option<u32>,
     debounce_pending: bool,
+    uia: UiaWorker,
+    /// Last UI Automation result for the current taskbar; `None` until the
+    /// first one arrives (the placement fallback guess applies meanwhile).
+    buttons_right: Option<i32>,
+    last_create_warn: Option<Instant>,
+}
+
+/// How much of the UI Automation search a tick asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Search {
+    /// Always re-search the app buttons.
+    Always,
+    /// Only when the taskbar row changed (auto-hide moves are vertical).
+    IfRowChanged,
 }
 
 thread_local! {
@@ -118,24 +138,20 @@ fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
 
 /// The strip thread's body.
 pub(super) fn run(rx: Receiver<StripEvent>, sched: SchedulerHandle) {
-    // SAFETY: thread-level setup calls with constant arguments. MTA keeps UI
-    // Automation calls from depending on this thread's message pumping.
-    let com = unsafe {
-        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        CoInitializeEx(None, COINIT_MULTITHREADED)
-    };
+    // Explorer's taskbar is per-monitor v2 aware; a child must match it.
+    // SAFETY: thread-level setting with a constant argument.
+    let previous =
+        unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    if previous.0.is_null() {
+        log::warn!("cannot make the strip thread per-monitor DPI aware");
+    }
     match setup(rx, sched) {
         Ok(()) => message_loop(),
         Err(e) => log::error!("cannot start the taskbar strip: {e}"),
     }
     CTL.store(0, Ordering::Release);
-    // COM objects (UI Automation, Direct2D) go before COM does.
-    placement::release_uia();
+    TASKBAR.store(0, Ordering::Release);
     STATE.with(|s| s.borrow_mut().take());
-    if com.is_ok() {
-        // SAFETY: pairs the successful CoInitializeEx above.
-        unsafe { CoUninitialize() };
-    }
 }
 
 fn setup(rx: Receiver<StripEvent>, sched: SchedulerHandle) -> windows::core::Result<()> {
@@ -204,13 +220,16 @@ fn setup(rx: Receiver<StripEvent>, sched: SchedulerHandle) -> windows::core::Res
             pos: None,
             rotate_secs: None,
             debounce_pending: false,
+            uia: UiaWorker::start(|| post_to_ctl(WM_APP_BUTTONS)),
+            buttons_right: None,
+            last_create_warn: None,
         });
     });
     CTL.store(ctl.0 as isize, Ordering::Release);
     // SAFETY: timer on our own window.
     unsafe { SetTimer(Some(ctl), T_FALLBACK, FALLBACK_MS, None) };
     with_state(|s| {
-        s.placement_tick();
+        s.tick(Search::Always);
         // Models published before the window existed are waiting.
         s.drain();
     });
@@ -299,41 +318,65 @@ impl State {
             .is_some_and(|h| unsafe { IsWindow(Some(h)) }.as_bool())
     }
 
-    /// Re-reads the taskbar, recreating the strip or hooks when Explorer
-    /// restarted, then repositions and redraws as needed.
-    fn placement_tick(&mut self) {
-        self.tick(true);
-    }
-
-    /// The periodic fallback: the same, but the UI Automation button search
-    /// only runs when the taskbar row changed or the strip was recreated.
-    fn fallback_tick(&mut self) {
-        self.tick(false);
-    }
-
-    fn tick(&mut self, full: bool) {
+    /// Re-reads the taskbar (Win32 only, never blocking on Explorer),
+    /// recreating the strip or hooks when Explorer restarted, then
+    /// repositions and redraws as needed. The app button search is handed to
+    /// the UI Automation worker; its result arrives as `WM_APP_BUTTONS`.
+    fn tick(&mut self, search: Search) {
         let Some(taskbar) = placement::taskbar_hwnd() else {
             self.info = None;
+            TASKBAR.store(0, Ordering::Release);
             return;
         };
-        let mut full = full;
+        let mut search = search;
         if self.taskbar != Some(taskbar) || !self.strip_alive() {
             self.recreate(taskbar);
-            full = true;
+            search = Search::Always;
         }
+        TASKBAR.store(taskbar.0 as isize, Ordering::Release);
         let mut pid = 0;
         // SAFETY: valid out pointer.
         unsafe { GetWindowThreadProcessId(taskbar, Some(&mut pid)) };
         if pid != 0 && pid != self.explorer_pid {
             self.rehook(pid);
         }
-        self.info = if full {
-            placement::query()
-        } else {
-            placement::query_reusing(self.info.as_ref())
+        let info = placement::read(taskbar, self.buttons_right);
+        let row_changed = match (&self.info, &info) {
+            (Some(a), Some(b)) => !placement::same_row(a, b),
+            _ => true,
         };
+        self.info = info;
         log::debug!("taskbar: {:?}", self.info);
+        if let Some(i) = info {
+            if search == Search::Always || row_changed {
+                self.uia.request(ButtonQuery {
+                    taskbar: taskbar.0 as isize,
+                    taskbar_rect: i.taskbar,
+                    tray_left: i.tray_left,
+                });
+            }
+        }
         self.refresh();
+    }
+
+    /// Applies a finished UI Automation search.
+    fn on_buttons(&mut self) {
+        let Some(result) = self.uia.take_result() else {
+            return;
+        };
+        let current = self.taskbar.map(|h| h.0 as isize);
+        if Some(result.query.taskbar) != current {
+            return;
+        }
+        log::debug!("app buttons end at {:?}", result.buttons_right);
+        // A failed search keeps the last good edge.
+        if let Some(right) = result.buttons_right {
+            self.buttons_right = Some(right);
+            if let Some(info) = self.info.as_mut() {
+                info.buttons_right = right.min(info.tray_left);
+            }
+            self.refresh();
+        }
     }
 
     fn recreate(&mut self, taskbar: HWND) {
@@ -343,10 +386,17 @@ impl State {
                 let _ = unsafe { DestroyWindow(old) };
             }
         }
+        if self.taskbar != Some(taskbar) {
+            // A new taskbar: the old button edge means nothing.
+            self.buttons_right = None;
+            self.info = None;
+        }
         // SAFETY: creates a child of the taskbar with our registered class.
+        // WS_EX_NOPARENTNOTIFY: creating or destroying the strip must not send
+        // WM_PARENTNOTIFY to Explorer, which blocks if Explorer is hung.
         let created = unsafe {
             CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOPARENTNOTIFY,
                 STRIP_CLASS,
                 w!("Perchbar"),
                 WS_CHILD | WS_CLIPSIBLINGS,
@@ -366,7 +416,16 @@ impl State {
                 self.strip = Some(h);
             }
             Err(e) => {
-                log::warn!("cannot create the strip window: {e}");
+                let now = Instant::now();
+                let quiet = self
+                    .last_create_warn
+                    .is_some_and(|t| now.duration_since(t) < CREATE_WARN_INTERVAL);
+                if quiet {
+                    log::debug!("cannot create the strip window: {e}");
+                } else {
+                    log::warn!("cannot create the strip window: {e}");
+                    self.last_create_warn = Some(now);
+                }
                 self.strip = None;
             }
         }
@@ -559,7 +618,9 @@ impl State {
         if let Some(sched) = self.sched.take() {
             sched.shutdown();
         }
+        self.uia.shutdown();
         CTL.store(0, Ordering::Release);
+        TASKBAR.store(0, Ordering::Release);
         // SAFETY: our own window; the loop ends on WM_QUIT.
         unsafe {
             let _ = DestroyWindow(self.ctl);
@@ -655,8 +716,12 @@ unsafe extern "system" fn win_event(
     _thread: u32,
     _time: u32,
 ) {
-    // The cursor and caret move constantly and say nothing about layout.
-    if id_object == OBJID_CURSOR.0 || id_object == OBJID_CARET.0 {
+    let taskbar = TASKBAR.load(Ordering::Acquire);
+    let relevant = is_taskbar_event(id_object, hwnd.0 as isize, taskbar, |parent, child| {
+        // SAFETY: IsChild accepts any handles.
+        unsafe { IsChild(HWND(parent as _), HWND(child as _)) }.as_bool()
+    });
+    if !relevant {
         return;
     }
     log::trace!(
@@ -664,6 +729,21 @@ unsafe extern "system" fn win_event(
         hwnd.0
     );
     post_to_ctl(WM_APP_TICK);
+}
+
+/// Keeps only window-level events on the taskbar or one of its descendants.
+/// Explorer also hosts File Explorer windows and the desktop, whose moves
+/// say nothing about the taskbar; the cursor and caret are not windows.
+fn is_taskbar_event(
+    id_object: i32,
+    hwnd: isize,
+    taskbar: isize,
+    is_child: impl Fn(isize, isize) -> bool,
+) -> bool {
+    taskbar != 0
+        && hwnd != 0
+        && (id_object == OBJID_WINDOW.0 || id_object == OBJID_CLIENT.0)
+        && (hwnd == taskbar || is_child(taskbar, hwnd))
 }
 
 /// True when a WM_SETTINGCHANGE names the color scheme.
@@ -701,13 +781,15 @@ unsafe extern "system" fn ctl_proc(
                     let _ = unsafe { KillTimer(Some(hwnd), T_DEBOUNCE) };
                     with_state(|s| {
                         s.debounce_pending = false;
-                        s.placement_tick();
+                        s.tick(Search::IfRowChanged);
                     });
                 }
                 T_FALLBACK => {
+                    // A full search here picks up app buttons that grew the
+                    // XAML row without any window event within FALLBACK_MS.
                     with_state(|s| {
                         s.reload_theme();
-                        s.fallback_tick();
+                        s.tick(Search::Always);
                     });
                 }
                 T_ROTATE => {
@@ -730,7 +812,14 @@ unsafe extern "system" fn ctl_proc(
         }
         m if m != 0 && m == TASKBAR_CREATED.load(Ordering::Acquire) => {
             log::info!("taskbar recreated");
-            with_state(State::placement_tick);
+            with_state(|s| s.tick(Search::Always));
+            LRESULT(0)
+        }
+        WM_APP_BUTTONS => {
+            if with_state(State::on_buttons).is_none() {
+                // Busy: try again from the loop.
+                post_to_ctl(WM_APP_BUTTONS);
+            }
             LRESULT(0)
         }
         // SAFETY: default handling.
@@ -765,5 +854,40 @@ unsafe extern "system" fn strip_proc(
         }
         // SAFETY: default handling.
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TASKBAR_HWND: isize = 100;
+    const BRIDGE: isize = 101;
+    const FOLDER_WINDOW: isize = 500;
+
+    fn is_child(parent: isize, child: isize) -> bool {
+        parent == TASKBAR_HWND && child == BRIDGE
+    }
+
+    #[test]
+    fn keeps_window_events_on_the_taskbar_and_its_children() {
+        let ev = |obj: i32, hwnd: isize| is_taskbar_event(obj, hwnd, TASKBAR_HWND, is_child);
+        assert!(ev(OBJID_WINDOW.0, TASKBAR_HWND));
+        assert!(ev(OBJID_WINDOW.0, BRIDGE));
+        assert!(ev(OBJID_CLIENT.0, BRIDGE));
+    }
+
+    #[test]
+    fn drops_other_explorer_windows_and_non_window_objects() {
+        let ev = |obj: i32, hwnd: isize| is_taskbar_event(obj, hwnd, TASKBAR_HWND, is_child);
+        // A File Explorer window being dragged.
+        assert!(!ev(OBJID_WINDOW.0, FOLDER_WINDOW));
+        // Cursor, caret and accessible child objects.
+        assert!(!ev(-9, TASKBAR_HWND));
+        assert!(!ev(-8, TASKBAR_HWND));
+        assert!(!ev(5, BRIDGE));
+        assert!(!ev(OBJID_WINDOW.0, 0));
+        // No taskbar known yet.
+        assert!(!is_taskbar_event(OBJID_WINDOW.0, BRIDGE, 0, is_child));
     }
 }

@@ -7,6 +7,7 @@ pub mod model;
 pub mod placement;
 pub mod render;
 pub mod theme;
+mod uia;
 mod window;
 
 use std::sync::mpsc::Receiver;
