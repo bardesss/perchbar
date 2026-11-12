@@ -16,9 +16,9 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 use tokio::sync::{Notify, Semaphore};
@@ -34,6 +34,8 @@ use crate::strip::model::{Member, Slot, SlotKind, SlotState, StripModel};
 const MAX_CONCURRENT_RUNS: usize = 4;
 const MAX_BACKOFF_SECS: u64 = 600;
 const MAX_START_JITTER_MS: u64 = 2000;
+/// How long `shutdown` waits for a pending instances.json write.
+const SHUTDOWN_SAVE_WAIT: Duration = Duration::from_secs(1);
 
 pub type RunFuture = Pin<Box<dyn Future<Output = Result<Output, RunError>> + Send>>;
 /// Performs one widget run. Injectable so tests can fake the sandbox.
@@ -53,6 +55,92 @@ pub fn sandbox_runner() -> Runner {
                 .unwrap_or_else(|e| Err(RunError::Script(format!("run aborted: {e}"))))
         })
     })
+}
+
+/// Writes `instances.json`. Injectable so tests can make the disk slow.
+pub type Writer = Arc<dyn Fn(&Path, &Instances) -> std::io::Result<()> + Send + Sync>;
+
+#[derive(Default)]
+struct SaverState {
+    /// The newest snapshot not yet written.
+    latest: Option<Instances>,
+    writing: bool,
+    closed: bool,
+}
+
+/// Persists `instances.json` on its own thread, so callers (the strip thread
+/// among them) never wait for the disk. Snapshots are submitted in the order
+/// the state changed; the thread always writes the newest one and skips any
+/// it was too slow to write, so the file ends up matching the last change.
+struct Saver {
+    state: Arc<(Mutex<SaverState>, Condvar)>,
+}
+
+impl Saver {
+    fn start(path: PathBuf, writer: Writer) -> Saver {
+        let state: Arc<(Mutex<SaverState>, Condvar)> = Arc::default();
+        let shared = Arc::clone(&state);
+        let spawned = std::thread::Builder::new()
+            .name("perchbar-saver".into())
+            .spawn(move || {
+                let (lock, cv) = &*shared;
+                let mut s = lock.lock().unwrap_or_else(|p| p.into_inner());
+                loop {
+                    if let Some(snapshot) = s.latest.take() {
+                        s.writing = true;
+                        drop(s);
+                        if let Err(e) = writer(&path, &snapshot) {
+                            log::warn!("cannot save instances: {e}");
+                        }
+                        s = lock.lock().unwrap_or_else(|p| p.into_inner());
+                        s.writing = false;
+                        cv.notify_all();
+                    } else if s.closed {
+                        return;
+                    } else {
+                        s = cv.wait(s).unwrap_or_else(|p| p.into_inner());
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            log::warn!("cannot start the instances saver: {e}");
+        }
+        Saver { state }
+    }
+
+    /// Queues a snapshot. Never blocks on the disk.
+    fn submit(&self, snapshot: Instances) {
+        let (lock, cv) = &*self.state;
+        lock.lock().unwrap_or_else(|p| p.into_inner()).latest = Some(snapshot);
+        cv.notify_all();
+    }
+
+    /// Waits up to `timeout` for queued snapshots to reach the disk. Returns
+    /// whether everything was written.
+    fn flush(&self, timeout: Duration) -> bool {
+        let (lock, cv) = &*self.state;
+        let deadline = std::time::Instant::now() + timeout;
+        let mut s = lock.lock().unwrap_or_else(|p| p.into_inner());
+        while s.latest.is_some() || s.writing {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            s = cv
+                .wait_timeout(s, left)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
+        true
+    }
+}
+
+impl Drop for Saver {
+    fn drop(&mut self) {
+        let (lock, cv) = &*self.state;
+        lock.lock().unwrap_or_else(|p| p.into_inner()).closed = true;
+        cv.notify_all();
+    }
 }
 
 /// Wait before the next run: `refresh` seconds with no failures, otherwise
@@ -85,12 +173,11 @@ struct Shared {
     http: Arc<dyn HttpClient>,
     runner: Runner,
     semaphore: Arc<Semaphore>,
-    instances_path: PathBuf,
     publish: Box<dyn Fn(StripModel) + Send + Sync>,
     /// Serialises publish calls so models reach the callback in generation order.
     publish_lock: Mutex<()>,
-    /// Serialises writes of instances.json.
-    save_lock: Mutex<()>,
+    /// Writes instances.json in the background.
+    saver: Saver,
     inner: Mutex<Inner>,
 }
 
@@ -192,6 +279,26 @@ impl Scheduler {
         instances_path: PathBuf,
         publish: impl Fn(StripModel) + Send + Sync + 'static,
     ) -> SchedulerHandle {
+        Self::start_with_writer(
+            widgets,
+            instances,
+            http,
+            runner,
+            instances_path,
+            Arc::new(|p: &Path, d: &Instances| instances::save(p, d)),
+            publish,
+        )
+    }
+
+    pub fn start_with_writer(
+        widgets: HashMap<String, (Arc<Manifest>, PathBuf)>,
+        instances: Instances,
+        http: Arc<dyn HttpClient>,
+        runner: Runner,
+        instances_path: PathBuf,
+        writer: Writer,
+        publish: impl Fn(StripModel) + Send + Sync + 'static,
+    ) -> SchedulerHandle {
         let shared = Arc::new(Shared {
             widgets: widgets
                 .into_iter()
@@ -200,10 +307,9 @@ impl Scheduler {
             http,
             runner,
             semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_RUNS)),
-            instances_path,
             publish: Box::new(publish),
             publish_lock: Mutex::new(()),
-            save_lock: Mutex::new(()),
+            saver: Saver::start(instances_path, writer),
             inner: Mutex::new(Inner {
                 data: instances,
                 states: HashMap::new(),
@@ -371,25 +477,34 @@ impl SchedulerHandle {
             } else if widget_known && !inner.tasks.contains_key(instance_id) {
                 spawn_instance(shared, inner, instance_id.to_string());
             }
+            // Submitted under the state lock, so snapshots reach the saver in
+            // the order the changes happened. The saver writes off-thread.
+            shared.saver.submit(inner.data.clone());
             true
         });
         if changed {
-            // Disk I/O happens outside the state lock. Re-reading the data under
-            // the save lock means concurrent callers always leave the newest on disk.
-            let _order = shared.save_lock.lock().unwrap_or_else(|p| p.into_inner());
-            let snapshot = shared.lock().data.clone();
-            if let Err(e) = instances::save(&shared.instances_path, &snapshot) {
-                log::warn!("cannot save instances: {e}");
-            }
+            log::debug!("{instance_id} hidden: {hidden}; saving in the background");
         }
     }
 
+    /// Waits up to `timeout` for pending `instances.json` writes. Returns
+    /// whether everything reached the disk.
+    pub fn flush_saves(&self, timeout: Duration) -> bool {
+        self.shared.saver.flush(timeout)
+    }
+
     /// Stops all instance loops. A run already executing finishes on its own
-    /// and its result is discarded.
+    /// and its result is discarded. Waits briefly for a pending save, so a
+    /// change made just before quitting is not lost.
     pub fn shutdown(self) {
-        let mut inner = self.shared.lock();
-        for (_, running) in inner.tasks.drain() {
-            running.task.abort();
+        {
+            let mut inner = self.shared.lock();
+            for (_, running) in inner.tasks.drain() {
+                running.task.abort();
+            }
+        }
+        if !self.flush_saves(SHUTDOWN_SAVE_WAIT) {
+            log::warn!("instances.json was not saved within {SHUTDOWN_SAVE_WAIT:?}");
         }
     }
 }
@@ -612,6 +727,7 @@ mod tests {
 
         rig.handle.set_hidden(&id(1), true);
         assert_eq!(rig.last().slots.len(), 1);
+        assert!(rig.handle.flush_saves(Duration::from_secs(5)));
         let saved = crate::instances::load(&rig.path);
         assert!(
             saved
@@ -629,6 +745,77 @@ mod tests {
                 .unwrap()
                 .hidden
         );
+    }
+
+    #[test]
+    fn set_hidden_does_not_wait_for_disk_and_the_last_call_wins() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instances.json");
+        // A writer that blocks until the test opens the gate.
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let (g, w) = (gate.clone(), writes.clone());
+        let writer: Writer = Arc::new(move |p: &Path, d: &Instances| {
+            let (lock, cv) = &*g;
+            let mut open = lock.lock().unwrap();
+            while !*open {
+                open = cv.wait(open).unwrap();
+            }
+            w.fetch_add(1, Ordering::SeqCst);
+            instances::save(p, d)
+        });
+        let published: Published = Arc::default();
+        let sink = published.clone();
+        let handle = rt.block_on(async {
+            Scheduler::start_with_writer(
+                HashMap::from([("w".to_string(), (manifest(), PathBuf::from("wdir")))]),
+                data(vec![inst(1, false), inst(2, false)]),
+                Arc::new(NoHttp),
+                Arc::new(|_| Box::pin(std::future::pending())),
+                path.clone(),
+                writer,
+                move |m| sink.lock().unwrap().push(m),
+            )
+        });
+
+        // Showing an instance spawns its loop, which needs the runtime.
+        let _rt = rt.enter();
+        // The writer is stuck, yet every call returns and publishes at once.
+        let t0 = std::time::Instant::now();
+        handle.set_hidden(&id(1), true);
+        handle.set_hidden(&id(2), true);
+        handle.set_hidden(&id(1), false);
+        assert!(t0.elapsed() < Duration::from_secs(1));
+        let last = published.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(last.slots.len(), 1);
+        assert_eq!(last.slots[0].id, id(1));
+        assert!(!path.exists());
+
+        {
+            let (lock, cv) = &*gate;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        assert!(handle.flush_saves(Duration::from_secs(5)));
+        let saved = instances::load(&path);
+        let hidden = |n: u32| {
+            saved
+                .instances
+                .iter()
+                .find(|i| i.id == id(n))
+                .unwrap()
+                .hidden
+        };
+        assert!(!hidden(1));
+        assert!(hidden(2));
+        // Three changes, coalesced into at most two writes.
+        assert!(writes.load(Ordering::SeqCst) <= 2);
+        handle.shutdown();
+        rt.shutdown_background();
     }
 
     #[tokio::test(start_paused = true)]

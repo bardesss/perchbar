@@ -18,8 +18,9 @@ use chrono::{DateTime, Local};
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, ScreenToClient, SelectObject,
-    AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS,
+    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetMonitorInfoW,
+    MonitorFromPoint, ScreenToClient, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
@@ -32,6 +33,7 @@ use windows::Win32::UI::HiDpi::{
     SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
+use windows::Win32::UI::Input::Touch::{CloseGestureInfoHandle, HGESTUREINFO};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GetCursorPos, GetMessageW, GetWindow, GetWindowRect,
@@ -42,11 +44,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GW_CHILD, HWND_TOP, IDC_ARROW, MA_NOACTIVATE, MF_SEPARATOR, MF_STRING, MSG, OBJID_CLIENT,
     OBJID_WINDOW, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
     TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA, WINDOW_STYLE, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WM_APP, WM_COMMAND, WM_DPICHANGED, WM_DPICHANGED_AFTERPARENT,
-    WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NULL,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOPARENTNOTIFY, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP,
+    WINEVENT_SKIPOWNPROCESS, WM_APP, WM_APPCOMMAND, WM_CHANGEUISTATE, WM_CHAR, WM_COMMAND,
+    WM_CONTEXTMENU, WM_DPICHANGED, WM_DPICHANGED_AFTERPARENT, WM_GESTURE, WM_HELP, WM_KEYDOWN,
+    WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_NULL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE,
+    WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_XBUTTONDBLCLK,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_NOPARENTNOTIFY, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::display::Block;
@@ -69,6 +73,9 @@ const WM_APP_BUTTONS: u32 = WM_APP + 2;
 const CREATE_WARN_INTERVAL: Duration = Duration::from_secs(60);
 /// Not exported by the `windows` features in use.
 const WM_MOUSELEAVE: u32 = 0x02A3;
+const WM_NCXBUTTONDOWN: u32 = 0x00AB;
+const WM_NCXBUTTONUP: u32 = 0x00AC;
+const WM_NCXBUTTONDBLCLK: u32 = 0x00AD;
 
 const T_FALLBACK: usize = 1;
 const T_DEBOUNCE: usize = 2;
@@ -158,9 +165,31 @@ struct State {
     pressed: Option<String>,
     /// Wheel movement not yet worth a whole step.
     wheel_acc: i32,
+    left: ButtonLatch,
+    right: ButtonLatch,
     tooltip: Option<HWND>,
     /// Text and position of the tooltip on screen; `None` while hidden.
     tooltip_shown: Option<(String, i32, i32)>,
+}
+
+/// Remembers that a mouse button went down on the strip, so its button-up
+/// acts only then (not for a press that started elsewhere).
+#[derive(Debug, Default, Clone, Copy)]
+struct ButtonLatch(bool);
+
+impl ButtonLatch {
+    fn down(&mut self) {
+        self.0 = true;
+    }
+
+    /// True when this release ends a press that began on the strip.
+    fn up(&mut self) -> bool {
+        std::mem::take(&mut self.0)
+    }
+
+    fn clear(&mut self) {
+        self.0 = false;
+    }
 }
 
 /// One entry of a popup menu.
@@ -320,6 +349,8 @@ fn setup(
             updated: HashMap::new(),
             pressed: None,
             wheel_acc: 0,
+            left: ButtonLatch::default(),
+            right: ButtonLatch::default(),
             tooltip: None,
             tooltip_shown: None,
         });
@@ -536,6 +567,8 @@ impl State {
         self.hover = None;
         self.pressed = None;
         self.tracking_mouse = false;
+        self.left.clear();
+        self.right.clear();
         self.rot.paused_slot = None;
         self.hide_tooltip();
     }
@@ -834,8 +867,9 @@ impl State {
         }
     }
 
-    /// The tooltip text and screen position for the hovered slot, if any.
-    fn tooltip_target(&self) -> Option<(String, i32, i32)> {
+    /// The tooltip text, the slot's center x on screen and the strip's
+    /// screen rect, for the hovered slot.
+    fn tooltip_target(&self) -> Option<(String, i32, RECT)> {
         let id = self.hover.as_deref()?;
         let slot = self.layout.items.iter().find(|p| p.slot_id == id)?;
         let text = tooltip_text(slot, &self.model, &self.updated)?;
@@ -845,19 +879,39 @@ impl State {
         // SAFETY: our own window; valid out pointer.
         unsafe { GetWindowRect(strip, &mut r) }.ok()?;
         let cx = r.left + layout::px(slot.x_dip + slot.width_dip / 2.0, scale);
-        Some((text, cx, r.top))
+        Some((text, cx, r))
     }
 
     fn show_tooltip(&mut self) {
-        let Some((text, cx, top)) = self.tooltip_target() else {
+        let Some((text, cx, strip_rect)) = self.tooltip_target() else {
             self.hide_tooltip();
             return;
         };
+        let top = strip_rect.top;
         if let Some((t, x, y)) = &self.tooltip_shown {
             if (t, *x, *y) == (&text, cx, top) {
                 return;
             }
         }
+        // The work area of the strip's monitor (local query, no messages).
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: valid point and out struct.
+        let work = unsafe {
+            let mon = MonitorFromPoint(POINT { x: cx, y: top }, MONITOR_DEFAULTTONEAREST);
+            if GetMonitorInfoW(mon, &mut mi).as_bool() {
+                mi.rcWork
+            } else {
+                RECT {
+                    left: i32::MIN / 2,
+                    top: i32::MIN / 2,
+                    right: i32::MAX / 2,
+                    bottom: i32::MAX / 2,
+                }
+            }
+        };
         let Some(tip) = self.tooltip_window() else {
             return;
         };
@@ -873,8 +927,7 @@ impl State {
             let size = SendMessageW(tip, TTM_GETBUBBLESIZE, None, Some(lp)).0;
             let (w, h) = ((size & 0xFFFF) as i32, ((size >> 16) & 0xFFFF) as i32);
             let gap = layout::px(TOOLTIP_GAP_DIP, scale);
-            let x = cx - w / 2;
-            let y = (top - gap - h).max(0);
+            let (x, y) = tooltip_pos(cx, strip_rect, w, h, gap, work);
             let pos = ((y as u16 as u32) << 16) | (x as u16 as u32);
             SendMessageW(tip, TTM_TRACKPOSITION, None, Some(LPARAM(pos as isize)));
             SendMessageW(tip, TTM_TRACKACTIVATE, Some(WPARAM(1)), Some(lp));
@@ -1119,6 +1172,20 @@ fn track_menu(owner: HWND, items: &[MenuItem]) -> u32 {
         let _ = DestroyMenu(menu);
         u32::try_from(picked).unwrap_or(0)
     }
+}
+
+/// Where a `w` x `h` tooltip goes: centered on `cx`, `gap` above the strip,
+/// or below it when that would leave the work area, and kept inside the
+/// work area horizontally.
+fn tooltip_pos(cx: i32, strip: RECT, w: i32, h: i32, gap: i32, work: RECT) -> (i32, i32) {
+    let x = (cx - w / 2).min(work.right - w).max(work.left);
+    let above = strip.top - gap - h;
+    let y = if above >= work.top {
+        above
+    } else {
+        strip.bottom + gap
+    };
+    (x, y)
 }
 
 /// A slot's current state for one instance, wherever it sits in the model.
@@ -1491,20 +1558,33 @@ unsafe extern "system" fn strip_proc(
         WM_MOUSELEAVE => {
             with_state(|s| {
                 s.tracking_mouse = false;
+                // There is no capture: a release off the strip is never seen.
+                s.left.clear();
+                s.right.clear();
                 s.set_hover(None);
             });
             LRESULT(0)
         }
+        WM_LBUTTONDOWN => {
+            with_state(|s| s.left.down());
+            LRESULT(0)
+        }
         WM_LBUTTONUP => {
             let x = lparam_x(lparam);
-            run_menu(with_state(|s| s.on_left_click(x)).flatten());
+            let menu = with_state(|s| s.left.up().then(|| s.on_left_click(x)).flatten());
+            run_menu(menu.flatten());
+            LRESULT(0)
+        }
+        WM_RBUTTONDOWN => {
+            with_state(|s| s.right.down());
             LRESULT(0)
         }
         // Handled here so DefWindowProc does not turn it into WM_CONTEXTMENU,
         // which a child window forwards to Explorer with SendMessage.
         WM_RBUTTONUP => {
             let x = lparam_x(lparam);
-            run_menu(with_state(|s| s.context_menu(x)));
+            let menu = with_state(|s| s.right.up().then(|| s.context_menu(x)));
+            run_menu(menu.flatten());
             LRESULT(0)
         }
         WM_MOUSEWHEEL => {
@@ -1520,9 +1600,23 @@ unsafe extern "system" fn strip_proc(
             }
             LRESULT(0)
         }
-        // DefWindowProc forwards these to the parent (Explorer) with
-        // SendMessage; the strip must never block on Explorer.
-        WM_MOUSEHWHEEL => LRESULT(0),
+        // For a child window, DefWindowProc passes each of these to the
+        // parent (Explorer) with SendMessage, directly or by turning them
+        // into one that it passes on (X buttons become WM_APPCOMMAND, a
+        // right click or Shift+F10 becomes WM_CONTEXTMENU, keys can become
+        // WM_SYSCOMMAND or WM_HELP). The strip must never block on Explorer.
+        // The X button and app command messages want TRUE when handled.
+        WM_MOUSEHWHEEL | WM_CONTEXTMENU | WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP
+        | WM_CHAR | WM_SYSCHAR | WM_SYSCOMMAND | WM_CHANGEUISTATE => LRESULT(0),
+        WM_GESTURE => {
+            // Handling it means closing its handle, which DefWindowProc would
+            // otherwise do after bubbling the message up to Explorer.
+            // SAFETY: lParam of WM_GESTURE is the gesture info handle.
+            let _ = unsafe { CloseGestureInfoHandle(HGESTUREINFO(lparam.0 as _)) };
+            LRESULT(0)
+        }
+        WM_XBUTTONDOWN | WM_XBUTTONUP | WM_XBUTTONDBLCLK | WM_NCXBUTTONDOWN | WM_NCXBUTTONUP
+        | WM_NCXBUTTONDBLCLK | WM_APPCOMMAND | WM_HELP => LRESULT(1),
         WM_SETCURSOR => {
             // SAFETY: a shared system cursor.
             unsafe {
@@ -1813,6 +1907,55 @@ mod tests {
         assert_eq!(acc, 0);
         assert_eq!(wheel_steps(&mut acc, 30), 0);
         assert_eq!(acc, 30);
+    }
+
+    #[test]
+    fn button_up_counts_only_after_a_down_on_the_strip() {
+        let mut b = ButtonLatch::default();
+        // Pressed elsewhere, released over the strip.
+        assert!(!b.up());
+        b.down();
+        assert!(b.up());
+        assert!(!b.up());
+        // Pressed here, dragged off (leave), released back over the strip.
+        b.down();
+        b.clear();
+        assert!(!b.up());
+    }
+
+    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
+        RECT {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn tooltip_sits_above_the_strip_inside_the_work_area() {
+        // Bottom taskbar: the work area ends where the strip starts.
+        let work = rect(0, 0, 2560, 1552);
+        let strip = rect(2136, 1552, 2293, 1600);
+        assert_eq!(
+            tooltip_pos(2200, strip, 100, 30, 6, work),
+            (2150, 1552 - 6 - 30)
+        );
+        // Clamped to the right and left edges of the work area.
+        assert_eq!(tooltip_pos(2540, strip, 100, 30, 6, work).0, 2460);
+        assert_eq!(tooltip_pos(10, strip, 100, 30, 6, work).0, 0);
+    }
+
+    #[test]
+    fn tooltip_flips_below_when_there_is_no_room_above() {
+        // Top taskbar: the work area starts below the strip.
+        let work = rect(0, 48, 1920, 1080);
+        let strip = rect(1500, 0, 1600, 48);
+        assert_eq!(tooltip_pos(1550, strip, 100, 30, 6, work), (1500, 48 + 6));
+        // A secondary monitor left of the primary one has negative x.
+        let work = rect(-1920, 0, 0, 1040);
+        let strip = rect(-500, 1040, -400, 1080);
+        assert_eq!(tooltip_pos(-450, strip, 100, 30, 6, work), (-500, 1004));
     }
 
     #[test]
