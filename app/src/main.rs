@@ -7,6 +7,8 @@ mod instances;
 mod manifest;
 #[allow(dead_code)]
 mod paths;
+#[allow(dead_code)]
+mod sandbox;
 
 fn main() {
     tauri::Builder::default()
