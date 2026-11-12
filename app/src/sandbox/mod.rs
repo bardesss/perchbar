@@ -91,11 +91,29 @@ pub enum RunError {
 
 const PRELUDE: &str = include_str!("prelude.js");
 
+/// Largest result JSON a widget may return; checked before parsing.
+pub const OUTPUT_MAX_BYTES: usize = 128 * 1024;
+/// `RunError` messages are cut to this many characters (they end up in the
+/// log and in tooltips).
+pub const ERROR_MAX_CHARS: usize = 300;
+
+/// Cuts an error message to `ERROR_MAX_CHARS` characters, the last one an
+/// ellipsis, so a widget cannot flood the log or a tooltip.
+fn clip(msg: impl Into<String>) -> String {
+    let msg = msg.into();
+    if msg.chars().count() <= ERROR_MAX_CHARS {
+        return msg;
+    }
+    let mut cut: String = msg.chars().take(ERROR_MAX_CHARS - 1).collect();
+    cut.push('…');
+    cut
+}
+
 /// Runs `widget.js` once in a fresh runtime and returns its parsed output.
 /// Storage changes are saved even when the run fails or times out.
 pub async fn run(ctx: RunContext) -> Result<Output, RunError> {
     let source = std::fs::read_to_string(ctx.widget_dir.join("widget.js"))
-        .map_err(|e| RunError::Script(format!("cannot read widget.js: {e}")))?;
+        .map_err(|e| RunError::Script(clip(format!("cannot read widget.js: {e}"))))?;
     let storage = Arc::new(Mutex::new(host::Storage::load(ctx.storage_path.clone())));
     let limits = ctx.limits;
     let violation = Arc::new(Mutex::new(None));
@@ -112,9 +130,12 @@ pub async fn run(ctx: RunContext) -> Result<Output, RunError> {
     }
 
     let json = result?.ok_or_else(|| RunError::BadOutput("widget returned nothing".into()))?;
+    if json.len() > OUTPUT_MAX_BYTES {
+        return Err(RunError::Script("output too large".into()));
+    }
     let value: Value =
-        serde_json::from_str(&json).map_err(|e| RunError::BadOutput(e.to_string()))?;
-    crate::display::parse(value).map_err(|e| RunError::BadOutput(e.to_string()))
+        serde_json::from_str(&json).map_err(|e| RunError::BadOutput(clip(e.to_string())))?;
+    crate::display::parse(value).map_err(|e| RunError::BadOutput(clip(e.to_string())))
 }
 
 /// Evaluates the prelude and widget in a fresh runtime + context; returns the
@@ -125,7 +146,7 @@ async fn execute(
     storage: Arc<Mutex<host::Storage>>,
     violation: Violation,
 ) -> Result<Option<String>, RunError> {
-    let script_err = |e: rquickjs::Error| RunError::Script(e.to_string());
+    let script_err = |e: rquickjs::Error| RunError::Script(clip(e.to_string()));
     let rt = AsyncRuntime::new().map_err(script_err)?;
     rt.set_memory_limit(ctx.limits.memory_bytes).await;
     let interrupted = Arc::new(AtomicBool::new(false));
@@ -184,9 +205,9 @@ fn classify(
         .as_ref()
         .filter(|v| message.contains(*v))
     {
-        RunError::Permission(v.clone())
+        RunError::Permission(clip(v.clone()))
     } else {
-        RunError::Script(message)
+        RunError::Script(clip(message))
     }
 }
 
@@ -424,6 +445,55 @@ mod tests {
         f.limits.timeout = Duration::from_secs(5);
         let res = f.run().await;
         assert!(matches!(res, Err(RunError::OutOfMemory)), "{res:?}");
+    }
+
+    #[tokio::test]
+    async fn output_over_128kb_is_rejected_before_parsing() {
+        let f = Fixture::new(
+            r#"export default async function update() {
+                return { blocks: [{ type: "text", value: "x".repeat(140000) }] };
+            }"#,
+        );
+        match f.run().await {
+            Err(RunError::Script(m)) => assert_eq!(m, "output too large"),
+            other => panic!("expected Script(output too large), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn output_just_under_128kb_is_accepted() {
+        let f = Fixture::new(
+            r#"export default async function update() {
+                return { blocks: [{ type: "text", value: "x".repeat(120000) }] };
+            }"#,
+        );
+        assert!(f.run().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn long_script_error_is_cut_to_300_chars() {
+        let f = Fixture::new(
+            "export default async function update() {\n  throw new Error(\"e\".repeat(5000));\n}",
+        );
+        match f.run().await {
+            Err(RunError::Script(m)) => {
+                assert_eq!(m.chars().count(), ERROR_MAX_CHARS, "{m}");
+                assert!(m.ends_with('…'));
+            }
+            other => panic!("expected Script error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn long_bad_output_error_is_cut_to_300_chars() {
+        let f = Fixture::new(&format!(
+            "export default async function update() {{ return {{ blocks: [], {}: 1 }}; }}",
+            "k".repeat(1000)
+        ));
+        match f.run().await {
+            Err(RunError::BadOutput(m)) => assert!(m.chars().count() <= ERROR_MAX_CHARS, "{m}"),
+            other => panic!("expected BadOutput error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
