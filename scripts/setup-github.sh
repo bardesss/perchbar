@@ -35,18 +35,6 @@ JSON
 gh api -X PUT "repos/$REPO/vulnerability-alerts"
 gh api -X PUT "repos/$REPO/private-vulnerability-reporting"
 
-# CodeQL default setup. Try Rust + Actions; if the API rejects Rust,
-# fall back to actions only.
-if ! gh api -X PATCH "repos/$REPO/code-scanning/default-setup" --input - <<'JSON'
-{ "state": "configured", "query_suite": "default", "languages": ["actions", "rust"] }
-JSON
-then
-  echo "Rust not supported by CodeQL default setup here; configuring actions only." >&2
-  gh api -X PATCH "repos/$REPO/code-scanning/default-setup" --input - <<'JSON'
-{ "state": "configured", "query_suite": "default", "languages": ["actions"] }
-JSON
-fi
-
 gh api -X PUT "repos/$REPO/actions/permissions/workflow" --input - <<'JSON'
 { "default_workflow_permissions": "read", "can_approve_pull_request_reviews": false }
 JSON
@@ -90,3 +78,11 @@ gh api "repos/$REPO/rulesets" --jq '.[].name'
 
 # Step 7: working branch for Plan 1.
 git switch -c plan-1-core main
+
+# CodeQL default setup. Kept last and non-fatal: the API rejects `rust`
+# (unsupported), and `actions` is only accepted once workflow files exist on
+# the default branch. Re-run this block after .github/workflows is on main.
+gh api -X PATCH "repos/$REPO/code-scanning/default-setup" --input - <<'JSON' \
+  || echo "CodeQL not configured: re-run this step after .github/workflows exists on the default branch." >&2
+{ "state": "configured", "query_suite": "default", "languages": ["actions"] }
+JSON
