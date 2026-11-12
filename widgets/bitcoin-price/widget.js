@@ -11,7 +11,7 @@ export default async function update({ settings, storage, time }) {
   // Coinbase answers {"data":{"amount":"67120.41", ...}}.
   const res = await fetch(`https://api.coinbase.com/v2/prices/${encodeURIComponent(pair)}/spot`);
   if (!res.ok) throw new Error(`Coinbase returned HTTP ${res.status} for ${pair}`);
-  const price = Number((await res.json()).data.amount);
+  const price = Number((await res.json())?.data?.amount);
   if (!Number.isFinite(price)) throw new Error(`Coinbase sent no price for ${pair}`);
 
   // Storage is per instance; start over when the pair changes.
@@ -34,7 +34,7 @@ export default async function update({ settings, storage, time }) {
     blocks.push({ type: "spark", values: history, color: trend });
   }
 
-  const exact = (SYMBOLS[currency] ?? "") + format.number(price, 2);
+  const exact = (SYMBOLS[currency] ?? "") + format.number(price, price < 1 ? 4 : 2);
   const tooltip = `${pair} ${exact} · updated ${time.now().hhmm}`;
   return { blocks, tooltip };
 }

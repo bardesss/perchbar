@@ -129,8 +129,7 @@ async fn bitcoin_template_renders_price() {
         .unwrap();
     let blocks = &out.frames[0].blocks;
     assert!(
-        matches!(&blocks[0], Block::Icon { name: Some(n), .. } if n == "bitcoin")
-            || matches!(&blocks[0], Block::Text { .. }),
+        matches!(&blocks[0], Block::Icon { name: Some(n), .. } if n == "bitcoin"),
         "{blocks:?}"
     );
     assert!(
@@ -199,9 +198,41 @@ async fn bitcoin_template_only_calls_coinbase() {
     assert_eq!(urls.len(), 2);
     for u in &urls {
         let parsed = url::Url::parse(u).unwrap();
+        assert_eq!(parsed.scheme(), "https", "{u}");
         assert_eq!(parsed.host_str(), Some("api.coinbase.com"), "{u}");
     }
     assert!(urls[1].ends_with("/v2/prices/SOL-GBP/spot"), "{urls:?}");
+}
+
+#[tokio::test]
+async fn bitcoin_template_reports_missing_price_clearly() {
+    let w = Installed::new();
+    for body in [r#"{"errors":[{"id":"not_found"}]}"#, "null", r#"{"data":null}"#] {
+        let res = w
+            .run("bitcoin-price", json!({}), FakeHttp::with(&[body]))
+            .await;
+        match res {
+            Err(RunError::Script(m)) => {
+                assert!(m.contains("Coinbase sent no price for BTC-USD"), "{body}: {m}")
+            }
+            other => panic!("{body}: expected Script error, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn bitcoin_template_tooltip_has_four_decimals_below_one() {
+    let w = Installed::new();
+    let out = w
+        .run(
+            "bitcoin-price",
+            json!({"coin": "DOGE"}),
+            FakeHttp::with(&[r#"{"data":{"amount":"0.123456"}}"#]),
+        )
+        .await
+        .unwrap();
+    let tooltip = out.frames[0].tooltip.as_deref().unwrap();
+    assert!(tooltip.starts_with("DOGE-USD $0.1235 \u{b7} "), "{tooltip}");
 }
 
 #[tokio::test]
