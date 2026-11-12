@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::instances::Instances;
-use crate::manifest::Manifest;
+use crate::manifest::{self, Manifest};
 
 /// A widget folder compiled into the binary.
 pub struct Template {
@@ -46,7 +46,8 @@ const FIRST_RUN: &[&str] = &["bitcoin-price", "world-clock"];
 /// Copies each bundled template into `widgets_dir/<id>` unless that folder
 /// already exists, so user edits are never overwritten. Returns the ids
 /// copied. Each folder is written under a temporary name and renamed into
-/// place, so an interrupted copy is redone on the next start.
+/// place, so an interrupted copy is redone on the next start. A template
+/// that cannot be copied is logged and skipped; the others still install.
 pub fn install_bundled(widgets_dir: &Path) -> io::Result<Vec<&'static str>> {
     std::fs::create_dir_all(widgets_dir)?;
     let mut copied = Vec::new();
@@ -55,18 +56,51 @@ pub fn install_bundled(widgets_dir: &Path) -> io::Result<Vec<&'static str>> {
         if target.exists() {
             continue;
         }
-        let partial: PathBuf = widgets_dir.join(format!(".{}.partial", t.id));
-        if partial.exists() {
-            std::fs::remove_dir_all(&partial)?;
+        match install_one(widgets_dir, t, &target) {
+            Ok(()) => copied.push(t.id),
+            Err(e) => log::warn!("cannot install the {} template: {e}", t.id),
         }
-        std::fs::create_dir(&partial)?;
-        for (name, contents) in t.files {
-            std::fs::write(partial.join(name), contents)?;
-        }
-        std::fs::rename(&partial, &target)?;
-        copied.push(t.id);
     }
     Ok(copied)
+}
+
+fn install_one(widgets_dir: &Path, t: &Template, target: &Path) -> io::Result<()> {
+    let partial: PathBuf = widgets_dir.join(format!(".{}.partial", t.id));
+    if partial.exists() {
+        std::fs::remove_dir_all(&partial)?;
+    }
+    std::fs::create_dir(&partial)?;
+    for (name, contents) in t.files {
+        std::fs::write(partial.join(name), contents)?;
+    }
+    std::fs::rename(&partial, target)
+}
+
+/// Installed widgets by manifest id. Folders that fail to load, and folders
+/// whose name starts with '.', are skipped.
+pub fn load_widgets(dir: &Path) -> HashMap<String, (Arc<Manifest>, PathBuf)> {
+    let mut widgets = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        log::info!("no widgets folder at {}", dir.display());
+        return widgets;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Dot folders are partial template copies or hidden user folders.
+        if !path.is_dir() || entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        match manifest::load(&path) {
+            Ok(m) if widgets.contains_key(&m.id) => {
+                log::warn!("skipping {}: duplicate widget id {}", path.display(), m.id);
+            }
+            Ok(m) => {
+                widgets.insert(m.id.clone(), (Arc::new(m), path));
+            }
+            Err(e) => log::warn!("skipping widget {}: {e}", path.display()),
+        }
+    }
+    widgets
 }
 
 /// On a first run (no instances yet) adds one instance of each first-run
@@ -128,6 +162,34 @@ mod tests {
         install_bundled(dir.path()).unwrap();
         assert!(!partial.exists());
         assert!(!dir.path().join("bitcoin-price").join("junk").exists());
+    }
+
+    #[test]
+    fn install_logs_a_failing_template_and_installs_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        // A file where the partial folder goes: removing it as a folder fails.
+        std::fs::write(dir.path().join(".bitcoin-price.partial"), "x").unwrap();
+        assert_eq!(install_bundled(dir.path()).unwrap(), ["world-clock"]);
+        assert!(dir.path().join("world-clock").join("widget.js").is_file());
+        assert!(!dir.path().join("bitcoin-price").exists());
+    }
+
+    #[test]
+    fn load_widgets_skips_dot_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        install_bundled(dir.path()).unwrap();
+        let hidden = dir.path().join(".leftover");
+        std::fs::create_dir(&hidden).unwrap();
+        std::fs::write(
+            hidden.join("widget.json"),
+            r#"{"id":"leftover","name":"L","formatVersion":1}"#,
+        )
+        .unwrap();
+        std::fs::write(hidden.join("widget.js"), "export default async function update() {}")
+            .unwrap();
+        let mut ids: Vec<String> = load_widgets(dir.path()).into_keys().collect();
+        ids.sort();
+        assert_eq!(ids, ["bitcoin-price", "world-clock"]);
     }
 
     #[test]

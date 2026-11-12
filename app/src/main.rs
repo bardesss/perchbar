@@ -8,7 +8,6 @@ use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use perchbar::manifest::{self, Manifest};
 use perchbar::sandbox::ReqwestClient;
 use perchbar::scheduler::Scheduler;
 use perchbar::strip::{self, StripEvent};
@@ -30,31 +29,6 @@ fn first_instance() -> bool {
             Err(_) => true,
         }
     }
-}
-
-/// Installed widgets by manifest id. Folders that fail to load are skipped.
-fn load_widgets(dir: &Path) -> HashMap<String, (Arc<Manifest>, PathBuf)> {
-    let mut widgets = HashMap::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        log::info!("no widgets folder at {}", dir.display());
-        return widgets;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        match manifest::load(&path) {
-            Ok(m) if widgets.contains_key(&m.id) => {
-                log::warn!("skipping {}: duplicate widget id {}", path.display(), m.id);
-            }
-            Ok(m) => {
-                widgets.insert(m.id.clone(), (Arc::new(m), path));
-            }
-            Err(e) => log::warn!("skipping widget {}: {e}", path.display()),
-        }
-    }
-    widgets
 }
 
 /// How long exit waits for the strip thread to tear down.
@@ -94,7 +68,7 @@ fn main() {
         Err(e) => log::warn!("cannot install bundled templates: {e}"),
     }
 
-    let widgets = load_widgets(&widgets_dir);
+    let widgets = setup::load_widgets(&widgets_dir);
     let known: HashSet<String> = widgets.keys().cloned().collect();
     let names: HashMap<PathBuf, String> = widgets
         .values()
