@@ -101,7 +101,7 @@ A widget returns a description of what to show, composed from:
 - **text** (with optional emphasis/size variants appropriate to taskbar height)
 - **icon**: a built-in icon (Windows 11 icon font) **or a custom image shipped in the widget's folder** (SVG or PNG, e.g. the Claude logo). An optional `tint` recolors a single-color logo to follow the text color, so it works in both dark and light mode. Full-color images are drawn as they are. Images must live inside the widget folder (no URLs, no `..`), max 256 KB each.
 - **color** (for text/icon/bar; also semantic colors like up/down/warning that adapt to light/dark)
-- **progress bar / ring** (0–100%)
+- **progress bar / ring** (0 to 100%)
 - **mini chart / sparkline** (a short series of numbers)
 - **rotate**: a list of frames the strip cycles through every N seconds (used by rotating prices and could be used by world clock)
 - **tooltip** text (shown on hover with more detail)
@@ -120,7 +120,7 @@ Widget JS runs in an embedded JS engine inside the Rust core (e.g. QuickJS via `
 - Each widget isolated from the others (separate context; no shared globals).
 - Settings marked `secret` are stored encrypted with Windows DPAPI (user scope) and never shown in logs.
 
-Permissions are shown to the user at install time ("This widget will contact: api.coinbase.com. It will read: ~/.claude/.credentials.json"). Widgets from the catalog have been reviewed through PR; widgets loaded from a local folder are marked "Local – not reviewed."
+Permissions are shown to the user at install time ("This widget will contact: api.coinbase.com. It will read: ~/.claude/.credentials.json"). Widgets from the catalog have been reviewed through PR; widgets loaded from a local folder are marked "Local: not reviewed."
 
 ### 5.5 Catalog
 
@@ -170,7 +170,7 @@ Permissions are shown to the user at install time ("This widget will contact: ap
 | **Rotating prices** | Crypto: public API, no key. Stocks: free-key provider (e.g. Finnhub) via a `secret` setting | Cycles through a user-defined list of tickers with price, change color, optional sparkline | `rotate`, list setting, secret setting, sparkline |
 | **Weather** | Free no-key weather API (e.g. Open-Meteo) for a chosen city | Temp + condition icon; details in tooltip | Location setting, icons |
 | **World clock** | None (host time source) | Time in one or more chosen cities; may rotate | No network, time zones |
-| **Now playing** | Host `media` source: current Windows media session via `GlobalSystemMediaTransportControlsSessionManager` (Spotify, browsers, most players). No sign-in, no network. | Title – artist (truncated), small artwork or play-state icon; hidden or dimmed when nothing plays. Click = play/pause (designer's call). | Built-in source, click action |
+| **Now playing** | Host `media` source: current Windows media session via `GlobalSystemMediaTransportControlsSessionManager` (Spotify, browsers, most players). No sign-in, no network. | Title - artist (truncated), small artwork or play-state icon; hidden or dimmed when nothing plays. Click = play/pause (designer's call). | Built-in source, click action |
 | **Device battery** | Host `battery` source: laptop battery + Bluetooth devices that report battery via Windows | Level per device (ring/bar + %), low-battery color | Built-in source permission |
 
 Claude limit notes:
@@ -188,7 +188,7 @@ Claude limit notes:
 ## 9. Left to the builder
 
 - Settings window UI framework and visual design (must feel like Windows 11).
-- Exact JS engine, exact `widget.js` function signature, and the exact return-value schema, within §5.2–5.4.
+- Exact JS engine, exact `widget.js` function signature, and the exact return-value schema, within §5.2 to 5.4.
 - Rendering library choice.
 - Specific public APIs for crypto prices and weather.
 - Catalog index format details and the CI validation implementation.
