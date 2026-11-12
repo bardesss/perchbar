@@ -247,6 +247,16 @@ fn main() {
     // Squeeze out the last slots so the "+N" item shows.
     metrics.available_dip = layout(&model, &rot, &metrics, &r).width_dip - 60.0;
     let l = layout(&model, &rot, &metrics, &r);
+    // Custom icons rasterize in the background: draw once, then wait.
+    let (_, sys) = theme::current();
+    let _ = r.render(
+        &l,
+        &model,
+        &metrics,
+        &theme::palette(true, sys.accent),
+        None,
+    );
+    r.settle_icons(std::time::Duration::from_secs(10));
     for (name, dark, bg) in [("dark", true, DARK_BG), ("light", false, LIGHT_BG)] {
         let (_, sys) = theme::current();
         let pal = theme::palette(dark, sys.accent);

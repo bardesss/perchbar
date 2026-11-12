@@ -1,10 +1,23 @@
 //! Custom widget icons (SVG or PNG files inside the widget folder).
+//!
+//! The strip thread never touches the disk or rasterizes here. [`ImageCache`]
+//! hands each (widget folder, src, pixel size) to one background worker
+//! thread, draws the placeholder dot while it is pending, and picks the
+//! result up on a later draw; the worker calls the `notify` callback (the
+//! strip posts itself a message) when a result is ready.
+//!
+//! The worker resolves the file (canonical path, mtime, size) and keeps the
+//! rasters keyed by (canonical path, mtime, file size, pixel size). Tint is
+//! never part of a key: it is applied to a copy of the cached raster. Failed
+//! rasterizations (errors and timeouts) are remembered per key apart from
+//! the rasters, so trimming the rasters never retries a broken file.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::SystemTime;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use resvg::tiny_skia::{FilterQuality, Pixmap, PixmapPaint, Transform};
 use resvg::usvg;
@@ -21,28 +34,133 @@ const MAX_PNG_DECODE_BYTES: usize = 8 * 1024 * 1024;
 const SVG_MAX_DEPTH: u32 = 32;
 /// Most elements an icon may have once `<use>` references are expanded.
 const SVG_MAX_ELEMENTS: u64 = 10_000;
-/// Stack for the SVG worker thread.
+/// Stack for the SVG rasterizer thread.
 const SVG_THREAD_STACK: usize = 16 * 1024 * 1024;
-/// Entries kept before the cache is emptied (old mtimes pile up otherwise).
+/// An SVG that takes longer than this counts as failed.
+const SVG_TIMEOUT: Duration = Duration::from_secs(3);
+/// Rasters (and strip-side entries) kept; the least recently used goes first.
 const MAX_ENTRIES: usize = 256;
+/// Failed keys kept. They are tiny, and only new files or sizes add one.
+const MAX_FAILURES: usize = 4096;
+/// A shown icon is re-resolved (off the strip thread) at most this often,
+/// so an edited file shows up without disk I/O on every draw.
+const REVALIDATE: Duration = Duration::from_secs(5);
 
-type Key = (PathBuf, SystemTime, u32, Option<[u8; 4]>);
+/// Turns a resolved icon file into a `size` x `size` bitmap. Injectable so
+/// tests can count rasterizations.
+pub type Rasterizer = Arc<dyn Fn(&Path, u32) -> Result<Bitmap, String> + Send + Sync>;
+/// Called on the worker thread whenever a result is ready.
+pub type Notify = Arc<dyn Fn() + Send + Sync>;
 
-/// Rasterized custom icons, keyed by (canonical path, mtime, size, tint).
+/// What the strip asks for: (widget folder, src, pixel size).
+type Request = (PathBuf, String, u32);
+/// What a raster depends on: (canonical path, mtime, file size, pixel size).
+type RasterKey = (PathBuf, SystemTime, u64, u32);
+/// A finished request; `None` means draw the fallback dot.
+type Done = (Request, Option<Arc<Bitmap>>);
+
+/// What the strip last got for a request.
+struct Shown {
+    bitmap: Option<Arc<Bitmap>>,
+    /// When the worker last resolved it; `None` forces a recheck.
+    checked: Option<Instant>,
+    used: u64,
+}
+
 #[derive(Default)]
+struct QueueState {
+    jobs: VecDeque<Request>,
+    closed: bool,
+}
+
+#[derive(Default)]
+struct Queue {
+    state: Mutex<QueueState>,
+    cv: Condvar,
+}
+
+impl Queue {
+    /// Adds `req` unless it is already waiting.
+    fn push(&self, req: Request) {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if !s.jobs.contains(&req) {
+            s.jobs.push_back(req);
+            self.cv.notify_one();
+        }
+    }
+
+    /// The next job, or `None` once closed.
+    fn pop(&self) -> Option<Request> {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if s.closed {
+                return None;
+            }
+            if let Some(j) = s.jobs.pop_front() {
+                return Some(j);
+            }
+            s = self.cv.wait(s).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+
+    fn close(&self) {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).closed = true;
+        self.cv.notify_all();
+    }
+}
+
+/// The strip-side icon cache. Never blocks: `get` returns what is ready and
+/// queues the rest for the worker.
 pub struct ImageCache {
-    entries: HashMap<Key, Option<Arc<Bitmap>>>,
-    /// Problems already logged, so a broken icon is reported once.
-    logged: HashSet<String>,
+    shown: HashMap<Request, Shown>,
+    /// Requests sent to the worker and not answered yet.
+    pending: HashSet<Request>,
+    queue: Arc<Queue>,
+    results: Receiver<Done>,
+    clock: u64,
+}
+
+impl Default for ImageCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ImageCache {
+    /// A cache with the real rasterizer and no notification.
     pub fn new() -> Self {
-        Self::default()
+        Self::with(Arc::new(load), Arc::new(|| {}))
     }
 
-    /// The icon `src` from `widget_dir`, scaled to `size_px` square and
-    /// optionally tinted. `None` means the caller draws the fallback dot.
+    /// A cache whose worker calls `notify` after each result.
+    pub fn with_notify(notify: Notify) -> Self {
+        Self::with(Arc::new(load), notify)
+    }
+
+    pub fn with(rasterize: Rasterizer, notify: Notify) -> Self {
+        let queue = Arc::new(Queue::default());
+        let (tx, results) = mpsc::channel();
+        let q = queue.clone();
+        let spawned = std::thread::Builder::new()
+            .name("perchbar-icons".into())
+            .spawn(move || worker(&q, &tx, &rasterize, &notify));
+        if let Err(e) = spawned {
+            // Without the worker every icon stays a dot; nothing blocks.
+            log::warn!("cannot start the icon worker ({e}); custom icons show as dots");
+        }
+        ImageCache {
+            shown: HashMap::new(),
+            pending: HashSet::new(),
+            queue,
+            results,
+            clock: 0,
+        }
+    }
+
+    /// The icon `src` from `widget_dir`, `size_px` square and optionally
+    /// tinted, if it is ready. `None` means the caller draws the fallback
+    /// dot: the icon is broken, or still being rasterized (a later draw,
+    /// after `notify`, picks it up).
     pub fn get(
         &mut self,
         widget_dir: &Path,
@@ -53,52 +171,200 @@ impl ImageCache {
         if size_px == 0 {
             return None;
         }
-        let path = match resolve(widget_dir, src) {
-            Ok(p) => p,
-            Err(why) => {
-                self.log_once(widget_dir, src, &why);
-                return None;
+        self.poll();
+        self.clock += 1;
+        let req: Request = (widget_dir.to_path_buf(), src.to_string(), size_px);
+        let (bitmap, recheck) = match self.shown.get_mut(&req) {
+            Some(e) => {
+                e.used = self.clock;
+                let due = e.checked.is_none_or(|t| t.elapsed() >= REVALIDATE);
+                (e.bitmap.clone(), due)
             }
+            None => (None, true),
         };
-        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
-        let key = (path, mtime, size_px, tint);
-        if let Some(hit) = self.entries.get(&key) {
-            return hit.clone();
+        if recheck && self.pending.insert(req.clone()) {
+            self.queue.push(req);
         }
-        let made = load(&key.0, size_px).map(|mut b| {
-            if let Some(t) = tint {
-                apply_tint(&mut b, t);
+        let bitmap = bitmap?;
+        Some(match tint {
+            Some(t) => {
+                let mut copy = (*bitmap).clone();
+                apply_tint(&mut copy, t);
+                Arc::new(copy)
             }
-            Arc::new(b)
-        });
-        let made = match made {
-            Ok(b) => Some(b),
-            Err(why) => {
-                self.log_once(widget_dir, src, &why);
-                None
-            }
-        };
-        if self.entries.len() >= MAX_ENTRIES {
-            self.entries.clear();
-        }
-        self.entries.insert(key, made.clone());
-        made
+            None => bitmap,
+        })
     }
 
-    fn log_once(&mut self, widget_dir: &Path, src: &str, why: &str) {
-        let id = format!("{}|{src}|{why}", widget_dir.display());
-        if self.logged.insert(id) {
-            log::warn!(
-                "icon {src:?} in {}: {why}; drawing a dot instead",
-                widget_dir.display()
-            );
+    /// Takes the worker's finished results. Returns whether any of them
+    /// changes what a draw would show.
+    pub fn poll(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(done) = self.results.try_recv() {
+            changed |= self.accept(done);
+        }
+        changed
+    }
+
+    /// Makes every icon re-resolve on its next draw (a widget published new
+    /// output, so its files may have changed).
+    pub fn invalidate(&mut self) {
+        for e in self.shown.values_mut() {
+            e.checked = None;
+        }
+    }
+
+    /// Waits up to `timeout` for every pending request. For tests and
+    /// offline renders only: the strip thread must never call it.
+    pub fn settle(&mut self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while !self.pending.is_empty() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.results.recv_timeout(left) {
+                Ok(done) => {
+                    self.accept(done);
+                }
+                Err(_) => return false,
+            }
+        }
+        true
+    }
+
+    fn accept(&mut self, (req, bitmap): Done) -> bool {
+        self.pending.remove(&req);
+        let changed = match self.shown.get(&req) {
+            None => true,
+            Some(old) => match (&old.bitmap, &bitmap) {
+                (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
+                (None, None) => false,
+                _ => true,
+            },
+        };
+        if !self.shown.contains_key(&req) && self.shown.len() >= MAX_ENTRIES {
+            if let Some(oldest) = self
+                .shown
+                .iter()
+                .min_by_key(|(_, e)| e.used)
+                .map(|(k, _)| k.clone())
+            {
+                self.shown.remove(&oldest);
+            }
+        }
+        self.shown.insert(
+            req,
+            Shown {
+                bitmap,
+                checked: Some(Instant::now()),
+                used: self.clock,
+            },
+        );
+        changed
+    }
+}
+
+impl Drop for ImageCache {
+    fn drop(&mut self) {
+        self.queue.close();
+    }
+}
+
+/// Rasters by key, least recently used evicted first, and failed keys kept
+/// apart so trimming never brings a broken file back.
+#[derive(Default)]
+struct RasterCache {
+    ok: HashMap<RasterKey, (Arc<Bitmap>, u64)>,
+    failed: HashSet<RasterKey>,
+    clock: u64,
+}
+
+impl RasterCache {
+    /// `Some(None)` for a known failure, `None` when not cached.
+    fn get(&mut self, key: &RasterKey) -> Option<Option<Arc<Bitmap>>> {
+        if self.failed.contains(key) {
+            return Some(None);
+        }
+        self.clock += 1;
+        let clock = self.clock;
+        self.ok.get_mut(key).map(|(b, used)| {
+            *used = clock;
+            Some(b.clone())
+        })
+    }
+
+    fn insert(&mut self, key: RasterKey, result: Option<Arc<Bitmap>>) {
+        match result {
+            Some(b) => {
+                if self.ok.len() >= MAX_ENTRIES {
+                    if let Some(oldest) = self
+                        .ok
+                        .iter()
+                        .min_by_key(|(_, (_, used))| *used)
+                        .map(|(k, _)| k.clone())
+                    {
+                        self.ok.remove(&oldest);
+                    }
+                }
+                self.clock += 1;
+                self.ok.insert(key, (b, self.clock));
+            }
+            None => {
+                if self.failed.len() >= MAX_FAILURES {
+                    self.failed.clear();
+                }
+                self.failed.insert(key);
+            }
         }
     }
 }
 
+/// The worker loop: resolve, look up or rasterize, send, notify.
+fn worker(queue: &Queue, tx: &Sender<Done>, rasterize: &Rasterizer, notify: &Notify) {
+    let mut cache = RasterCache::default();
+    let mut logged: HashSet<String> = HashSet::new();
+    let mut log_once = |dir: &Path, src: &str, why: &str| {
+        if logged.insert(format!("{}|{src}|{why}", dir.display())) {
+            log::warn!(
+                "icon {src:?} in {}: {why}; drawing a dot instead",
+                dir.display()
+            );
+        }
+    };
+    while let Some(req) = queue.pop() {
+        let (dir, src, size) = (&req.0, req.1.as_str(), req.2);
+        let bitmap = match resolve(dir, src) {
+            Err(why) => {
+                log_once(dir, src, &why);
+                None
+            }
+            Ok((path, mtime, len)) => {
+                let key: RasterKey = (path, mtime, len, size);
+                match cache.get(&key) {
+                    Some(hit) => hit,
+                    None => {
+                        let made = match rasterize(&key.0, size) {
+                            Ok(b) => Some(Arc::new(b)),
+                            Err(why) => {
+                                log_once(dir, src, &why);
+                                None
+                            }
+                        };
+                        cache.insert(key, made.clone());
+                        made
+                    }
+                }
+            }
+        };
+        if tx.send((req, bitmap)).is_err() {
+            return;
+        }
+        notify();
+    }
+}
+
 /// Resolves `src` inside `widget_dir`, following links, and refuses anything
-/// that ends up outside the folder or is too big.
-fn resolve(widget_dir: &Path, src: &str) -> Result<PathBuf, String> {
+/// that ends up outside the folder or is too big. Returns the canonical
+/// path, its mtime and its size.
+fn resolve(widget_dir: &Path, src: &str) -> Result<(PathBuf, SystemTime, u64), String> {
     // ':' covers drive letters, NTFS alternate data streams and `data:` URLs.
     if src.is_empty() || src.contains(':') {
         return Err("invalid path".into());
@@ -115,7 +381,8 @@ fn resolve(widget_dir: &Path, src: &str) -> Result<PathBuf, String> {
     if meta.len() > MAX_ICON_BYTES {
         return Err("larger than 256 KB".into());
     }
-    Ok(file)
+    let mtime = meta.modified().map_err(|e| e.to_string())?;
+    Ok((file, mtime, meta.len()))
 }
 
 fn load(path: &Path, size_px: u32) -> Result<Bitmap, String> {
@@ -212,15 +479,23 @@ fn expanded_elements(data: &[u8]) -> Option<u64> {
 
 /// Parses and rasterizes on a fresh thread with a large stack, so a deeply
 /// nested file can never overflow the caller's stack (an overflow aborts the
-/// process and cannot be caught). Loads are rare and cached.
+/// process and cannot be caught). Runs on the icon worker, never the strip.
 fn rasterize_svg_isolated(data: Vec<u8>, size: u32) -> Result<Pixmap, String> {
+    let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("svg-icon".into())
         .stack_size(SVG_THREAD_STACK)
-        .spawn(move || rasterize_svg(&data, size))
-        .map_err(|e| format!("cannot start SVG thread: {e}"))?
-        .join()
-        .map_err(|_| "SVG rasterizer panicked".to_string())?
+        .spawn(move || {
+            let _ = tx.send(rasterize_svg(&data, size));
+        })
+        .map_err(|e| format!("cannot start SVG thread: {e}"))?;
+    // A slow file is given up on (and cached as failed); its thread is
+    // left to finish on its own.
+    match rx.recv_timeout(SVG_TIMEOUT) {
+        Ok(r) => r,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err("took too long to draw".into()),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err("SVG rasterizer panicked".into()),
+    }
 }
 
 /// Uniform scale and offset that fit `w` x `h` centered in a square.
@@ -326,6 +601,22 @@ pub fn apply_tint(b: &mut Bitmap, tint: [u8; 4]) {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    impl ImageCache {
+        /// `get`, waiting for the worker if the icon is not ready yet.
+        fn get_wait(
+            &mut self,
+            dir: &Path,
+            src: &str,
+            size: u32,
+            tint: Option<[u8; 4]>,
+        ) -> Option<Arc<Bitmap>> {
+            self.get(dir, src, size, tint);
+            assert!(self.settle(Duration::from_secs(20)), "icon worker stuck");
+            self.get(dir, src, size, tint)
+        }
+    }
 
     fn fixtures() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -361,11 +652,11 @@ mod tests {
     #[test]
     fn svg_icon_rasterizes_at_scale() {
         let mut c = ImageCache::new();
-        let b = c.get(&fixtures(), "logo.svg", 24, None).expect("svg");
+        let b = c.get_wait(&fixtures(), "logo.svg", 24, None).expect("svg");
         assert_eq!((b.width, b.height), (24, 24));
         assert_eq!(b.pixels.len(), 24 * 24 * 4);
         assert!(max_alpha(&b) > 0);
-        let big = c.get(&fixtures(), "logo.svg", 36, None).expect("svg");
+        let big = c.get_wait(&fixtures(), "logo.svg", 36, None).expect("svg");
         assert_eq!((big.width, big.height), (36, 36));
     }
 
@@ -374,7 +665,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.png"), png_bytes(8, 8, [0, 0, 255, 255])).unwrap();
         let mut c = ImageCache::new();
-        let b = c.get(dir.path(), "a.png", 16, None).expect("png");
+        let b = c.get_wait(dir.path(), "a.png", 16, None).expect("png");
         assert_eq!((b.width, b.height), (16, 16));
         // BGRA: opaque blue in the middle.
         let mid = ((8 * 16 + 8) * 4) as usize;
@@ -384,9 +675,9 @@ mod tests {
     #[test]
     fn tint_replaces_color_keeps_alpha() {
         let mut c = ImageCache::new();
-        let plain = c.get(&fixtures(), "logo.svg", 24, None).expect("svg");
+        let plain = c.get_wait(&fixtures(), "logo.svg", 24, None).expect("svg");
         let red = c
-            .get(&fixtures(), "logo.svg", 24, Some([255, 0, 0, 255]))
+            .get_wait(&fixtures(), "logo.svg", 24, Some([255, 0, 0, 255]))
             .expect("tinted");
         assert_eq!(plain.pixels.len(), red.pixels.len());
         for (p, t) in plain.pixels.chunks(4).zip(red.pixels.chunks(4)) {
@@ -415,11 +706,13 @@ mod tests {
         assert!(widget.join("link").join("evil.svg").exists());
 
         let mut c = ImageCache::new();
-        assert!(c.get(&widget, "ok.svg", 16, None).is_some());
-        assert!(c.get(&outside, "evil.svg", 16, None).is_some());
-        assert!(c.get(&widget, "link/evil.svg", 16, None).is_none());
-        assert!(c.get(&widget, "link\\evil.svg", 16, None).is_none());
-        assert!(c.get(&widget, "../outside/evil.svg", 16, None).is_none());
+        assert!(c.get_wait(&widget, "ok.svg", 16, None).is_some());
+        assert!(c.get_wait(&outside, "evil.svg", 16, None).is_some());
+        assert!(c.get_wait(&widget, "link/evil.svg", 16, None).is_none());
+        assert!(c.get_wait(&widget, "link\\evil.svg", 16, None).is_none());
+        assert!(c
+            .get_wait(&widget, "../outside/evil.svg", 16, None)
+            .is_none());
     }
 
     #[test]
@@ -427,14 +720,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::copy(fixtures().join("logo.svg"), dir.path().join("a.svg")).unwrap();
         let mut c = ImageCache::new();
-        assert!(c.get(dir.path(), "a.svg", 16, None).is_some());
-        assert!(c.get(dir.path(), "a.svg:x", 16, None).is_none());
-        assert!(c.get(dir.path(), "a.svg::$DATA", 16, None).is_none());
+        assert!(c.get_wait(dir.path(), "a.svg", 16, None).is_some());
+        assert!(c.get_wait(dir.path(), "a.svg:x", 16, None).is_none());
+        assert!(c.get_wait(dir.path(), "a.svg::$DATA", 16, None).is_none());
         assert!(c
-            .get(dir.path(), "data:image/svg+xml,<svg/>", 16, None)
+            .get_wait(dir.path(), "data:image/svg+xml,<svg/>", 16, None)
             .is_none());
         let abs = dir.path().join("a.svg");
-        assert!(c.get(dir.path(), abs.to_str().unwrap(), 16, None).is_none());
+        assert!(c
+            .get_wait(dir.path(), abs.to_str().unwrap(), 16, None)
+            .is_none());
     }
 
     #[test]
@@ -444,7 +739,7 @@ mod tests {
         bytes.resize(300 * 1024, 0);
         std::fs::write(dir.path().join("big.png"), &bytes).unwrap();
         let mut c = ImageCache::new();
-        assert!(c.get(dir.path(), "big.png", 16, None).is_none());
+        assert!(c.get_wait(dir.path(), "big.png", 16, None).is_none());
     }
 
     #[test]
@@ -453,15 +748,15 @@ mod tests {
         std::fs::write(dir.path().join("bad.svg"), b"not svg").unwrap();
         std::fs::write(dir.path().join("bad.png"), b"not png").unwrap();
         let mut c = ImageCache::new();
-        assert!(c.get(dir.path(), "missing.svg", 16, None).is_none());
-        assert!(c.get(dir.path(), "bad.svg", 16, None).is_none());
-        assert!(c.get(dir.path(), "bad.png", 16, None).is_none());
+        assert!(c.get_wait(dir.path(), "missing.svg", 16, None).is_none());
+        assert!(c.get_wait(dir.path(), "bad.svg", 16, None).is_none());
+        assert!(c.get_wait(dir.path(), "bad.png", 16, None).is_none());
     }
 
     #[test]
     fn deeply_nested_svg_is_rejected_without_crashing() {
-        // Runs on the test thread: a stack overflow here would abort the
-        // whole test binary, so passing proves the caller's stack is safe.
+        // A stack overflow on the icon worker would abort the whole test
+        // binary, so passing proves its stack is safe.
         let depth = 1000;
         let mut svg = String::from(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 4">"#);
         svg.push_str(&r#"<g opacity=".9">"#.repeat(depth));
@@ -472,7 +767,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("deep.svg"), svg).unwrap();
         let mut c = ImageCache::new();
-        if let Some(b) = c.get(dir.path(), "deep.svg", 16, None) {
+        if let Some(b) = c.get_wait(dir.path(), "deep.svg", 16, None) {
             assert_eq!((b.width, b.height), (16, 16));
         }
     }
@@ -496,7 +791,7 @@ mod tests {
         std::fs::write(dir.path().join("fan.svg"), svg).unwrap();
         let start = std::time::Instant::now();
         let mut c = ImageCache::new();
-        assert!(c.get(dir.path(), "fan.svg", 16, None).is_none());
+        assert!(c.get_wait(dir.path(), "fan.svg", 16, None).is_none());
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
 
@@ -534,5 +829,129 @@ mod tests {
             let tree = svg_tree(svg.as_bytes()).expect("svg parses");
             assert!(!has_image(tree.root()), "image {href} must not be loaded");
         }
+    }
+
+    /// A rasterizer that counts its calls and fails when `fail` is set.
+    fn counting(fail: bool) -> (Rasterizer, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let r: Rasterizer = Arc::new(move |_path: &Path, size: u32| {
+            c.fetch_add(1, Ordering::SeqCst);
+            if fail {
+                return Err("fake failure".into());
+            }
+            let n = size as usize;
+            Ok(Bitmap {
+                width: size as i32,
+                height: size as i32,
+                pixels: [0u8, 0, 0, 255].repeat(n * n),
+            })
+        });
+        (r, calls)
+    }
+
+    #[test]
+    fn tint_change_does_not_rasterize_again() {
+        let (r, calls) = counting(false);
+        let mut c = ImageCache::with(r, Arc::new(|| {}));
+        let plain = c
+            .get_wait(&fixtures(), "logo.svg", 24, None)
+            .expect("plain");
+        let red = c
+            .get(&fixtures(), "logo.svg", 24, Some([255, 0, 0, 255]))
+            .expect("tinted copy is ready at once");
+        let blue = c
+            .get(&fixtures(), "logo.svg", 24, Some([0, 0, 255, 255]))
+            .expect("tinted copy is ready at once");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(&red.pixels[..4], &[0, 0, 255, 255]);
+        assert_eq!(&blue.pixels[..4], &[255, 0, 0, 255]);
+        // The cached raster itself is untouched by tinting.
+        assert_eq!(&plain.pixels[..4], &[0, 0, 0, 255]);
+        let again = c.get(&fixtures(), "logo.svg", 24, None).unwrap();
+        assert!(Arc::ptr_eq(&plain, &again));
+    }
+
+    #[test]
+    fn failure_is_cached_and_not_retried() {
+        let (r, calls) = counting(true);
+        let mut c = ImageCache::with(r, Arc::new(|| {}));
+        assert!(c.get_wait(&fixtures(), "logo.svg", 24, None).is_none());
+        assert!(c.get(&fixtures(), "logo.svg", 24, None).is_none());
+        // A publish makes it re-resolve; the same file is still known bad.
+        c.invalidate();
+        assert!(c.get_wait(&fixtures(), "logo.svg", 24, None).is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn get_never_waits_and_notify_fires_when_ready() {
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let gate = Mutex::new(gate_rx);
+        let r: Rasterizer = Arc::new(move |_: &Path, size: u32| {
+            // Blocks until the test lets it finish.
+            let _ = gate.lock().unwrap().recv();
+            Ok(Bitmap {
+                width: size as i32,
+                height: size as i32,
+                pixels: vec![0; (size * size * 4) as usize],
+            })
+        });
+        let notified = Arc::new(AtomicUsize::new(0));
+        let n = notified.clone();
+        let mut c = ImageCache::with(
+            r,
+            Arc::new(move || {
+                n.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            // Pending: the placeholder is drawn, and no duplicate requests.
+            assert!(c.get(&fixtures(), "logo.svg", 16, None).is_none());
+        }
+        assert!(t0.elapsed() < Duration::from_secs(1));
+        assert_eq!(c.pending.len(), 1);
+        gate_tx.send(()).unwrap();
+        assert!(c.settle(Duration::from_secs(20)));
+        assert_eq!(notified.load(Ordering::SeqCst), 1);
+        assert!(c.get(&fixtures(), "logo.svg", 16, None).is_some());
+    }
+
+    fn key(n: u32) -> RasterKey {
+        (
+            PathBuf::from(format!("f{n}.svg")),
+            SystemTime::UNIX_EPOCH,
+            1,
+            16,
+        )
+    }
+
+    fn tiny() -> Option<Arc<Bitmap>> {
+        Some(Arc::new(Bitmap {
+            width: 1,
+            height: 1,
+            pixels: vec![0; 4],
+        }))
+    }
+
+    #[test]
+    fn raster_cache_evicts_least_recently_used_and_keeps_failures() {
+        let mut rc = RasterCache::default();
+        rc.insert(key(9999), None);
+        for n in 0..MAX_ENTRIES as u32 {
+            rc.insert(key(n), tiny());
+        }
+        // Touch the oldest so it is recent.
+        assert!(rc.get(&key(0)).is_some());
+        rc.insert(key(5000), tiny());
+        assert_eq!(rc.ok.len(), MAX_ENTRIES);
+        assert!(rc.get(&key(0)).is_some(), "recently used kept");
+        assert!(rc.get(&key(1)).is_none(), "least recently used evicted");
+        assert!(rc.get(&key(5000)).is_some());
+        for n in 6000..6000 + 2 * MAX_ENTRIES as u32 {
+            rc.insert(key(n), tiny());
+        }
+        assert!(matches!(rc.get(&key(9999)), Some(None)), "failure survives");
     }
 }
