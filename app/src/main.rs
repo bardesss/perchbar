@@ -2,6 +2,8 @@
 #[allow(dead_code)]
 mod display;
 #[allow(dead_code)]
+mod instances;
+#[allow(dead_code)]
 mod manifest;
 #[allow(dead_code)]
 mod paths;
