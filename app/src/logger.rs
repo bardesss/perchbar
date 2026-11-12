@@ -13,13 +13,24 @@ use log::{LevelFilter, Log, Metadata, Record};
 pub const MAX_BYTES: u64 = 1024 * 1024;
 /// Optional level override, e.g. `PERCHBAR_LOG=debug`.
 pub const LEVEL_ENV: &str = "PERCHBAR_LOG";
+/// After a failed rotation, write this much more before trying again.
+const RETRY_AFTER_BYTES: u64 = 64 * 1024;
 
 pub struct FileLogger {
     path: PathBuf,
     max_bytes: u64,
     level: LevelFilter,
+    state: Mutex<State>,
+}
+
+#[derive(Default)]
+struct State {
     /// The open file and its current size; `None` after a failed open.
-    file: Mutex<Option<(File, u64)>>,
+    file: Option<(File, u64)>,
+    /// After a failed rotation, the size the file must reach before the
+    /// next attempt, so a stuck rename is not retried on every line.
+    retry_at: u64,
+    attempts: u32,
 }
 
 impl FileLogger {
@@ -33,23 +44,28 @@ impl FileLogger {
             path: path.to_path_buf(),
             max_bytes,
             level,
-            file: Mutex::new(Some((file, size))),
+            state: Mutex::new(State {
+                file: Some((file, size)),
+                ..State::default()
+            }),
         })
     }
 
     /// Appends one line, rotating first if it would not fit.
     pub fn write_line(&self, line: &str) {
-        let mut guard = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let len = line.len() as u64 + 1;
-        if guard
-            .as_ref()
-            .is_some_and(|(_, size)| size + len > self.max_bytes)
-        {
-            *guard = None; // close before renaming
-            let _ = std::fs::rename(&self.path, rotated(&self.path));
+        let size = state.file.as_ref().map(|(_, size)| *size);
+        if let Some(size) = size.filter(|s| s + len > self.max_bytes && *s >= state.retry_at) {
+            state.file = None; // close before renaming
+            state.attempts += 1;
+            state.retry_at = match std::fs::rename(&self.path, rotated(&self.path)) {
+                Ok(()) => 0,
+                Err(_) => size + RETRY_AFTER_BYTES,
+            };
         }
-        if guard.is_none() {
-            *guard = OpenOptions::new()
+        if state.file.is_none() {
+            state.file = OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&self.path)
@@ -59,11 +75,18 @@ impl FileLogger {
                     (f, size)
                 });
         }
-        if let Some((file, size)) = guard.as_mut() {
+        if let Some((file, size)) = state.file.as_mut() {
             if writeln!(file, "{line}").is_ok() {
                 *size += len;
             }
         }
+    }
+}
+
+impl FileLogger {
+    /// How many times rotation was tried (for tests and diagnostics).
+    pub fn rotation_attempts(&self) -> u32 {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).attempts
     }
 }
 
@@ -103,7 +126,8 @@ impl Log for FileLogger {
     }
 
     fn flush(&self) {
-        if let Some((file, _)) = self.file.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((file, _)) = state.file.as_mut() {
             let _ = file.flush();
         }
     }
@@ -152,6 +176,33 @@ mod tests {
         logger.write_line("next");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "next\n");
         assert_eq!(std::fs::read_to_string(rotated(&path)).unwrap().len(), 97);
+    }
+
+    #[test]
+    fn failed_rotation_waits_for_another_64kb_before_retrying() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("perchbar.log");
+        // A non-empty folder where the old file goes: the rename fails.
+        let blocker = rotated(&path);
+        std::fs::create_dir(&blocker).unwrap();
+        std::fs::write(blocker.join("x"), "x").unwrap();
+        let logger = FileLogger::open(&path, 100, LevelFilter::Info).unwrap();
+        let line = "y".repeat(99); // 100 bytes with the newline
+        logger.write_line(&line);
+        logger.write_line(&line); // over the limit: the first attempt fails
+        assert_eq!(logger.rotation_attempts(), 1);
+        // Below another 64 KB: no new attempt, and lines still land.
+        for _ in 0..600 {
+            logger.write_line(&line);
+        }
+        assert_eq!(logger.rotation_attempts(), 1);
+        let written = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(written, 602 * 100);
+        // Past 64 KB more: one more attempt.
+        for _ in 0..60 {
+            logger.write_line(&line);
+        }
+        assert_eq!(logger.rotation_attempts(), 2);
     }
 
     #[test]
