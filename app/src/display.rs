@@ -7,6 +7,20 @@ const MIN_ROTATE_SECS: u32 = 2;
 const MAX_TEXT_CHARS: usize = 120;
 const MAX_SPARK_POINTS: usize = 60;
 const MIN_SPARK_POINTS: usize = 2;
+const MAX_FRAMES: usize = 16;
+const MAX_BLOCKS_PER_FRAME: usize = 8;
+const MAX_TOOLTIP_CHARS: usize = 500;
+const MAX_ICON_REF_CHARS: usize = 128;
+const MAX_BAR_WIDTH_DIP: u32 = 200;
+
+/// Cuts `s` to at most `max` characters, the last one an ellipsis.
+fn truncate_chars(s: &mut String, max: usize) {
+    if s.chars().count() > max {
+        let mut cut: String = s.chars().take(max.saturating_sub(1)).collect();
+        cut.push('…');
+        *s = cut;
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum DisplayError {
@@ -167,10 +181,25 @@ fn validate(out: &mut Output) -> Result<(), DisplayError> {
     if out.frames.is_empty() {
         return Err(DisplayError::Invalid("frames must not be empty".into()));
     }
+    if out.frames.len() > MAX_FRAMES {
+        return Err(DisplayError::Invalid(format!(
+            "at most {MAX_FRAMES} frames allowed, got {}",
+            out.frames.len()
+        )));
+    }
     if let Some(r) = out.rotate.as_mut() {
         *r = (*r).max(MIN_ROTATE_SECS);
     }
     for frame in &mut out.frames {
+        if frame.blocks.len() > MAX_BLOCKS_PER_FRAME {
+            return Err(DisplayError::Invalid(format!(
+                "at most {MAX_BLOCKS_PER_FRAME} blocks per frame allowed, got {}",
+                frame.blocks.len()
+            )));
+        }
+        if let Some(t) = frame.tooltip.as_mut() {
+            truncate_chars(t, MAX_TOOLTIP_CHARS);
+        }
         for block in &mut frame.blocks {
             validate_block(block, false)?;
         }
@@ -198,6 +227,11 @@ fn validate_block(block: &mut Block, in_stack: bool) -> Result<(), DisplayError>
             }
         }
         Block::Icon { name, src, .. } => match (name.as_deref(), src.as_deref()) {
+            (Some(r), _) | (_, Some(r)) if r.chars().count() > MAX_ICON_REF_CHARS => {
+                return Err(DisplayError::Invalid(format!(
+                    "icon name or src must be at most {MAX_ICON_REF_CHARS} characters"
+                )))
+            }
             (Some(_), Some(_)) => {
                 return Err(DisplayError::Invalid(
                     "icon takes either name or src, not both".into(),
@@ -210,7 +244,12 @@ fn validate_block(block: &mut Block, in_stack: bool) -> Result<(), DisplayError>
             (None, Some(s)) => check_icon_src(s)?,
             _ => {}
         },
-        Block::Bar { value, .. } => *value = clamp_unit(*value, "bar")?,
+        Block::Bar { value, width, .. } => {
+            *value = clamp_unit(*value, "bar")?;
+            if let Some(w) = width.as_mut() {
+                *w = (*w).min(MAX_BAR_WIDTH_DIP);
+            }
+        }
         Block::Ring { value, .. } => *value = clamp_unit(*value, "ring")?,
         Block::Spark { values, .. } => {
             if values.iter().any(|v| !v.is_finite()) {
@@ -400,6 +439,93 @@ mod tests {
         assert!(one_block(json!({"type":"icon"})).is_err());
         assert!(one_block(json!({"type":"icon","name":"sun"})).is_ok());
         assert!(one_block(json!({"type":"icon","src":"a.svg","tint":true})).is_ok());
+    }
+
+    #[test]
+    fn more_than_16_frames_rejected() {
+        let ok: Vec<_> = (0..16).map(|_| text_frame()).collect();
+        assert_eq!(parse(json!({ "frames": ok })).unwrap().frames.len(), 16);
+        let too_many: Vec<_> = (0..17).map(|_| text_frame()).collect();
+        let err = parse(json!({ "frames": too_many })).unwrap_err().to_string();
+        assert!(err.contains("at most 16 frames"), "{err}");
+    }
+
+    #[test]
+    fn more_than_8_blocks_per_frame_rejected() {
+        let t = json!({"type":"text","value":"a"});
+        let eight: Vec<_> = (0..8).map(|_| t.clone()).collect();
+        assert_eq!(
+            parse(json!({ "blocks": eight })).unwrap().frames[0]
+                .blocks
+                .len(),
+            8
+        );
+        let nine: Vec<_> = (0..9).map(|_| t.clone()).collect();
+        let err = parse(json!({ "blocks": nine })).unwrap_err().to_string();
+        assert!(err.contains("at most 8 blocks"), "{err}");
+    }
+
+    #[test]
+    fn tooltip_is_truncated_to_500_chars() {
+        let long = "é".repeat(2000);
+        let o = parse(json!({"blocks":[], "tooltip": long})).unwrap();
+        let t = o.frames[0].tooltip.as_deref().unwrap();
+        assert_eq!(t.chars().count(), 500);
+        assert!(t.ends_with('…'));
+        let exact = "a".repeat(500);
+        let o = parse(json!({"blocks":[], "tooltip": exact})).unwrap();
+        assert_eq!(o.frames[0].tooltip.as_deref(), Some(exact.as_str()));
+    }
+
+    #[test]
+    fn icon_name_and_src_longer_than_128_chars_rejected() {
+        let name = "a".repeat(128);
+        assert!(one_block(json!({"type":"icon","name":name})).is_ok());
+        let name = "a".repeat(129);
+        let err = one_block(json!({"type":"icon","name":name}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at most 128"), "{err}");
+        let src = format!("{}.svg", "a".repeat(124));
+        assert!(one_block(json!({"type":"icon","src":src})).is_ok());
+        let src = format!("{}.svg", "a".repeat(125));
+        let err = one_block(json!({"type":"icon","src":src}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at most 128"), "{err}");
+    }
+
+    #[test]
+    fn bar_width_is_clamped_to_200() {
+        let o = one_block(json!({"type":"bar","value":0.5,"width":100000})).unwrap();
+        assert!(matches!(
+            o.frames[0].blocks[0],
+            Block::Bar {
+                width: Some(200),
+                ..
+            }
+        ));
+        let o = one_block(json!({"type":"bar","value":0.5,"width":40})).unwrap();
+        assert!(matches!(
+            o.frames[0].blocks[0],
+            Block::Bar {
+                width: Some(40),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn stacked_bar_width_is_clamped_too() {
+        let bar = json!({"type":"bar","value":0.5,"width":5000});
+        let t = json!({"type":"text","value":"a"});
+        let o = one_block(json!({"type":"stack","top":bar,"bottom":t})).unwrap();
+        match &o.frames[0].blocks[0] {
+            Block::Stack { top, .. } => {
+                assert!(matches!(**top, Block::Bar { width: Some(200), .. }))
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]
