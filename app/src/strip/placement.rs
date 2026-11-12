@@ -1,29 +1,18 @@
 //! Where the strip goes on the taskbar: just left of the tray, never over
 //! the app buttons.
 //!
-//! [`query`] reads the live taskbar (Win32 plus UI Automation); [`compute`]
-//! and [`available_px`] are pure so they can be tested.
+//! [`read`] reads the live taskbar with plain Win32 calls. The app button
+//! edge comes from UI Automation on a separate worker thread
+//! (`strip::uia`) and is passed in. [`compute`], [`available_px`],
+//! [`is_hidden`] and [`same_row`] are pure so they can be tested.
 
-use std::cell::RefCell;
-use std::time::Instant;
-
-use windows::core::Interface;
-use windows::core::{w, PCWSTR};
+use windows::core::w;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
-use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
-use windows::Win32::System::Variant::VARIANT;
-use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomation2, IUIAutomationCacheRequest,
-    IUIAutomationCondition, TreeScope_Descendants, UIA_BoundingRectanglePropertyId,
-    UIA_ButtonControlTypeId, UIA_ControlTypePropertyId,
-};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, FindWindowW, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
-};
+use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, FindWindowW, GetWindowRect};
 
 /// Gap between the strip's right edge and the tray, in DIPs.
 pub const TRAY_GAP_DIP: f32 = 2.0;
@@ -31,11 +20,6 @@ pub const TRAY_GAP_DIP: f32 = 2.0;
 pub const APP_GAP_DIP: f32 = crate::strip::layout::MIN_APP_GAP_DIP;
 /// A taskbar with less than this many pixels on its monitor is auto-hidden.
 const HIDDEN_THRESHOLD_PX: i32 = 4;
-/// UI Automation timeouts, so a hung Explorer cannot stall the strip thread.
-const UIA_CONNECTION_TIMEOUT_MS: u32 = 1000;
-const UIA_TRANSACTION_TIMEOUT_MS: u32 = 2000;
-/// A FindAll slower than this is logged.
-const UIA_SLOW_MS: u128 = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TaskbarInfo {
@@ -93,8 +77,19 @@ pub fn is_hidden(taskbar: &RECT, monitor: &RECT) -> bool {
     w.min(h) < HIDDEN_THRESHOLD_PX
 }
 
-/// Conservative guess when UI Automation fails: center plus a quarter width.
-fn fallback_buttons_right(taskbar: &RECT) -> i32 {
+/// True when two readings share the taskbar row: same horizontal extent,
+/// tray edge and DPI. Auto-hide only moves the taskbar vertically, so the
+/// app button edge measured for one still holds for the other.
+pub fn same_row(a: &TaskbarInfo, b: &TaskbarInfo) -> bool {
+    a.taskbar.left == b.taskbar.left
+        && a.taskbar.right == b.taskbar.right
+        && a.tray_left == b.tray_left
+        && a.dpi == b.dpi
+}
+
+/// Conservative guess when no UI Automation result is available yet:
+/// center plus a quarter width.
+pub fn fallback_buttons_right(taskbar: &RECT) -> i32 {
     let width = taskbar.right - taskbar.left;
     taskbar.left + width / 2 + width / 4
 }
@@ -107,57 +102,40 @@ pub fn taskbar_hwnd() -> Option<HWND> {
         .filter(|h| !h.is_invalid())
 }
 
-/// Reads the live taskbar. Must run on a thread with COM initialized.
-pub fn query() -> Option<TaskbarInfo> {
-    query_reusing(None)
+/// The tray window, a child of the taskbar.
+pub fn tray_hwnd(taskbar: HWND) -> Option<HWND> {
+    // SAFETY: plain window lookup.
+    unsafe { FindWindowExW(Some(taskbar), None, w!("TrayNotifyWnd"), None) }
+        .ok()
+        .filter(|h| !h.is_invalid())
 }
 
-/// True when `prev`'s button edge still holds for a taskbar with this
-/// horizontal extent, tray edge and DPI (auto-hide only moves it vertically).
-fn same_row(prev: &TaskbarInfo, tb: &RECT, tray_left: i32, dpi: u32) -> bool {
-    prev.taskbar.left == tb.left
-        && prev.taskbar.right == tb.right
-        && prev.tray_left == tray_left
-        && prev.dpi == dpi
-}
-
-/// Like [`query`], but reuses `prev.buttons_right` instead of running the
-/// UI Automation search when the taskbar row is unchanged. For the periodic
-/// fallback tick, so an idle strip does not search the taskbar every time.
-pub fn query_reusing(prev: Option<&TaskbarInfo>) -> Option<TaskbarInfo> {
-    let taskbar = taskbar_hwnd()?;
+/// Reads the live taskbar with Win32 calls only (no cross-process COM).
+/// `buttons_right` is the last UI Automation result for this taskbar, or
+/// `None` to use [`fallback_buttons_right`]. It is capped at the tray edge.
+pub fn read(taskbar: HWND, buttons_right: Option<i32>) -> Option<TaskbarInfo> {
     let mut tb = RECT::default();
     // SAFETY: valid out pointer; the window may vanish, which gives an error.
     unsafe { GetWindowRect(taskbar, &mut tb) }.ok()?;
-    let tray_left = tray_left(taskbar).unwrap_or(tb.right);
+    let tray_left = tray_hwnd(taskbar)
+        .and_then(|tray| {
+            let mut r = RECT::default();
+            // SAFETY: valid out pointer.
+            unsafe { GetWindowRect(tray, &mut r) }.ok()?;
+            Some(r.left)
+        })
+        .unwrap_or(tb.right);
     // SAFETY: plain call on a window handle.
     let dpi = unsafe { GetDpiForWindow(taskbar) }.max(96);
-    let buttons_right = match prev.filter(|p| same_row(p, &tb, tray_left, dpi)) {
-        Some(p) => p.buttons_right,
-        None => uia_buttons_right(taskbar, tray_left, &tb)
-            .unwrap_or_else(|| fallback_buttons_right(&tb))
-            .min(tray_left),
-    };
     Some(TaskbarInfo {
         taskbar: tb,
         tray_left,
-        buttons_right,
+        buttons_right: buttons_right
+            .unwrap_or_else(|| fallback_buttons_right(&tb))
+            .min(tray_left),
         dpi,
         hidden: monitor_rect(taskbar).is_some_and(|m| is_hidden(&tb, &m)),
     })
-}
-
-fn tray_left(taskbar: HWND) -> Option<i32> {
-    // SAFETY: plain window lookup and a valid out pointer.
-    unsafe {
-        let tray = FindWindowExW(Some(taskbar), None, w!("TrayNotifyWnd"), None).ok()?;
-        if tray.is_invalid() {
-            return None;
-        }
-        let mut r = RECT::default();
-        GetWindowRect(tray, &mut r).ok()?;
-        Some(r.left)
-    }
 }
 
 fn monitor_rect(taskbar: HWND) -> Option<RECT> {
@@ -172,149 +150,6 @@ fn monitor_rect(taskbar: HWND) -> Option<RECT> {
             .as_bool()
             .then_some(mi.rcMonitor)
     }
-}
-
-/// The cached UI Automation client for this thread.
-struct Uia {
-    automation: IUIAutomation,
-    buttons: IUIAutomationCondition,
-    cache: IUIAutomationCacheRequest,
-}
-
-impl Uia {
-    fn new() -> windows::core::Result<Self> {
-        // SAFETY: COM is initialized on the calling thread (see `query`).
-        unsafe {
-            let automation: IUIAutomation =
-                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
-            if let Ok(a2) = automation.cast::<IUIAutomation2>() {
-                let _ = a2.SetConnectionTimeout(UIA_CONNECTION_TIMEOUT_MS);
-                let _ = a2.SetTransactionTimeout(UIA_TRANSACTION_TIMEOUT_MS);
-            }
-            let buttons = automation.CreatePropertyCondition(
-                UIA_ControlTypePropertyId,
-                &VARIANT::from(UIA_ButtonControlTypeId.0),
-            )?;
-            let cache = automation.CreateCacheRequest()?;
-            cache.AddProperty(UIA_BoundingRectanglePropertyId)?;
-            Ok(Uia {
-                automation,
-                buttons,
-                cache,
-            })
-        }
-    }
-}
-
-thread_local! {
-    static UIA: RefCell<Option<Uia>> = const { RefCell::new(None) };
-}
-
-/// Drops this thread's UI Automation client; call before `CoUninitialize`.
-pub fn release_uia() {
-    UIA.with(|u| u.borrow_mut().take());
-}
-
-/// Rightmost button edge left of the tray, from one cached FindAll.
-fn uia_buttons_right(taskbar: HWND, tray_left: i32, tb: &RECT) -> Option<i32> {
-    UIA.with(|cell| {
-        let mut cell = cell.borrow_mut();
-        if cell.is_none() {
-            match Uia::new() {
-                Ok(u) => *cell = Some(u),
-                Err(e) => {
-                    log::warn!("UI Automation unavailable: {e}");
-                    return None;
-                }
-            }
-        }
-        let uia = cell.as_ref()?;
-        let started = Instant::now();
-        let result = find_buttons_right(uia, taskbar, tray_left, tb);
-        let took = started.elapsed().as_millis();
-        if took > UIA_SLOW_MS {
-            log::info!("taskbar button query took {took} ms");
-        }
-        match result {
-            Ok(r) => r,
-            Err(e) => {
-                log::debug!("taskbar button query failed: {e}");
-                None
-            }
-        }
-    })
-}
-
-fn find_buttons_right(
-    uia: &Uia,
-    taskbar: HWND,
-    tray_left: i32,
-    tb: &RECT,
-) -> windows::core::Result<Option<i32>> {
-    let mut right: Option<i32> = None;
-    let mut last_err = None;
-    for child in searchable_children(taskbar) {
-        // SAFETY: COM calls on live interfaces owned by this thread.
-        let found = unsafe {
-            uia.automation.ElementFromHandle(child).and_then(|root| {
-                root.FindAllBuildCache(TreeScope_Descendants, &uia.buttons, &uia.cache)
-            })
-        };
-        let all = match found {
-            Ok(a) => a,
-            Err(e) => {
-                last_err = Some(e);
-                continue;
-            }
-        };
-        // SAFETY: as above.
-        let len = unsafe { all.Length() }.unwrap_or(0);
-        for i in 0..len {
-            // SAFETY: as above; `i` is in range.
-            let rect = unsafe { all.GetElement(i).and_then(|e| e.CachedBoundingRectangle()) };
-            let Ok(r) = rect else {
-                continue;
-            };
-            // Skip empty, off-taskbar and tray buttons (the tray and its
-            // descendants all sit at or right of its left edge).
-            if r.right <= r.left || r.left < tb.left || r.right > tb.right || r.left >= tray_left {
-                continue;
-            }
-            right = Some(right.map_or(r.right, |m| m.max(r.right)));
-        }
-    }
-    match (right, last_err) {
-        (None, Some(e)) => Err(e),
-        (r, _) => Ok(r),
-    }
-}
-
-/// Visible direct children of the taskbar owned by other processes, minus
-/// the tray. Searching these one by one, instead of the taskbar itself,
-/// keeps UI Automation away from the strip: the strip is a taskbar child
-/// owned by the calling thread, and UIA asking it for its provider while
-/// this thread waits inside FindAll deadlocks until the call times out.
-fn searchable_children(taskbar: HWND) -> Vec<HWND> {
-    let own_pid = std::process::id();
-    let mut out = Vec::new();
-    let mut after: Option<HWND> = None;
-    // SAFETY: plain window enumeration; a handle that goes stale only makes
-    // the later calls fail.
-    unsafe {
-        let tray = FindWindowExW(Some(taskbar), None, w!("TrayNotifyWnd"), PCWSTR::null()).ok();
-        while let Ok(child) = FindWindowExW(Some(taskbar), after, PCWSTR::null(), PCWSTR::null()) {
-            if child.is_invalid() {
-                break;
-            }
-            after = Some(child);
-            let mut pid = 0;
-            GetWindowThreadProcessId(child, Some(&mut pid));
-            if pid != own_pid && Some(child) != tray && IsWindowVisible(child).as_bool() {
-                out.push(child);
-            }
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -389,13 +224,21 @@ mod tests {
     #[test]
     fn button_edge_is_reused_only_for_the_same_row() {
         let prev = info(1700, 1100, 96, false);
-        let tb = prev.taskbar;
-        assert!(same_row(&prev, &tb, 1700, 96));
+        assert!(same_row(&prev, &prev));
         // Auto-hide slides the taskbar down; the row is the same.
-        assert!(same_row(&prev, &rect(0, 1078, 1920, 1126), 1700, 96));
-        assert!(!same_row(&prev, &tb, 1650, 96));
-        assert!(!same_row(&prev, &tb, 1700, 144));
-        assert!(!same_row(&prev, &rect(0, 1032, 2560, 1080), 1700, 96));
+        let slid = TaskbarInfo {
+            taskbar: rect(0, 1078, 1920, 1126),
+            hidden: true,
+            ..prev
+        };
+        assert!(same_row(&prev, &slid));
+        assert!(!same_row(&prev, &info(1650, 1100, 96, false)));
+        assert!(!same_row(&prev, &info(1700, 1100, 144, false)));
+        let wider = TaskbarInfo {
+            taskbar: rect(0, 1032, 2560, 1080),
+            ..prev
+        };
+        assert!(!same_row(&prev, &wider));
     }
 
     #[test]
