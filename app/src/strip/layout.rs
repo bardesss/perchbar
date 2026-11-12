@@ -391,6 +391,12 @@ pub fn layout(
         Some(item)
     };
 
+    // Not even "+N" fits: show nothing (the strip hides at width 0) rather
+    // than draw over the app buttons. The slack absorbs float rounding.
+    if used > metrics.available_dip + 0.01 {
+        return StripLayout::default();
+    }
+
     StripLayout {
         width_dip: used,
         items,
@@ -645,14 +651,26 @@ mod tests {
     }
 
     #[test]
-    fn zero_available_space_shows_only_plus_n() {
+    fn zero_available_space_shows_nothing() {
+        // Not even "+N" fits: the strip must not cover the app buttons.
         let m = model(vec![btc("s1"), btc("s2")]);
         let l = run(&m, 0.0);
+        assert_eq!(l, StripLayout::default());
+        assert_eq!(l.width_dip, 0.0);
+    }
+
+    #[test]
+    fn plus_n_alone_shows_only_when_it_fits() {
+        // "+2" is 22 wide with the fake measure.
+        let m = model(vec![btc("s1"), btc("s2")]);
+        assert_eq!(run(&m, 21.0), StripLayout::default());
+        let l = run(&m, 22.0);
         assert!(l.items.is_empty());
         assert_eq!(l.overflow, ["s1", "s2"]);
         let plus = l.overflow_item.expect("plus item");
         assert_eq!(plus.x_dip, 0.0);
         assert_eq!(plus.text, "+2");
+        assert!(l.width_dip <= 22.0);
     }
 
     #[test]
