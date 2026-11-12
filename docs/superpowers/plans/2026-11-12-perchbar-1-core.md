@@ -12,7 +12,7 @@
 
 **Plan series:** Plan 1 is the core (this file). Plan 2 covers the settings window, instances UI, groups UI, secrets (DPAPI), autostart, and the permissions prompt. Plan 3 covers the catalog, updates, Share, AGENTS.md and the docs, the remaining templates, and the `battery`/`media`/`files` sources.
 
-**Reference app:** read `src/main.rs` (`ensure_widget`, `present`, the `TaskbarCreated` handling) and `src/render.rs` of `github.com/AbdoSarmini/claude-usage-widget-for-windows-taskbar` before Tasks 8–10.
+**Reference app:** read `src/main.rs` (`ensure_widget`, `present`, the `TaskbarCreated` handling) and `src/render.rs` of `github.com/AbdoSarmini/claude-usage-widget-for-windows-taskbar` before Tasks 8 to 10.
 
 ## Global Constraints
 
@@ -346,7 +346,7 @@ export default async function update({ settings, storage, log, time }) {
 Use `tokio::time::pause()` to advance time.
 
 - [ ] **Step 2:** Run `cargo test -p perchbar scheduler`. Expected: FAIL.
-- [ ] **Step 3:** Implement one tokio task per visible instance. Limit concurrent runs with a `Semaphore(4)`. The first run starts immediately with a 0–2 s random jitter. Hold the model behind a `Mutex`, bump `generation` on every change, and call `publish` with a clone.
+- [ ] **Step 3:** Implement one tokio task per visible instance. Limit concurrent runs with a `Semaphore(4)`. The first run starts immediately with a 0 to 2 s random jitter. Hold the model behind a `Mutex`, bump `generation` on every change, and call `publish` with a clone.
 - [ ] **Step 4:** Run `cargo test -p perchbar scheduler`. Expected: PASS.
 - [ ] **Step 5:** Commit with the message `feat: scheduler with backoff and stale state`.
 
@@ -494,7 +494,7 @@ Behavior:
 - **Left click** on a slot: Plan 1 opens nothing (the settings window comes in Plan 2). It calls `refresh_now` and briefly dims the slot. On a group, left click advances to the next member.
 - **Mouse wheel** on a group or multi-frame slot: moves to the next or previous member/frame.
 - **Right-click** on a slot: a popup menu (`TrackPopupMenuEx`) with Refresh now, Hide this widget, a separator, Quit Perchbar. On empty strip space or "+N", the menu has only Quit Perchbar.
-- **Left click on "+N":** a popup menu listing the hidden widgets by name, with their current main text where there is one (e.g. "Bitcoin price — $67,120"). Clicking an entry calls `refresh_now`. A proper flyout window is a Plan 2 item.
+- **Left click on "+N":** a popup menu listing the hidden widgets by name, with their current main text where there is one (e.g. "Bitcoin price: $67,120"). Clicking an entry calls `refresh_now`. A proper flyout window is a Plan 2 item.
 - Mouse tracking uses `TrackMouseEvent(TME_LEAVE)`, and WM_MOUSELEAVE clears hover.
 
 - [ ] **Step 1: Write failing tests:** `hit_test_finds_slot`, `hit_test_overflow_item`, `hit_test_gap_is_none`.
@@ -525,7 +525,7 @@ Behavior:
 Templates:
 - **bitcoin-price**: refresh 60, network `["api.coinbase.com"]`, settings `coin` (select: BTC, ETH, SOL, XRP, DOGE; default BTC), `currency` (select: USD, EUR, GBP; default USD). It calls `GET https://api.coinbase.com/v2/prices/{coin}-{currency}/spot`, which responds with `{data:{amount:"67120.41"}}`. Display: icon `bitcoin` (falls back to the text "₿") when the coin is BTC, otherwise the coin symbol as text; the price via `format.money`; color `up`/`down` against the stored last price; and a 24-point sparkline of stored history once there are at least 2 points. Tooltip: `"BTC-USD $67,120.41 · updated 14:05"`.
 - **world-clock**: refresh 10, no network, settings `cities` (list; each entry is `"Label|IANA tz"`, default `["Amsterdam|Europe/Amsterdam", "Tokyo|Asia/Tokyo"]`) and `rotate` (number, seconds, default 6). With one city it shows one frame `"Tokyo 22:05"`. With more cities it returns one frame per city and `rotate`. Each frame's tooltip shows the weekday plus the UTC offset (e.g. `"Tokyo · Thu · UTC+9"`).
-- Each README is 5–10 lines: what it shows, its settings, and where the data comes from.
+- Each README is 5 to 10 lines: what it shows, its settings, and where the data comes from.
 
 - [ ] **Step 1: Write failing integration tests:**
 
@@ -549,7 +549,7 @@ Templates:
 ### Task 12: Open the pull request
 
 - [ ] **Step 1:** Run `cargo test -p perchbar`, `cargo clippy -- -D warnings`, and `cargo build --release`. Expected: all pass, with no warnings.
-- [ ] **Step 2:** Push `plan-1-core` and open a PR into `main` titled `Plan 1: Perchbar core (taskbar strip + widget runtime)`. The body summarizes what works, lists the manual checks from Tasks 9–11 with their results, and links the spec and the plan.
+- [ ] **Step 2:** Push `plan-1-core` and open a PR into `main` titled `Plan 1: Perchbar core (taskbar strip + widget runtime)`. The body summarizes what works, lists the manual checks from Tasks 9 to 11 with their results, and links the spec and the plan.
 
 ---
 
