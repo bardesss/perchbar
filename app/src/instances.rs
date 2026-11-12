@@ -84,7 +84,9 @@ pub fn load(path: &Path) -> Instances {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Instances::default();
     };
-    match serde_json::from_str::<Instances>(&text) {
+    // Hand-edited files may start with a UTF-8 byte order mark.
+    let json = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    match serde_json::from_str::<Instances>(json) {
         Ok(mut loaded) => {
             loaded.drop_malformed_ids();
             loaded
@@ -349,6 +351,18 @@ mod tests {
             .filter(|n| n.starts_with("instances.json.bak-"))
             .collect();
         assert_eq!(backups.len(), 1);
+    }
+
+    #[test]
+    fn hand_edited_file_with_byte_order_mark_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instances.json");
+        let mut data = Instances::default();
+        data.new_instance(&manifest("weather"));
+        let json = serde_json::to_string(&data).unwrap();
+        std::fs::write(&path, format!("\u{feff}{json}")).unwrap();
+        assert_eq!(load(&path), data);
+        assert!(path.exists());
     }
 
     #[test]

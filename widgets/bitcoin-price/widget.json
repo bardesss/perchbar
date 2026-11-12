@@ -1,0 +1,29 @@
+{
+  "$schema": "https://perchbar.dev/schema/widget.schema.json",
+  "id": "bitcoin-price",
+  "name": "Bitcoin Price",
+  "description": "Spot price of a crypto coin from Coinbase, with a short history.",
+  "author": "Perchbar",
+  "version": "1.0.0",
+  "formatVersion": 1,
+  "refresh": 60,
+  "settings": [
+    {
+      "key": "coin",
+      "label": "Coin",
+      "kind": "select",
+      "options": ["BTC", "ETH", "SOL", "XRP", "DOGE"],
+      "default": "BTC"
+    },
+    {
+      "key": "currency",
+      "label": "Currency",
+      "kind": "select",
+      "options": ["USD", "EUR", "GBP"],
+      "default": "USD"
+    }
+  ],
+  "permissions": {
+    "network": ["api.coinbase.com"]
+  }
+}

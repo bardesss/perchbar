@@ -427,6 +427,7 @@ async fn instance_loop(
         .unwrap_or_else(|e| Err(RunError::Script(format!("run aborted: {e}"))));
         let state = match result {
             Ok(output) => {
+                log::debug!("widget run ok for {id}");
                 failures = 0;
                 last_good = Some(output.clone());
                 SlotState::Ok(output)

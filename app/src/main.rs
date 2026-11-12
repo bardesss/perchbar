@@ -1,18 +1,6 @@
-// Wired up by later tasks.
-#[allow(dead_code)]
-mod display;
-#[allow(dead_code)]
-mod instances;
-#[allow(dead_code)]
-mod manifest;
-#[allow(dead_code)]
-mod paths;
-#[allow(dead_code)]
-mod sandbox;
-#[allow(dead_code)]
-mod scheduler;
-#[allow(dead_code)]
-mod strip;
+// Release builds are GUI programs: no console window when started from
+// Explorer or at sign-in. Debug builds keep the console for log output.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -20,10 +8,29 @@ use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use manifest::Manifest;
-use sandbox::ReqwestClient;
-use scheduler::Scheduler;
-use strip::StripEvent;
+use perchbar::manifest::{self, Manifest};
+use perchbar::sandbox::ReqwestClient;
+use perchbar::scheduler::Scheduler;
+use perchbar::strip::{self, StripEvent};
+use perchbar::{instances, logger, paths, setup};
+
+/// Takes the session-wide `Local\Perchbar` mutex. Returns false when another
+/// Perchbar already holds it. The handle is never closed: the mutex lives
+/// until the process exits.
+fn first_instance() -> bool {
+    use windows::core::w;
+    use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::System::Threading::CreateMutexW;
+
+    // SAFETY: plain Win32 calls with a static, NUL-terminated name.
+    unsafe {
+        match CreateMutexW(None, false, w!("Local\\Perchbar")) {
+            Ok(_) => GetLastError() != ERROR_ALREADY_EXISTS,
+            // Without the mutex we cannot tell; running is the safer guess.
+            Err(_) => true,
+        }
+    }
+}
 
 /// Installed widgets by manifest id. Folders that fail to load are skipped.
 fn load_widgets(dir: &Path) -> HashMap<String, (Arc<Manifest>, PathBuf)> {
@@ -68,17 +75,42 @@ fn join_for(t: JoinHandle<()>, timeout: Duration) {
 }
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("perchbar=info"))
-        .init();
+    if !first_instance() {
+        return;
+    }
+    if let Err(e) = logger::init(&paths::log_file()) {
+        eprintln!("cannot open {}: {e}", paths::log_file().display());
+    }
+    log::info!(
+        "Perchbar {} starting, data in {}",
+        env!("CARGO_PKG_VERSION"),
+        paths::data_dir().display()
+    );
 
-    let widgets = load_widgets(&paths::widgets_dir());
+    let widgets_dir = paths::widgets_dir();
+    match setup::install_bundled(&widgets_dir) {
+        Ok(copied) if !copied.is_empty() => log::info!("installed templates: {copied:?}"),
+        Ok(_) => {}
+        Err(e) => log::warn!("cannot install bundled templates: {e}"),
+    }
+
+    let widgets = load_widgets(&widgets_dir);
     let known: HashSet<String> = widgets.keys().cloned().collect();
     let names: HashMap<PathBuf, String> = widgets
         .values()
         .map(|(m, dir)| (dir.clone(), m.name.clone()))
         .collect();
     let mut data = instances::load(&paths::instances_file());
+    // No file after loading: a first run, or a corrupt file that `load` moved
+    // aside. A saved empty strip (the user removed everything) stays empty.
+    let first_run = !paths::instances_file().exists();
     data.normalize(&known);
+    if first_run && setup::seed_first_run(&mut data, &widgets) {
+        log::info!("first run: added the default widgets");
+        if let Err(e) = instances::save(&paths::instances_file(), &data) {
+            log::warn!("cannot save {}: {e}", paths::instances_file().display());
+        }
+    }
     log::info!(
         "{} widget(s), {} instance(s)",
         widgets.len(),
