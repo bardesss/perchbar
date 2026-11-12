@@ -10,8 +10,9 @@
 //! All waiting is done with timers (no polling), so an idle scheduler uses no CPU.
 //!
 //! Must be started from inside a tokio runtime. The `publish` callback runs
-//! while the scheduler's lock is held, so it must be quick and must not call
-//! back into the `SchedulerHandle`.
+//! after the state lock is released (calls are serialised, in generation
+//! order), so handle methods are safe to call from other threads while it
+//! runs. It must still not call back into the `SchedulerHandle` itself.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -74,15 +75,22 @@ struct Inner {
     states: HashMap<String, SlotState>,
     model: StripModel,
     tasks: HashMap<String, Running>,
+    /// Per-instance run guards. They outlive the loop task, so a run that is
+    /// still executing after hide/show blocks the next loop from starting another.
+    guards: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
 }
 
 struct Shared {
     widgets: HashMap<String, (Arc<Manifest>, Arc<PathBuf>)>,
     http: Arc<dyn HttpClient>,
     runner: Runner,
-    semaphore: Semaphore,
+    semaphore: Arc<Semaphore>,
     instances_path: PathBuf,
     publish: Box<dyn Fn(StripModel) + Send + Sync>,
+    /// Serialises publish calls so models reach the callback in generation order.
+    publish_lock: Mutex<()>,
+    /// Serialises writes of instances.json.
+    save_lock: Mutex<()>,
     inner: Mutex<Inner>,
 }
 
@@ -91,14 +99,24 @@ impl Shared {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Rebuilds the slots; bumps the generation and publishes only if they differ.
-    fn republish(&self, inner: &mut Inner) {
-        let slots = self.build_slots(inner);
+    /// Runs `f` on the state, then rebuilds the slots. If they changed, bumps
+    /// the generation and publishes. The state lock is released before the
+    /// callback runs; the publish lock is taken before that release, so
+    /// callbacks still arrive in generation order.
+    fn update<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
+        let mut inner = self.lock();
+        let result = f(&mut inner);
+        let slots = self.build_slots(&inner);
         if slots != inner.model.slots {
             inner.model.slots = slots;
             inner.model.generation += 1;
-            (self.publish)(inner.model.clone());
+            let model = inner.model.clone();
+            let order = self.publish_lock.lock().unwrap_or_else(|p| p.into_inner());
+            drop(inner);
+            (self.publish)(model);
+            drop(order);
         }
+        result
     }
 
     fn is_visible(&self, inst: &instances::Instance) -> bool {
@@ -181,33 +199,41 @@ impl Scheduler {
                 .collect(),
             http,
             runner,
-            semaphore: Semaphore::new(MAX_CONCURRENT_RUNS),
+            semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_RUNS)),
             instances_path,
             publish: Box::new(publish),
+            publish_lock: Mutex::new(()),
+            save_lock: Mutex::new(()),
             inner: Mutex::new(Inner {
                 data: instances,
                 states: HashMap::new(),
                 model: StripModel::default(),
                 tasks: HashMap::new(),
+                guards: HashMap::new(),
             }),
         });
-        {
-            let mut inner = shared.lock();
-            let visible: Vec<String> = inner
-                .data
-                .instances
-                .iter()
-                .filter(|i| shared.is_visible(i))
-                .map(|i| i.id.clone())
-                .collect();
-            for id in visible {
-                spawn_instance(&shared, &mut inner, id);
-            }
-            // The first model (everything Loading) always goes out.
-            inner.model.slots = shared.build_slots(&inner);
-            inner.model.generation = 1;
-            (shared.publish)(inner.model.clone());
+        let mut inner = shared.lock();
+        let visible: Vec<String> = inner
+            .data
+            .instances
+            .iter()
+            .filter(|i| shared.is_visible(i))
+            .map(|i| i.id.clone())
+            .collect();
+        for id in visible {
+            spawn_instance(&shared, &mut inner, id);
         }
+        // The first model (everything Loading) always goes out.
+        inner.model.slots = shared.build_slots(&inner);
+        inner.model.generation = 1;
+        let model = inner.model.clone();
+        let order = shared
+            .publish_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        drop(inner);
+        (shared.publish)(model);
+        drop(order);
         SchedulerHandle { shared }
     }
 }
@@ -215,11 +241,22 @@ impl Scheduler {
 fn spawn_instance(shared: &Arc<Shared>, inner: &mut Inner, id: String) {
     inner.states.insert(id.clone(), SlotState::Loading);
     let notify = Arc::new(Notify::new());
-    let task = tokio::spawn(instance_loop(shared.clone(), id.clone(), notify.clone()));
+    let guard = inner.guards.entry(id.clone()).or_default().clone();
+    let task = tokio::spawn(instance_loop(
+        shared.clone(),
+        id.clone(),
+        notify.clone(),
+        guard,
+    ));
     inner.tasks.insert(id, Running { notify, task });
 }
 
-async fn instance_loop(shared: Arc<Shared>, id: String, notify: Arc<Notify>) {
+async fn instance_loop(
+    shared: Arc<Shared>,
+    id: String,
+    notify: Arc<Notify>,
+    guard: Arc<tokio::sync::Mutex<()>>,
+) {
     let mut wait = Duration::from_millis(rand::random_range(0..=MAX_START_JITTER_MS));
     let mut failures = 0u32;
     let mut last_good: Option<Output> = None;
@@ -228,13 +265,26 @@ async fn instance_loop(shared: Arc<Shared>, id: String, notify: Arc<Notify>) {
             _ = tokio::time::sleep(wait) => {}
             _ = notify.notified() => {}
         }
+        // A run left over from before a hide/show may still be executing; its
+        // task holds the guard, so wait for it before starting another.
+        let run_guard = guard.clone().lock_owned().await;
         let Some((ctx, refresh)) = make_context(&shared, &id) else {
             return;
         };
-        let result = match shared.semaphore.acquire().await {
-            Ok(_permit) => (shared.runner)(ctx).await,
-            Err(_) => return,
+        let Ok(permit) = shared.semaphore.clone().acquire_owned().await else {
+            return;
         };
+        // The run lives in its own task that owns the guard and the permit.
+        // Aborting this loop (hide, shutdown) only drops the join handle, so
+        // the permit and guard are released when the run itself ends, never
+        // earlier. The real runner's blocking work is covered by this too.
+        let fut = (shared.runner)(ctx);
+        let result = tokio::spawn(async move {
+            let _held = (run_guard, permit);
+            fut.await
+        })
+        .await
+        .unwrap_or_else(|e| Err(RunError::Script(format!("run aborted: {e}"))));
         let state = match result {
             Ok(output) => {
                 failures = 0;
@@ -253,14 +303,12 @@ async fn instance_loop(shared: Arc<Shared>, id: String, notify: Arc<Notify>) {
                 }
             }
         };
-        {
-            let mut inner = shared.lock();
+        shared.update(|inner| {
             // Skip if the instance was hidden or removed while the run was in flight.
             if let Some(slot) = inner.states.get_mut(&id) {
                 *slot = state;
-                shared.republish(&mut inner);
             }
-        }
+        });
         wait = next_delay(refresh, failures);
     }
 }
@@ -296,39 +344,48 @@ impl SchedulerHandle {
     }
 
     /// Hides or shows an instance, saves `instances.json` and republishes.
-    /// Hidden instances are not run; showing one starts it as Loading.
+    /// Hidden instances are not run; showing one starts it as Loading. A run
+    /// still executing from before a hide finishes first (its result is
+    /// discarded); the restarted loop waits for it, so runs never overlap.
     pub fn set_hidden(&self, instance_id: &str, hidden: bool) {
         let shared = &self.shared;
-        let mut inner = shared.lock();
-        let Some(inst) = inner
-            .data
-            .instances
-            .iter_mut()
-            .find(|i| i.id == instance_id)
-        else {
-            return;
-        };
-        if inst.hidden == hidden {
-            return;
-        }
-        inst.hidden = hidden;
-        let widget_known = shared.widgets.contains_key(&inst.widget);
-        if let Err(e) = instances::save(&shared.instances_path, &inner.data) {
-            log::warn!("cannot save instances: {e}");
-        }
-        if hidden {
-            inner.states.remove(instance_id);
-            if let Some(running) = inner.tasks.remove(instance_id) {
-                running.task.abort();
+        let changed = shared.update(|inner| {
+            let Some(inst) = inner
+                .data
+                .instances
+                .iter_mut()
+                .find(|i| i.id == instance_id)
+            else {
+                return false;
+            };
+            if inst.hidden == hidden {
+                return false;
             }
-        } else if widget_known && !inner.tasks.contains_key(instance_id) {
-            spawn_instance(shared, &mut inner, instance_id.to_string());
+            inst.hidden = hidden;
+            let widget_known = shared.widgets.contains_key(&inst.widget);
+            if hidden {
+                inner.states.remove(instance_id);
+                if let Some(running) = inner.tasks.remove(instance_id) {
+                    running.task.abort();
+                }
+            } else if widget_known && !inner.tasks.contains_key(instance_id) {
+                spawn_instance(shared, inner, instance_id.to_string());
+            }
+            true
+        });
+        if changed {
+            // Disk I/O happens outside the state lock. Re-reading the data under
+            // the save lock means concurrent callers always leave the newest on disk.
+            let _order = shared.save_lock.lock().unwrap_or_else(|p| p.into_inner());
+            let snapshot = shared.lock().data.clone();
+            if let Err(e) = instances::save(&shared.instances_path, &snapshot) {
+                log::warn!("cannot save instances: {e}");
+            }
         }
-        shared.republish(&mut inner);
     }
 
-    /// Stops all instance tasks. A run already on the blocking pool finishes
-    /// on its own and its result is discarded.
+    /// Stops all instance loops. A run already executing finishes on its own
+    /// and its result is discarded.
     pub fn shutdown(self) {
         let mut inner = self.shared.lock();
         for (_, running) in inner.tasks.drain() {
@@ -666,5 +723,86 @@ mod tests {
         }
         advance(60).await;
         assert_eq!(max_seen.load(Ordering::SeqCst), 1);
+    }
+
+    /// Tracks how many runs execute at once, per instance and overall.
+    #[derive(Default)]
+    struct Concurrency {
+        per_instance: Mutex<HashMap<String, usize>>,
+        active: AtomicUsize,
+        max_total: AtomicUsize,
+        max_per_instance: AtomicUsize,
+        runs: AtomicUsize,
+    }
+
+    fn slow_runner(c: Arc<Concurrency>) -> Runner {
+        Arc::new(move |ctx: RunContext| {
+            let c = c.clone();
+            Box::pin(async move {
+                c.runs.fetch_add(1, Ordering::SeqCst);
+                let total = c.active.fetch_add(1, Ordering::SeqCst) + 1;
+                c.max_total.fetch_max(total, Ordering::SeqCst);
+                let mine = {
+                    let mut m = c.per_instance.lock().unwrap();
+                    let n = m.entry(ctx.instance_id.clone()).or_default();
+                    *n += 1;
+                    *n
+                };
+                c.max_per_instance.fetch_max(mine, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                *c.per_instance
+                    .lock()
+                    .unwrap()
+                    .get_mut(&ctx.instance_id)
+                    .unwrap() -= 1;
+                c.active.fetch_sub(1, Ordering::SeqCst);
+                Ok(out("x"))
+            })
+        })
+    }
+
+    fn start_slow(count: u32, c: Arc<Concurrency>) -> (SchedulerHandle, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let widgets = HashMap::from([("w".to_string(), (manifest(), PathBuf::from("wdir")))]);
+        let handle = Scheduler::start_with_runner(
+            widgets,
+            data((1..=count).map(|n| inst(n, false)).collect()),
+            Arc::new(NoHttp),
+            slow_runner(c),
+            dir.path().join("i.json"),
+            |_| {},
+        );
+        (handle, dir)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hide_then_show_mid_run_does_not_overlap() {
+        let c = Arc::new(Concurrency::default());
+        let (handle, _dir) = start_slow(1, c.clone());
+        advance(3).await; // the first run is in flight
+        assert_eq!(c.active.load(Ordering::SeqCst), 1);
+        handle.set_hidden(&id(1), true);
+        handle.set_hidden(&id(1), false);
+        advance(120).await;
+        assert_eq!(c.max_per_instance.load(Ordering::SeqCst), 1);
+        // The restarted loop did run again after the first run ended.
+        assert!(c.runs.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn global_run_cap_holds_across_hide_show_toggles() {
+        let c = Arc::new(Concurrency::default());
+        let (handle, _dir) = start_slow(10, c.clone());
+        for round in 0..4 {
+            advance(3).await;
+            for n in 1..=10 {
+                handle.set_hidden(&id(n), true);
+                handle.set_hidden(&id(n), false);
+            }
+            advance(round + 1).await;
+        }
+        advance(120).await;
+        assert_eq!(c.max_per_instance.load(Ordering::SeqCst), 1);
+        assert_eq!(c.max_total.load(Ordering::SeqCst), MAX_CONCURRENT_RUNS);
     }
 }
