@@ -271,8 +271,8 @@ fn install_fetch<'js>(
                         ));
                     }
                 };
-                let total = received.fetch_add(resp.body.len(), Ordering::Relaxed)
-                    + resp.body.len();
+                let total =
+                    received.fetch_add(resp.body.len(), Ordering::Relaxed) + resp.body.len();
                 if total > FETCH_BUDGET_BYTES {
                     return Err(over_budget());
                 }
@@ -654,11 +654,10 @@ mod tests {
             true
         }
         fn log(&self, r: &log::Record) {
-            self.0.lock().unwrap().push((
-                r.target().to_string(),
-                r.level(),
-                r.args().to_string(),
-            ));
+            self.0
+                .lock()
+                .unwrap()
+                .push((r.target().to_string(), r.level(), r.args().to_string()));
         }
         fn flush(&self) {}
     }

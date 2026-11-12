@@ -298,7 +298,9 @@ mod tests {
         let mut data = Instances::default();
         let kept = data.new_instance(&manifest("weather"));
         let orphan = data.new_instance(&manifest("uninstalled"));
-        data.instances[1].settings.insert("city".into(), json!("Oslo"));
+        data.instances[1]
+            .settings
+            .insert("city".into(), json!("Oslo"));
         save(&path, &data).unwrap();
 
         let mut loaded = load(&path);

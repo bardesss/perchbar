@@ -803,7 +803,10 @@ mod tests {
         rig.handle.set_hidden(&id(1), true);
         assert!(rig.handle.flush_saves(Duration::from_secs(5)));
         let saved = crate::instances::load(&rig.path);
-        assert!(saved.instances.iter().any(|i| i.id == id(2) && i.widget == "gone"));
+        assert!(saved
+            .instances
+            .iter()
+            .any(|i| i.id == id(2) && i.widget == "gone"));
     }
 
     #[test]

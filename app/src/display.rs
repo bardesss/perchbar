@@ -446,7 +446,9 @@ mod tests {
         let ok: Vec<_> = (0..16).map(|_| text_frame()).collect();
         assert_eq!(parse(json!({ "frames": ok })).unwrap().frames.len(), 16);
         let too_many: Vec<_> = (0..17).map(|_| text_frame()).collect();
-        let err = parse(json!({ "frames": too_many })).unwrap_err().to_string();
+        let err = parse(json!({ "frames": too_many }))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("at most 16 frames"), "{err}");
     }
 
@@ -522,7 +524,13 @@ mod tests {
         let o = one_block(json!({"type":"stack","top":bar,"bottom":t})).unwrap();
         match &o.frames[0].blocks[0] {
             Block::Stack { top, .. } => {
-                assert!(matches!(**top, Block::Bar { width: Some(200), .. }))
+                assert!(matches!(
+                    **top,
+                    Block::Bar {
+                        width: Some(200),
+                        ..
+                    }
+                ))
             }
             other => panic!("unexpected {other:?}"),
         }

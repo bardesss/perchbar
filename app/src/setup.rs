@@ -185,8 +185,11 @@ mod tests {
             r#"{"id":"leftover","name":"L","formatVersion":1}"#,
         )
         .unwrap();
-        std::fs::write(hidden.join("widget.js"), "export default async function update() {}")
-            .unwrap();
+        std::fs::write(
+            hidden.join("widget.js"),
+            "export default async function update() {}",
+        )
+        .unwrap();
         let mut ids: Vec<String> = load_widgets(dir.path()).into_keys().collect();
         ids.sort();
         assert_eq!(ids, ["bitcoin-price", "world-clock"]);
