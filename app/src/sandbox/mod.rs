@@ -104,9 +104,10 @@ pub const FETCH_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 pub const WIDGET_LOG_TARGET: &str = "perchbar::widget";
 
 /// Cuts an error message to `ERROR_MAX_CHARS` characters, the last one an
-/// ellipsis, so a widget cannot flood the log or a tooltip.
+/// ellipsis, and blanks control characters, so a widget cannot flood or
+/// forge log lines or tooltips.
 fn clip(msg: impl Into<String>) -> String {
-    let msg = msg.into();
+    let msg = host::without_controls(&msg.into());
     if msg.chars().count() <= ERROR_MAX_CHARS {
         return msg;
     }
@@ -509,6 +510,20 @@ mod tests {
             Err(RunError::Script(m)) => {
                 assert_eq!(m.chars().count(), ERROR_MAX_CHARS, "{m}");
                 assert!(m.ends_with('…'));
+            }
+            other => panic!("expected Script error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn script_error_has_no_control_characters() {
+        let f = Fixture::new(
+            "export default async function update() {\n  throw new Error(\"a\\nperchbar::x ERROR fake\\x1b[31m\");\n}",
+        );
+        match f.run().await {
+            Err(RunError::Script(m)) => {
+                assert!(m.contains("a perchbar::x ERROR fake [31m"), "{m:?}");
+                assert!(!m.chars().any(char::is_control), "{m:?}");
             }
             other => panic!("expected Script error, got {other:?}"),
         }

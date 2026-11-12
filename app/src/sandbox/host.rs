@@ -138,11 +138,23 @@ impl LogLimiter {
     pub fn admit(&mut self, msg: &str) -> Option<String> {
         self.calls += 1;
         match self.calls {
-            n if n <= LOG_MAX_CALLS => Some(truncate_to_boundary(msg, LOG_MESSAGE_MAX_BYTES)),
+            n if n <= LOG_MAX_CALLS => Some(truncate_to_boundary(
+                &without_controls(msg),
+                LOG_MESSAGE_MAX_BYTES,
+            )),
             n if n == LOG_MAX_CALLS + 1 => Some("log limit reached".to_string()),
             _ => None,
         }
     }
+}
+
+/// Replaces every control character (C0, DEL and C1, so CR, LF and ESC
+/// too) with a space, so widget text cannot forge log lines or send
+/// terminal escapes.
+pub fn without_controls(msg: &str) -> String {
+    msg.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 fn truncate_to_boundary(msg: &str, max: usize) -> String {
@@ -393,6 +405,16 @@ mod tests {
         let tricky = format!("{}é{}", "a".repeat(1023), "b".repeat(10));
         assert_eq!(l.admit(&tricky).unwrap().len(), 1023);
         assert_eq!(l.admit("short").as_deref(), Some("short"));
+    }
+
+    #[test]
+    fn log_messages_cannot_forge_lines_or_send_escapes() {
+        let mut l = LogLimiter::default();
+        let line = l.admit("a\nperchbar::x ERROR fake\x1b[31m").unwrap();
+        assert_eq!(line, "a perchbar::x ERROR fake [31m");
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+        let line = l.admit("x\r\ty\u{7f}z\u{9b}w").unwrap();
+        assert_eq!(line, "x  y z w");
     }
 
     #[test]
