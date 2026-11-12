@@ -48,7 +48,114 @@ const REVALIDATE: Duration = Duration::from_secs(5);
 
 /// Turns a resolved icon file into a `size` x `size` bitmap. Injectable so
 /// tests can count rasterizations.
-pub type Rasterizer = Arc<dyn Fn(&Path, u32) -> Result<Bitmap, String> + Send + Sync>;
+pub type Rasterizer = Arc<dyn Fn(&Path, u32) -> Result<Bitmap, RasterError> + Send + Sync>;
+
+/// Why an icon could not be rasterized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RasterError {
+    /// Broken or unsupported file; cached as failed for this file version.
+    Failed(String),
+    /// Took longer than the limit; that widget folder and src stay failed
+    /// for the rest of the process, whatever later edits to the file.
+    TimedOut,
+    /// Another SVG rasterization (possibly a timed-out one) still runs;
+    /// not cached, the icon is tried again on a later recheck.
+    Busy,
+}
+
+impl std::fmt::Display for RasterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RasterError::Failed(why) => f.write_str(why),
+            RasterError::TimedOut => f.write_str("took too long to draw"),
+            RasterError::Busy => f.write_str("another icon is still being drawn"),
+        }
+    }
+}
+
+/// Allows one isolated rasterization thread alive at a time. A thread that
+/// timed out keeps its slot until it really ends, so a widget cannot pile
+/// up runaway threads by changing its src or file.
+pub struct Slot {
+    busy: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl Slot {
+    pub const fn new() -> Slot {
+        Slot {
+            busy: Mutex::new(false),
+            cv: Condvar::new(),
+        }
+    }
+}
+
+impl Default for Slot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The process-wide slot for SVG rasterization threads.
+static SVG_SLOT: Slot = Slot::new();
+
+/// Frees the slot when the rasterization thread ends, however it ends.
+struct SlotGuard(&'static Slot);
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        *self.0.busy.lock().unwrap_or_else(|p| p.into_inner()) = false;
+        self.0.cv.notify_all();
+    }
+}
+
+/// Runs `job` on a fresh thread with a large stack, holding `slot`. Waits
+/// up to `wait` for the slot (else `Busy`, without spawning) and up to
+/// `timeout` for the result (else `TimedOut`; the thread keeps the slot
+/// until it finishes).
+fn run_limited<T: Send + 'static>(
+    slot: &'static Slot,
+    wait: Duration,
+    timeout: Duration,
+    job: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, RasterError> {
+    {
+        let deadline = Instant::now() + wait;
+        let mut busy = slot.busy.lock().unwrap_or_else(|p| p.into_inner());
+        while *busy {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(RasterError::Busy);
+            }
+            busy = slot
+                .cv
+                .wait_timeout(busy, left)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
+        *busy = true;
+    }
+    let guard = SlotGuard(slot);
+    let (tx, rx) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("svg-icon".into())
+        .stack_size(SVG_THREAD_STACK)
+        .spawn(move || {
+            let _guard = guard;
+            let _ = tx.send(job());
+        });
+    if let Err(e) = spawned {
+        // The closure (and the guard in it) was dropped: the slot is free.
+        return Err(RasterError::Failed(format!("cannot start SVG thread: {e}")));
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(r) => r.map_err(RasterError::Failed),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(RasterError::TimedOut),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(RasterError::Failed("SVG rasterizer panicked".into()))
+        }
+    }
+}
 /// Called on the worker thread whenever a result is ready.
 pub type Notify = Arc<dyn Fn() + Send + Sync>;
 
@@ -320,6 +427,8 @@ impl RasterCache {
 /// The worker loop: resolve, look up or rasterize, send, notify.
 fn worker(queue: &Queue, tx: &Sender<Done>, rasterize: &Rasterizer, notify: &Notify) {
     let mut cache = RasterCache::default();
+    // (widget folder, src) that timed out once: failed for good.
+    let mut timed_out: HashSet<(PathBuf, String)> = HashSet::new();
     let mut logged: HashSet<String> = HashSet::new();
     let mut log_once = |dir: &Path, src: &str, why: &str| {
         if logged.insert(format!("{}|{src}|{why}", dir.display())) {
@@ -331,7 +440,9 @@ fn worker(queue: &Queue, tx: &Sender<Done>, rasterize: &Rasterizer, notify: &Not
     };
     while let Some(req) = queue.pop() {
         let (dir, src, size) = (&req.0, req.1.as_str(), req.2);
+        let gave_up = timed_out.contains(&(dir.clone(), src.to_string()));
         let bitmap = match resolve(dir, src) {
+            _ if gave_up => None,
             Err(why) => {
                 log_once(dir, src, &why);
                 None
@@ -340,17 +451,22 @@ fn worker(queue: &Queue, tx: &Sender<Done>, rasterize: &Rasterizer, notify: &Not
                 let key: RasterKey = (path, mtime, len, size);
                 match cache.get(&key) {
                     Some(hit) => hit,
-                    None => {
-                        let made = match rasterize(&key.0, size) {
-                            Ok(b) => Some(Arc::new(b)),
-                            Err(why) => {
-                                log_once(dir, src, &why);
-                                None
+                    None => match rasterize(&key.0, size) {
+                        Ok(b) => {
+                            let made = Some(Arc::new(b));
+                            cache.insert(key, made.clone());
+                            made
+                        }
+                        Err(RasterError::Busy) => None,
+                        Err(e) => {
+                            log_once(dir, src, &e.to_string());
+                            if e == RasterError::TimedOut {
+                                timed_out.insert((dir.clone(), src.to_string()));
                             }
-                        };
-                        cache.insert(key, made.clone());
-                        made
-                    }
+                            cache.insert(key, None);
+                            None
+                        }
+                    },
                 }
             }
         };
@@ -385,13 +501,14 @@ fn resolve(widget_dir: &Path, src: &str) -> Result<(PathBuf, SystemTime, u64), S
     Ok((file, mtime, meta.len()))
 }
 
-fn load(path: &Path, size_px: u32) -> Result<Bitmap, String> {
+fn load(path: &Path, size_px: u32) -> Result<Bitmap, RasterError> {
+    let failed = RasterError::Failed;
     let mut data = Vec::new();
     std::fs::File::open(path)
         .and_then(|f| f.take(MAX_ICON_BYTES + 1).read_to_end(&mut data))
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| failed(e.to_string()))?;
     if data.len() as u64 > MAX_ICON_BYTES {
-        return Err("larger than 256 KB".into());
+        return Err(failed("larger than 256 KB".into()));
     }
     let ext = path
         .extension()
@@ -399,8 +516,8 @@ fn load(path: &Path, size_px: u32) -> Result<Bitmap, String> {
         .map(str::to_ascii_lowercase);
     let pixmap = match ext.as_deref() {
         Some("svg") => rasterize_svg_isolated(data, size_px)?,
-        Some("png") => scale_png(&data, size_px)?,
-        _ => return Err("not .svg or .png".into()),
+        Some("png") => scale_png(&data, size_px).map_err(failed)?,
+        _ => return Err(failed("not .svg or .png".into())),
     };
     Ok(to_bitmap(pixmap))
 }
@@ -480,22 +597,10 @@ fn expanded_elements(data: &[u8]) -> Option<u64> {
 /// Parses and rasterizes on a fresh thread with a large stack, so a deeply
 /// nested file can never overflow the caller's stack (an overflow aborts the
 /// process and cannot be caught). Runs on the icon worker, never the strip.
-fn rasterize_svg_isolated(data: Vec<u8>, size: u32) -> Result<Pixmap, String> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::Builder::new()
-        .name("svg-icon".into())
-        .stack_size(SVG_THREAD_STACK)
-        .spawn(move || {
-            let _ = tx.send(rasterize_svg(&data, size));
-        })
-        .map_err(|e| format!("cannot start SVG thread: {e}"))?;
-    // A slow file is given up on (and cached as failed); its thread is
-    // left to finish on its own.
-    match rx.recv_timeout(SVG_TIMEOUT) {
-        Ok(r) => r,
-        Err(mpsc::RecvTimeoutError::Timeout) => Err("took too long to draw".into()),
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err("SVG rasterizer panicked".into()),
-    }
+fn rasterize_svg_isolated(data: Vec<u8>, size: u32) -> Result<Pixmap, RasterError> {
+    run_limited(&SVG_SLOT, SVG_TIMEOUT, SVG_TIMEOUT, move || {
+        rasterize_svg(&data, size)
+    })
 }
 
 /// Uniform scale and offset that fit `w` x `h` centered in a square.
@@ -838,7 +943,7 @@ mod tests {
         let r: Rasterizer = Arc::new(move |_path: &Path, size: u32| {
             c.fetch_add(1, Ordering::SeqCst);
             if fail {
-                return Err("fake failure".into());
+                return Err(RasterError::Failed("fake failure".into()));
             }
             let n = size as usize;
             Ok(Bitmap {
@@ -953,5 +1058,99 @@ mod tests {
             rc.insert(key(n), tiny());
         }
         assert!(matches!(rc.get(&key(9999)), Some(None)), "failure survives");
+    }
+
+    #[test]
+    fn no_new_thread_while_a_timed_out_one_still_runs() {
+        static TEST_SLOT: Slot = Slot::new();
+        let started = Arc::new(AtomicUsize::new(0));
+        let (s1, s2, s3) = (started.clone(), started.clone(), started.clone());
+        let slow = run_limited(
+            &TEST_SLOT,
+            Duration::ZERO,
+            Duration::from_millis(50),
+            move || {
+                s1.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(600));
+                Ok(())
+            },
+        );
+        assert_eq!(slow, Err(RasterError::TimedOut));
+        // The timed-out thread still holds the slot: no second thread.
+        let second = run_limited(
+            &TEST_SLOT,
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+            move || {
+                s2.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        assert_eq!(second, Err(RasterError::Busy));
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+        // Once it ends, the next job runs.
+        let third = run_limited(
+            &TEST_SLOT,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            move || {
+                s3.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        assert_eq!(third, Ok(()));
+        assert_eq!(started.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn timed_out_src_stays_failed_after_the_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("slow.svg");
+        std::fs::copy(fixtures().join("logo.svg"), &file).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let r: Rasterizer = Arc::new(move |_: &Path, _: u32| {
+            c.fetch_add(1, Ordering::SeqCst);
+            Err(RasterError::TimedOut)
+        });
+        let mut cache = ImageCache::with(r, Arc::new(|| {}));
+        assert!(cache.get_wait(dir.path(), "slow.svg", 16, None).is_none());
+        // New contents, size and mtime: a new raster key.
+        let mut bigger = std::fs::read(&file).unwrap();
+        bigger.extend_from_slice(b"<!-- edited -->");
+        std::fs::write(&file, bigger).unwrap();
+        let later = SystemTime::now() + Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        cache.invalidate();
+        assert!(cache.get_wait(dir.path(), "slow.svg", 16, None).is_none());
+        // Another size is a new key too, and still not tried.
+        assert!(cache.get_wait(dir.path(), "slow.svg", 24, None).is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn busy_is_not_cached_as_a_failure() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let r: Rasterizer = Arc::new(move |_: &Path, size: u32| {
+            if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(RasterError::Busy);
+            }
+            Ok(Bitmap {
+                width: size as i32,
+                height: size as i32,
+                pixels: vec![0; (size * size * 4) as usize],
+            })
+        });
+        let mut cache = ImageCache::with(r, Arc::new(|| {}));
+        assert!(cache.get_wait(&fixtures(), "logo.svg", 16, None).is_none());
+        cache.invalidate();
+        assert!(cache.get_wait(&fixtures(), "logo.svg", 16, None).is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }
