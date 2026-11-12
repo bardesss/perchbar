@@ -19,6 +19,8 @@ const MAX_PNG_SIDE: u32 = 1024;
 const MAX_PNG_DECODE_BYTES: usize = 8 * 1024 * 1024;
 /// usvg nesting limit; its converter recurses once per level.
 const SVG_MAX_DEPTH: u32 = 32;
+/// Most elements an icon may have once `<use>` references are expanded.
+const SVG_MAX_ELEMENTS: u64 = 10_000;
 /// Stack for the SVG worker thread.
 const SVG_THREAD_STACK: usize = 16 * 1024 * 1024;
 /// Entries kept before the cache is emptied (old mtimes pile up otherwise).
@@ -139,6 +141,9 @@ fn load(path: &Path, size_px: u32) -> Result<Bitmap, String> {
 /// Parses an SVG without touching the file system or network: no resources
 /// folder, every `<image>` reference refused, and no font support compiled in.
 fn svg_tree(data: &[u8]) -> Option<usvg::Tree> {
+    if expanded_elements(data)? > SVG_MAX_ELEMENTS {
+        return None;
+    }
     let opt = usvg::Options {
         resources_dir: None,
         image_href_resolver: usvg::ImageHrefResolver {
@@ -149,6 +154,60 @@ fn svg_tree(data: &[u8]) -> Option<usvg::Tree> {
         ..usvg::Options::default()
     };
     usvg::Tree::from_data(data, &opt).ok()
+}
+
+/// Element count after expanding every `<use>`, so a fan-out of references
+/// is refused up front instead of being expanded by usvg (which only stops
+/// at a million elements, seconds of CPU). Iterative, so nesting depth does
+/// not matter. `None` when the XML does not parse.
+fn expanded_elements(data: &[u8]) -> Option<u64> {
+    let text = std::str::from_utf8(data).ok()?;
+    let opt = roxmltree::ParsingOptions {
+        allow_dtd: true,
+        ..roxmltree::ParsingOptions::default()
+    };
+    let doc = roxmltree::Document::parse_with_options(text, opt).ok()?;
+    let by_id: HashMap<&str, roxmltree::NodeId> = doc
+        .descendants()
+        .filter_map(|n| Some((n.attribute("id")?, n.id())))
+        .collect();
+    let use_target = |n: roxmltree::Node| -> Option<roxmltree::NodeId> {
+        if n.tag_name().name() != "use" {
+            return None;
+        }
+        let href = n
+            .attribute(("http://www.w3.org/1999/xlink", "href"))
+            .or_else(|| n.attribute("href"))?;
+        by_id.get(href.strip_prefix('#')?).copied()
+    };
+
+    // Post-order walk with an explicit stack. `None` in `count` means the
+    // node is being counted; a reference back to it (a cycle) adds nothing.
+    let mut count: HashMap<roxmltree::NodeId, Option<u64>> = HashMap::new();
+    let root = doc.root_element().id();
+    let mut stack = vec![(root, false)];
+    while let Some((id, done)) = stack.pop() {
+        let node = doc.get_node(id)?;
+        let deps = node
+            .children()
+            .filter(|c| c.is_element())
+            .map(|c| c.id())
+            .chain(use_target(node));
+        if done {
+            let total = deps.fold(1_u64, |acc, d| {
+                acc.saturating_add(count.get(&d).copied().flatten().unwrap_or(0))
+            });
+            if total > SVG_MAX_ELEMENTS {
+                return Some(total);
+            }
+            count.insert(id, Some(total));
+        } else if let std::collections::hash_map::Entry::Vacant(e) = count.entry(id) {
+            e.insert(None);
+            stack.push((id, true));
+            stack.extend(deps.filter(|d| !count.contains_key(d)).map(|d| (d, false)));
+        }
+    }
+    count.get(&root).copied().flatten()
 }
 
 /// Parses and rasterizes on a fresh thread with a large stack, so a deeply
@@ -437,10 +496,21 @@ mod tests {
         std::fs::write(dir.path().join("fan.svg"), svg).unwrap();
         let start = std::time::Instant::now();
         let mut c = ImageCache::new();
-        if let Some(b) = c.get(dir.path(), "fan.svg", 16, None) {
-            assert_eq!((b.width, b.height), (16, 16));
-        }
+        assert!(c.get(dir.path(), "fan.svg", 16, None).is_none());
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn expanded_element_count() {
+        let logo = std::fs::read(fixtures().join("logo.svg")).unwrap();
+        assert_eq!(expanded_elements(&logo), Some(3));
+        let used = br##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><g id="a"><rect/><rect/></g><use href="#a"/><use xlink:href="#a"/></svg>"##;
+        // svg, the g subtree (3), and two uses of 1 + 3 each.
+        assert_eq!(expanded_elements(used), Some(12));
+        let cycle =
+            br##"<svg xmlns="http://www.w3.org/2000/svg"><g id="a"><use href="#a"/></g></svg>"##;
+        assert_eq!(expanded_elements(cycle), Some(3));
+        assert_eq!(expanded_elements(b"not xml"), None);
     }
 
     #[test]
