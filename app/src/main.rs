@@ -9,6 +9,10 @@ mod manifest;
 mod paths;
 #[allow(dead_code)]
 mod sandbox;
+#[allow(dead_code)]
+mod scheduler;
+#[allow(dead_code)]
+mod strip;
 
 fn main() {
     tauri::Builder::default()

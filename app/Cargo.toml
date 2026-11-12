@@ -21,8 +21,8 @@ chrono = "0.4"
 log = "0.4"
 url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
-tokio = { version = "1", features = ["time", "rt"] }
+tokio = { version = "1", features = ["time", "rt", "sync", "macros"] }
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
