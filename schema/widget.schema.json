@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perchbar.dev/schema/widget.schema.json",
+  "title": "Perchbar widget manifest (widget.json)",
+  "type": "object",
+  "required": ["id", "name", "formatVersion"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "id": { "type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$" },
+    "name": { "type": "string", "minLength": 1 },
+    "description": { "type": "string", "default": "" },
+    "author": { "type": "string", "default": "" },
+    "version": { "type": "string", "default": "0.0.0" },
+    "formatVersion": { "const": 1 },
+    "refresh": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 60,
+      "description": "Refresh interval in seconds. Values below 10 are raised to 10."
+    },
+    "settings": {
+      "type": "array",
+      "default": [],
+      "items": { "$ref": "#/$defs/settingField" }
+    },
+    "permissions": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "network": { "type": "array", "default": [], "items": { "$ref": "#/$defs/hostname" } },
+        "files": { "type": "array", "default": [], "items": { "type": "string" } },
+        "sources": { "type": "array", "default": [], "items": { "type": "string" } }
+      }
+    }
+  },
+  "$defs": {
+    "hostname": {
+      "type": "string",
+      "description": "Bare hostname: no scheme, port, path or whitespace.",
+      "pattern": "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$"
+    },
+    "settingField": {
+      "type": "object",
+      "required": ["key", "label", "kind"],
+      "additionalProperties": false,
+      "properties": {
+        "key": { "type": "string", "minLength": 1 },
+        "label": { "type": "string" },
+        "kind": {
+          "enum": ["text", "number", "select", "toggle", "list", "secret", "location", "color"]
+        },
+        "default": {},
+        "options": { "type": "array", "items": { "type": "string" }, "default": [] },
+        "required": { "type": "boolean", "default": false }
+      },
+      "if": { "properties": { "kind": { "const": "select" } }, "required": ["kind"] },
+      "then": { "required": ["options"], "properties": { "options": { "minItems": 1 } } }
+    }
+  }
+}
