@@ -204,6 +204,47 @@ impl RotationState {
         true
     }
 
+    /// When the next rotation is due: the earliest of every rotating key's
+    /// last advance plus its period, as of the last `tick`. `None` when
+    /// nothing rotates. Arming one timer for this instant lets an 8 s group
+    /// next to a 6 s clock rotate at 8 s, not at the clock's 12 s tick.
+    pub fn next_due(&self, model: &StripModel) -> Option<Instant> {
+        let mut due: Option<Instant> = None;
+        let mut note = |at: Option<&Instant>, secs: u32| {
+            if let Some(t) = at {
+                let d = *t + Duration::from_secs(u64::from(secs.max(1)));
+                due = Some(due.map_or(d, |cur| cur.min(d)));
+            }
+        };
+        let frames_secs = |out: Option<&Output>| {
+            out.filter(|o| o.frames.len() > 1)
+                .map(|o| o.rotate.unwrap_or(DEFAULT_ROTATE_SECS))
+        };
+        for slot in &model.slots {
+            match &slot.kind {
+                SlotKind::Single {
+                    instance_id, state, ..
+                } => {
+                    if let Some(secs) = frames_secs(state_output(state)) {
+                        note(self.frame_at.get(instance_id), secs);
+                    }
+                }
+                SlotKind::Group { interval, members } if !members.is_empty() => {
+                    if members.len() > 1 {
+                        note(self.group_at.get(&slot.id), *interval);
+                    }
+                    let idx = self.group_index.get(&slot.id).copied().unwrap_or(0) % members.len();
+                    let m = &members[idx];
+                    if let Some(secs) = frames_secs(state_output(&m.state)) {
+                        note(self.frame_at.get(&m.instance_id), secs);
+                    }
+                }
+                SlotKind::Group { .. } => {}
+            }
+        }
+        due
+    }
+
     fn tick_frames(&mut self, id: &str, out: Option<&Output>, now: Instant, paused: bool) {
         let n = out.map_or(0, |o| o.frames.len());
         if n < 2 {
@@ -760,6 +801,44 @@ mod tests {
         assert_eq!(rot.frame_index["slow"], 1);
         let l = layout(&m, &rot, &metrics(500.0), &Fake);
         assert_eq!(l.items[0].frame.as_ref().unwrap().frame_index, 1);
+    }
+
+    #[test]
+    fn next_due_is_the_earliest_rotation_across_keys() {
+        // A 6 s two-frame clock next to an 8 s group.
+        let clock = single("clock", SlotState::Ok(out(&["a", "b"])), None);
+        let g = group(
+            "g",
+            8,
+            vec![
+                member("m1", SlotState::Ok(out(&["one"]))),
+                member("m2", SlotState::Ok(out(&["two"]))),
+            ],
+        );
+        let m = model(vec![clock, g]);
+        let mut rot = RotationState::default();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        rot.tick(&m, t0);
+        assert_eq!(rot.next_due(&m), Some(at(6)));
+        rot.tick(&m, at(6));
+        assert_eq!(rot.frame_index["clock"], 1);
+        // The group is due at 8 s, not at the clock's next tick (12 s).
+        assert_eq!(rot.next_due(&m), Some(at(8)));
+        rot.tick(&m, at(8));
+        assert_eq!(rot.group_index["g"], 1);
+        assert_eq!(rot.next_due(&m), Some(at(12)));
+    }
+
+    #[test]
+    fn next_due_is_none_when_nothing_rotates() {
+        let m = model(vec![
+            btc("s1"),
+            group("solo", 5, vec![member("a", SlotState::Ok(out(&["x"])))]),
+        ]);
+        let mut rot = RotationState::default();
+        rot.tick(&m, Instant::now());
+        assert_eq!(rot.next_due(&m), None);
     }
 
     #[test]

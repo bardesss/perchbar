@@ -62,7 +62,7 @@ use crate::strip::placement::{self, TaskbarInfo};
 use crate::strip::render::{Bitmap, Renderer};
 use crate::strip::theme::{self, Palette};
 use crate::strip::uia::{ButtonQuery, UiaWorker};
-use crate::strip::{rotation_secs, RenderKey, StripEvent};
+use crate::strip::{RenderKey, StripEvent};
 
 /// Drain the event channel.
 const WM_APP_EVENTS: u32 = WM_APP;
@@ -106,6 +106,8 @@ const ID_OVERFLOW_BASE: u32 = 100;
 /// A WM_TIMER can fire a little early; this keeps such a tick from missing
 /// a rotation that is due.
 const ROTATE_SLACK: Duration = Duration::from_millis(100);
+/// Shortest wait the rotation timer is armed with.
+const ROTATE_MIN_MS: u32 = 50;
 
 const CTL_CLASS: PCWSTR = w!("PerchbarStripControl");
 const STRIP_CLASS: PCWSTR = w!("PerchbarStrip");
@@ -148,7 +150,6 @@ struct State {
     width_px: i32,
     key: Option<RenderKey>,
     pos: Option<(i32, i32, i32, i32)>,
-    rotate_secs: Option<u32>,
     debounce_pending: bool,
     uia: UiaWorker,
     /// Last UI Automation result for the current taskbar; `None` until the
@@ -339,7 +340,6 @@ fn setup(
             width_px: 0,
             key: None,
             pos: None,
-            rotate_secs: None,
             debounce_pending: false,
             uia: UiaWorker::start(|| post_to_ctl(WM_APP_BUTTONS)),
             buttons_right: None,
@@ -401,17 +401,20 @@ impl State {
         }
     }
 
+    /// Arms `T_ROTATE` for the earliest rotation due across all slots and
+    /// frames (one-shot: `rotate` re-arms it), or stops it when nothing
+    /// rotates.
     fn update_rotation_timer(&mut self) {
-        let secs = rotation_secs(&self.model);
-        if secs == self.rotate_secs {
-            return;
-        }
-        self.rotate_secs = secs;
+        let next = self.rot.next_due(&self.model);
         // SAFETY: timers on our own window; SetTimer replaces an existing one.
         unsafe {
-            match secs {
-                Some(s) => {
-                    SetTimer(Some(self.ctl), T_ROTATE, s.saturating_mul(1000), None);
+            match next {
+                Some(at) => {
+                    let wait = at.saturating_duration_since(Instant::now());
+                    let ms = u32::try_from(wait.as_millis())
+                        .unwrap_or(u32::MAX)
+                        .max(ROTATE_MIN_MS);
+                    SetTimer(Some(self.ctl), T_ROTATE, ms, None);
                 }
                 None => {
                     let _ = KillTimer(Some(self.ctl), T_ROTATE);
@@ -422,6 +425,7 @@ impl State {
 
     fn rotate(&mut self) {
         self.rot.tick(&self.model, Instant::now() + ROTATE_SLACK);
+        self.update_rotation_timer();
         self.refresh();
     }
 
