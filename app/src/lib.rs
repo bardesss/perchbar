@@ -1,6 +1,7 @@
 //! Perchbar: Windows 11 taskbar widgets. The binary in `main.rs` wires these
 //! modules together; integration tests drive them directly.
 
+pub mod commands;
 pub mod display;
 pub mod instances;
 pub mod logbook;
@@ -14,3 +15,4 @@ pub mod secrets;
 pub mod settings_window;
 pub mod setup;
 pub mod strip;
+pub mod validate;

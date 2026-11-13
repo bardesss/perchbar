@@ -2,7 +2,25 @@ use std::path::Path;
 
 /// Commands the settings page may call. Each gets an `allow-<command>`
 /// permission, granted in capabilities/settings.json.
-const COMMANDS: &[&str] = &["get_version"];
+const COMMANDS: &[&str] = &[
+    "get_version",
+    "get_state",
+    "add_instance",
+    "remove_instance",
+    "update_settings",
+    "set_secret",
+    "clear_secret",
+    "set_hidden",
+    "set_max_width",
+    "set_order",
+    "create_group",
+    "update_group",
+    "ungroup",
+    "refresh_now",
+    "get_logs",
+    "set_autostart",
+    "open_log_folder",
+];
 
 fn main() {
     println!("cargo:rerun-if-changed=windows-app-manifest.xml");

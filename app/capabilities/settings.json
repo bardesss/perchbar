@@ -7,6 +7,22 @@
     "core:event:default",
     "core:window:allow-close",
     "core:window:allow-minimize",
-    "allow-get-version"
+    "allow-get-version",
+    "allow-get-state",
+    "allow-add-instance",
+    "allow-remove-instance",
+    "allow-update-settings",
+    "allow-set-secret",
+    "allow-clear-secret",
+    "allow-set-hidden",
+    "allow-set-max-width",
+    "allow-set-order",
+    "allow-create-group",
+    "allow-update-group",
+    "allow-ungroup",
+    "allow-refresh-now",
+    "allow-get-logs",
+    "allow-set-autostart",
+    "allow-open-log-folder"
   ]
 }

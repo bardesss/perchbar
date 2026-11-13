@@ -8,6 +8,8 @@ use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use perchbar::commands::AppState;
+use perchbar::prefs::{self, Autostart, NoAutostart, RegistryAutostart};
 use perchbar::sandbox::ReqwestClient;
 use perchbar::scheduler::{Scheduler, WidgetEntry};
 use perchbar::secrets::{self, SecretStore};
@@ -66,17 +68,17 @@ fn main() {
     // Dev and test runs (PERCHBAR_DATA_DIR set) must not register themselves
     // in the real Run key.
     let dev_mode = std::env::var_os(paths::DATA_DIR_ENV).is_some_and(|v| !v.is_empty());
-    match std::env::current_exe() {
-        Ok(exe) if !dev_mode => {
-            perchbar::prefs::startup(
-                &paths::prefs_file(),
-                &perchbar::prefs::RegistryAutostart { exe: exe.clone() },
-                &exe,
-            );
-        }
+    let exe = std::env::current_exe();
+    let autostart: Arc<dyn Autostart + Send + Sync> = match &exe {
+        Ok(exe) if !dev_mode => Arc::new(RegistryAutostart { exe: exe.clone() }),
+        _ => Arc::new(NoAutostart),
+    };
+    match &exe {
         Ok(exe) => {
-            log::info!("autostart skipped in dev mode");
-            perchbar::prefs::startup(&paths::prefs_file(), &perchbar::prefs::NoAutostart, &exe);
+            if dev_mode {
+                log::info!("autostart skipped in dev mode");
+            }
+            prefs::startup(&paths::prefs_file(), autostart.as_ref(), exe);
         }
         Err(e) => log::warn!("cannot find own exe, Start with Windows unchanged: {e}"),
     }
@@ -135,6 +137,8 @@ fn main() {
     let (tx, rx) = mpsc::channel();
     let publish_tx = tx.clone();
     let (bridge, bridge_rx) = StateBridge::new();
+    // The same store, shared with the settings commands.
+    let sched_secrets = secret_store.clone();
     // The scheduler spawns onto the runtime it starts in, and its runner needs
     // a multi-thread runtime; Tauri's global runtime is one.
     let sched = tauri::async_runtime::block_on(async move {
@@ -142,7 +146,7 @@ fn main() {
             widgets,
             data,
             Arc::new(ReqwestClient::new()),
-            secret_store,
+            sched_secrets,
             move |model| {
                 // Runs on scheduler threads under the publish lock: never block.
                 let _ = publish_tx.send(StripEvent::Model(model));
@@ -151,7 +155,15 @@ fn main() {
             },
         )
     });
+    let state = AppState::new(
+        sched.clone(),
+        secret_store,
+        sched.logbook(),
+        autostart,
+        paths::data_dir(),
+    );
     let app = tauri::Builder::default()
+        .manage(state)
         .invoke_handler(settings_window::invoke_handler())
         .build(tauri::generate_context!())
         .expect("failed to build Perchbar");

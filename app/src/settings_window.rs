@@ -145,7 +145,26 @@ pub fn get_version() -> &'static str {
 /// `build.rs` and an `allow-` permission in `capabilities/settings.json`.
 pub fn invoke_handler<R: Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static
 {
-    tauri::generate_handler![get_version]
+    use crate::commands::ipc;
+    tauri::generate_handler![
+        get_version,
+        ipc::get_state,
+        ipc::add_instance,
+        ipc::remove_instance,
+        ipc::update_settings,
+        ipc::set_secret,
+        ipc::clear_secret,
+        ipc::set_hidden,
+        ipc::set_max_width,
+        ipc::set_order,
+        ipc::create_group,
+        ipc::update_group,
+        ipc::ungroup,
+        ipc::refresh_now,
+        ipc::get_logs,
+        ipc::set_autostart,
+        ipc::open_log_folder,
+    ]
 }
 
 /// What to do when Tauri asks the app to exit.

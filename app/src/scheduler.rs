@@ -688,6 +688,8 @@ fn add_secrets(ctx: &mut RunContext, secrets: SecretLoad) {
     ctx.redactor = Arc::new(Redactor::new(hidden));
 }
 
+/// Cheap to clone; clones drive the same scheduler.
+#[derive(Clone)]
 pub struct SchedulerHandle {
     shared: Arc<Shared>,
 }
@@ -699,6 +701,24 @@ impl SchedulerHandle {
         if let Some(running) = self.shared.lock().tasks.get(instance_id) {
             running.notify.notify_one();
         }
+    }
+
+    /// The installed widgets, by manifest id.
+    pub fn widgets(&self) -> HashMap<String, WidgetEntry> {
+        self.shared
+            .lock()
+            .widgets
+            .iter()
+            .map(|(id, w)| {
+                let entry = WidgetEntry {
+                    manifest: w.manifest.clone(),
+                    dir: w.dir.as_ref().clone(),
+                    approved: w.approved.clone(),
+                    blocked: w.blocked.clone(),
+                };
+                (id.clone(), entry)
+            })
+            .collect()
     }
 
     /// A copy of the current instance data.
