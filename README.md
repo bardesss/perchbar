@@ -81,13 +81,17 @@ The builds are not code-signed yet, so Windows SmartScreen may say "Windows prot
 
 ## Build from source
 
-You need Windows 11 and [Rust](https://rustup.rs).
+You need Windows 11, [Rust](https://rustup.rs) and [Node.js](https://nodejs.org) 22 or newer.
 
 ```bash
 git clone https://github.com/bardesss/perchbar.git
 cd perchbar
+npm --prefix ui ci
+npm --prefix ui run build
 cargo run -p perchbar --release
 ```
+
+The settings window is built from `ui/` into `ui/dist`, which the Rust build embeds. Run the two npm commands again after changing anything in `ui/`.
 
 On first start you get a Bitcoin price and a world clock. Settings live in `%APPDATA%\Perchbar\instances.json` until the settings window arrives.
 

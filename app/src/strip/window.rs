@@ -84,13 +84,10 @@ const T_FALLBACK: usize = 1;
 const T_DEBOUNCE: usize = 2;
 const T_ROTATE: usize = 3;
 const T_TOOLTIP: usize = 4;
-const T_PRESS: usize = 5;
 const FALLBACK_MS: u32 = 5000;
 const DEBOUNCE_MS: u32 = 250;
 /// Hover delay before the tooltip shows.
 const TOOLTIP_MS: u32 = 400;
-/// How long a clicked slot stays dimmed.
-const PRESS_MS: u32 = 200;
 /// Tooltip lines wrap at this width (DIPs); it also enables `\n` breaks.
 const TOOLTIP_MAX_WIDTH_DIP: f32 = 320.0;
 /// Space between the strip and its tooltip (DIPs).
@@ -99,11 +96,13 @@ const TOOLTIP_GAP_DIP: f32 = 4.0;
 const WHEEL_DELTA: i32 = 120;
 
 /// Menu command ids. Hidden-widget entries of the "+N" menu start at
-/// `ID_OVERFLOW_BASE`. `ID_QUIT` is also accepted as a `WM_COMMAND` posted
-/// to the control window.
+/// `ID_OVERFLOW_BASE`. `ID_QUIT` and `ID_OPEN_SETTINGS` are also accepted
+/// as a `WM_COMMAND` posted to the control window.
 const ID_REFRESH: u32 = 1;
 const ID_HIDE: u32 = 2;
 const ID_QUIT: u32 = 3;
+const ID_WIDGET_SETTINGS: u32 = 4;
+const ID_OPEN_SETTINGS: u32 = 5;
 const ID_OVERFLOW_BASE: u32 = 100;
 /// A WM_TIMER can fire a little early; this keeps such a tick from missing
 /// a rotation that is due.
@@ -162,11 +161,12 @@ struct State {
     names: HashMap<PathBuf, String>,
     /// Ends the whole app; taken when "Quit Perchbar" runs.
     on_quit: Option<Box<dyn FnOnce() + Send>>,
+    /// Opens the settings window, focused on an instance or not. Returns
+    /// at once.
+    on_open_settings: OpenSettings,
     quitting: bool,
     /// When each instance's output last changed, for stale tooltips.
     updated: HashMap<String, DateTime<Local>>,
-    /// The slot dimmed after a click, until `T_PRESS` fires.
-    pressed: Option<String>,
     /// Wheel movement not yet worth a whole step.
     wheel_acc: i32,
     left: ButtonLatch,
@@ -196,6 +196,9 @@ impl ButtonLatch {
     }
 }
 
+/// Opens the settings window (see [`crate::strip::spawn`]).
+pub(super) type OpenSettings = Box<dyn Fn(Option<String>) + Send + Sync>;
+
 /// One entry of a popup menu.
 #[derive(Debug, Clone, PartialEq)]
 enum MenuItem {
@@ -209,7 +212,8 @@ enum MenuItem {
 #[derive(Debug, Default)]
 struct MenuSpec {
     items: Vec<MenuItem>,
-    /// The instance "Refresh now" and "Hide this widget" act on.
+    /// The instance "Refresh now", "Widget settings" and "Hide this widget"
+    /// act on.
     target: Option<String>,
     /// Instance ids of the "+N" entries, by index from `ID_OVERFLOW_BASE`.
     overflow: Vec<String>,
@@ -249,6 +253,7 @@ pub(super) fn run(
     sched: SchedulerHandle,
     names: HashMap<PathBuf, String>,
     on_quit: Box<dyn FnOnce() + Send>,
+    on_open_settings: OpenSettings,
 ) {
     // Explorer's taskbar is per-monitor v2 aware; a child must match it.
     // SAFETY: thread-level setting with a constant argument.
@@ -257,7 +262,7 @@ pub(super) fn run(
     if previous.0.is_null() {
         log::warn!("cannot make the strip thread per-monitor DPI aware");
     }
-    match setup(rx, sched, names, on_quit) {
+    match setup(rx, sched, names, on_quit, on_open_settings) {
         Ok(()) => message_loop(),
         Err(e) => log::error!("cannot start the taskbar strip: {e}"),
     }
@@ -271,6 +276,7 @@ fn setup(
     sched: SchedulerHandle,
     names: HashMap<PathBuf, String>,
     on_quit: Box<dyn FnOnce() + Send>,
+    on_open_settings: OpenSettings,
 ) -> windows::core::Result<()> {
     // SAFETY: class registration and window creation with valid arguments.
     let ctl = unsafe {
@@ -348,9 +354,9 @@ fn setup(
             last_create_warn: None,
             names,
             on_quit: Some(on_quit),
+            on_open_settings,
             quitting: false,
             updated: HashMap::new(),
-            pressed: None,
             wheel_acc: 0,
             left: ButtonLatch::default(),
             right: ButtonLatch::default(),
@@ -582,7 +588,6 @@ impl State {
         self.key = None;
         self.pos = None;
         self.hover = None;
-        self.pressed = None;
         self.tracking_mouse = false;
         self.left.clear();
         self.right.clear();
@@ -644,7 +649,6 @@ impl State {
             groups,
             frames,
             hover: self.hover.clone(),
-            pressed: self.pressed.clone(),
             dark: self.dark,
             dpi: info.dpi,
             height: info.height(),
@@ -674,16 +678,7 @@ impl State {
                 &self.palette,
                 self.hover.as_deref(),
             ) {
-                Ok(mut bmp) => {
-                    if let Some(p) = lay
-                        .items
-                        .iter()
-                        .find(|p| Some(&p.slot_id) == self.pressed.as_ref())
-                    {
-                        let x0 = layout::px(p.x_dip, scale);
-                        let x1 = layout::px(p.x_dip + p.width_dip, scale);
-                        dim_columns(&mut bmp.pixels, bmp.width, x0, x1);
-                    }
+                Ok(bmp) => {
                     self.width_px = bmp.width;
                     self.layout = lay;
                     self.key = Some(key);
@@ -775,33 +770,21 @@ impl State {
         }
     }
 
-    /// Left click: a group steps to its next member; any other slot
-    /// refreshes now (R5: a widget's `click` action waits for Plan 2) and
-    /// dims briefly; "+N" returns the hidden-widget menu to show.
+    /// Left click: a group steps to its next member, a single slot opens
+    /// its settings, "+N" returns the hidden-widget menu to show.
     fn on_left_click(&mut self, x_px: i32) -> Option<MenuSpec> {
         let hit = self.hit(x_px);
         log::debug!("left click on {hit:?}");
-        match hit? {
-            Hit::Slot(id) if is_multi_member_group(&self.model, &id) => {
+        match left_click_action(&self.model, &self.rot, hit?, &self.on_open_settings) {
+            LeftClick::Done => None,
+            LeftClick::Advance(id) => {
                 if self.rot.advance(&id, 1, &self.model) {
                     self.refresh();
                     self.sync_tooltip();
                 }
                 None
             }
-            Hit::Slot(id) => {
-                if let Some(inst) = shown_instance(&self.model, &self.rot, &id) {
-                    if let Some(s) = &self.sched {
-                        s.refresh_now(&inst);
-                    }
-                }
-                self.pressed = Some(id);
-                // SAFETY: timer on our own window.
-                unsafe { SetTimer(Some(self.ctl), T_PRESS, PRESS_MS, None) };
-                self.refresh();
-                None
-            }
-            Hit::Overflow => {
+            LeftClick::Overflow => {
                 let entries = overflow_entries(&self.layout, &self.model, &self.names);
                 if entries.is_empty() {
                     return None;
@@ -818,23 +801,14 @@ impl State {
         }
     }
 
-    /// Right click: slot commands over a slot, otherwise only Quit.
+    /// Right click: slot commands over a slot, then the app commands.
     fn context_menu(&mut self, x_px: i32) -> MenuSpec {
         self.hide_tooltip();
-        let mut spec = MenuSpec::default();
-        if let Some(Hit::Slot(id)) = self.hit(x_px) {
-            spec.target = shown_instance(&self.model, &self.rot, &id);
-        }
-        if spec.target.is_some() {
-            spec.items.extend([
-                MenuItem::Command(ID_REFRESH, "Refresh now".into()),
-                MenuItem::Command(ID_HIDE, "Hide this widget".into()),
-                MenuItem::Separator,
-            ]);
-        }
-        spec.items
-            .push(MenuItem::Command(ID_QUIT, "Quit Perchbar".into()));
-        spec
+        let target = match self.hit(x_px) {
+            Some(Hit::Slot(id)) => shown_instance(&self.model, &self.rot, &id),
+            _ => None,
+        };
+        context_menu_spec(target)
     }
 
     /// Carries out a command picked from `spec`.
@@ -853,6 +827,12 @@ impl State {
                     s.set_hidden(t, true);
                 }
             }
+            ID_WIDGET_SETTINGS => {
+                if let Some(t) = target {
+                    (self.on_open_settings)(Some(t.to_string()));
+                }
+            }
+            ID_OPEN_SETTINGS => (self.on_open_settings)(None),
             ID_QUIT => self.quit_app(),
             n if n >= ID_OVERFLOW_BASE => {
                 let picked = spec.overflow.get((n - ID_OVERFLOW_BASE) as usize);
@@ -873,14 +853,6 @@ impl State {
         if steps != 0 && self.rot.advance(&id, steps, &self.model) {
             self.refresh();
             self.sync_tooltip();
-        }
-    }
-
-    fn end_press(&mut self) {
-        // SAFETY: our own timer.
-        let _ = unsafe { KillTimer(Some(self.ctl), T_PRESS) };
-        if self.pressed.take().is_some() {
-            self.refresh();
         }
     }
 
@@ -1048,7 +1020,7 @@ impl State {
         self.hide_tooltip();
         // SAFETY: our own timers, hooks and windows.
         unsafe {
-            for t in [T_FALLBACK, T_DEBOUNCE, T_ROTATE, T_TOOLTIP, T_PRESS] {
+            for t in [T_FALLBACK, T_DEBOUNCE, T_ROTATE, T_TOOLTIP] {
                 let _ = KillTimer(Some(self.ctl), t);
             }
         }
@@ -1339,6 +1311,58 @@ fn overflow_entries(
     out
 }
 
+/// What is left to do after [`left_click_action`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LeftClick {
+    /// Nothing more on the strip.
+    Done,
+    /// Step this group to its next member.
+    Advance(String),
+    /// Show the "+N" menu.
+    Overflow,
+}
+
+/// A left click on `hit`: a group with several members advances, any other
+/// slot opens settings on the instance it shows, "+N" shows its menu.
+fn left_click_action(
+    model: &StripModel,
+    rot: &RotationState,
+    hit: Hit,
+    open_settings: &dyn Fn(Option<String>),
+) -> LeftClick {
+    match hit {
+        Hit::Slot(id) if is_multi_member_group(model, &id) => LeftClick::Advance(id),
+        Hit::Slot(id) => {
+            if let Some(inst) = shown_instance(model, rot, &id) {
+                open_settings(Some(inst));
+            }
+            LeftClick::Done
+        }
+        Hit::Overflow => LeftClick::Overflow,
+    }
+}
+
+/// The right-click menu: the widget's commands when the click was on one
+/// (`target`), then the app's.
+fn context_menu_spec(target: Option<String>) -> MenuSpec {
+    let mut spec = MenuSpec::default();
+    if target.is_some() {
+        spec.items.extend([
+            MenuItem::Command(ID_REFRESH, "Refresh now".into()),
+            MenuItem::Command(ID_WIDGET_SETTINGS, "Widget settings".into()),
+            MenuItem::Command(ID_HIDE, "Hide this widget".into()),
+            MenuItem::Separator,
+        ]);
+    }
+    spec.items.extend([
+        MenuItem::Command(ID_OPEN_SETTINGS, "Open Perchbar settings".into()),
+        MenuItem::Separator,
+        MenuItem::Command(ID_QUIT, "Quit Perchbar".into()),
+    ]);
+    spec.target = target;
+    spec
+}
+
 /// Menu text with `&` doubled, so it is not read as a mnemonic marker.
 fn menu_label(s: &str) -> String {
     s.replace('&', "&&")
@@ -1371,23 +1395,6 @@ fn wheel_steps(acc: &mut i32, delta: i16) -> i32 {
     let notches = *acc / WHEEL_DELTA;
     *acc -= notches * WHEEL_DELTA;
     -notches
-}
-
-/// Halves premultiplied BGRA pixels in columns `x0..x1` of a bitmap
-/// `width` pixels wide, which halves the opacity of that slot.
-fn dim_columns(pixels: &mut [u8], width: i32, x0: i32, x1: i32) {
-    if width <= 0 {
-        return;
-    }
-    let (x0, x1) = (x0.clamp(0, width) as usize, x1.clamp(0, width) as usize);
-    if x0 >= x1 {
-        return;
-    }
-    for row in pixels.chunks_exact_mut(width as usize * 4) {
-        for b in &mut row[x0 * 4..x1 * 4] {
-            *b /= 2;
-        }
-    }
 }
 
 fn post_to_ctl(msg: u32) {
@@ -1518,15 +1525,18 @@ unsafe extern "system" fn ctl_proc(
                     let _ = unsafe { KillTimer(Some(hwnd), T_TOOLTIP) };
                     with_state(State::show_tooltip);
                 }
-                T_PRESS => {
-                    with_state(State::end_press);
-                }
                 _ => {}
             }
             LRESULT(0)
         }
         WM_COMMAND if (wparam.0 & 0xFFFF) as u32 == ID_QUIT => {
             if with_state(State::quit_app).is_none() {
+                post_to_ctl_with(WM_COMMAND, wparam);
+            }
+            LRESULT(0)
+        }
+        WM_COMMAND if (wparam.0 & 0xFFFF) as u32 == ID_OPEN_SETTINGS => {
+            if with_state(|s| (s.on_open_settings)(None)).is_none() {
                 post_to_ctl_with(WM_COMMAND, wparam);
             }
             LRESULT(0)
@@ -1985,21 +1995,69 @@ mod tests {
         assert_eq!(tooltip_pos(-450, strip, 100, 30, 6, work), (-500, 1004));
     }
 
+    fn labels(spec: &MenuSpec) -> Vec<&str> {
+        spec.items
+            .iter()
+            .map(|i| match i {
+                MenuItem::Command(_, label) => label.as_str(),
+                MenuItem::Separator => "-",
+            })
+            .collect()
+    }
+
     #[test]
-    fn dimming_halves_only_the_given_columns() {
-        // 3 x 2 premultiplied BGRA, all 200.
-        let mut px = vec![200u8; 3 * 2 * 4];
-        dim_columns(&mut px, 3, 1, 2);
-        for row in 0..2 {
-            for col in 0..3 {
-                let i = (row * 3 + col) * 4;
-                let want = if col == 1 { 100 } else { 200 };
-                assert_eq!(&px[i..i + 4], &[want; 4], "row {row} col {col}");
-            }
-        }
-        // Out-of-range columns are clamped.
-        dim_columns(&mut px, 3, -5, 99);
-        assert_eq!(px[0], 100);
+    fn menu_for_single_slot() {
+        let spec = context_menu_spec(Some("a".into()));
+        assert_eq!(
+            labels(&spec),
+            [
+                "Refresh now",
+                "Widget settings",
+                "Hide this widget",
+                "-",
+                "Open Perchbar settings",
+                "-",
+                "Quit Perchbar"
+            ]
+        );
+        assert_eq!(spec.target.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn menu_for_empty_area() {
+        let spec = context_menu_spec(None);
+        assert_eq!(
+            labels(&spec),
+            ["Open Perchbar settings", "-", "Quit Perchbar"]
+        );
+        assert_eq!(spec.target, None);
+    }
+
+    #[test]
+    fn left_click_single_opens_settings() {
+        let m = model(vec![
+            single("a", "w", SlotState::Loading),
+            group(
+                "g",
+                vec![("x", SlotState::Loading), ("y", SlotState::Loading)],
+            ),
+        ]);
+        let rot = RotationState::default();
+        let opened = RefCell::new(Vec::new());
+        let open = |id: Option<String>| opened.borrow_mut().push(id);
+
+        let action = left_click_action(&m, &rot, Hit::Slot("a".into()), &open);
+        assert_eq!(action, LeftClick::Done, "no refresh, no dim");
+        assert_eq!(*opened.borrow(), [Some("a".to_string())]);
+
+        // A group still steps to its next member.
+        let action = left_click_action(&m, &rot, Hit::Slot("g".into()), &open);
+        assert_eq!(action, LeftClick::Advance("g".into()));
+        assert_eq!(
+            left_click_action(&m, &rot, Hit::Overflow, &open),
+            LeftClick::Overflow
+        );
+        assert_eq!(opened.borrow().len(), 1);
     }
 
     const TASKBAR_HWND: isize = 100;

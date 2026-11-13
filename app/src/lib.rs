@@ -11,5 +11,6 @@ pub mod prefs;
 pub mod sandbox;
 pub mod scheduler;
 pub mod secrets;
+pub mod settings_window;
 pub mod setup;
 pub mod strip;

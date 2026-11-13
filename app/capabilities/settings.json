@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "settings",
+  "description": "What the settings window may do. Each Perchbar command needs its allow- permission here and an entry in build.rs.",
+  "windows": ["settings"],
+  "permissions": [
+    "core:event:default",
+    "core:window:allow-close",
+    "core:window:allow-minimize",
+    "allow-get-version"
+  ]
+}

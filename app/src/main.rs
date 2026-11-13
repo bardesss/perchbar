@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use perchbar::sandbox::ReqwestClient;
 use perchbar::scheduler::{Scheduler, WidgetEntry};
 use perchbar::secrets::{self, SecretStore};
+use perchbar::settings_window::{self, ExitDecision, StateBridge};
 use perchbar::strip::{self, StripEvent};
 use perchbar::{instances, logger, paths, setup};
 
@@ -133,6 +134,7 @@ fn main() {
 
     let (tx, rx) = mpsc::channel();
     let publish_tx = tx.clone();
+    let (bridge, bridge_rx) = StateBridge::new();
     // The scheduler spawns onto the runtime it starts in, and its runner needs
     // a multi-thread runtime; Tauri's global runtime is one.
     let sched = tauri::async_runtime::block_on(async move {
@@ -145,20 +147,40 @@ fn main() {
                 // Runs on scheduler threads under the publish lock: never block.
                 let _ = publish_tx.send(StripEvent::Model(model));
                 strip::wake();
+                bridge.notify();
             },
         )
     });
     let app = tauri::Builder::default()
+        .invoke_handler(settings_window::invoke_handler())
         .build(tauri::generate_context!())
         .expect("failed to build Perchbar");
-    let handle = app.handle().clone();
+    settings_window::spawn_state_bridge(app.handle(), bridge_rx);
+    let quit_handle = app.handle().clone();
+    let open_handle = app.handle().clone();
     // "Quit Perchbar" in the strip's menu: an explicit exit code, which the
     // ExitRequested handler below lets through.
-    let mut strip_thread = Some(strip::spawn(rx, sched, names, move || handle.exit(0)));
+    let mut strip_thread = Some(strip::spawn(
+        rx,
+        sched,
+        names,
+        move || quit_handle.exit(0),
+        // Queued for the main thread; the strip never waits.
+        move |focus| {
+            let app = open_handle.clone();
+            let queued = open_handle.run_on_main_thread(move || settings_window::open(&app, focus));
+            if let Err(e) = queued {
+                log::warn!("cannot open the settings window: {e}");
+            }
+        },
+    ));
 
     app.run(move |_app, event| match event {
-        // Perchbar has no windows; only an explicit exit (code Some) quits.
-        tauri::RunEvent::ExitRequested { api, code, .. } if code.is_none() => {
+        // Closing the settings window must not end Perchbar; only an
+        // explicit exit (code Some) quits.
+        tauri::RunEvent::ExitRequested { api, code, .. }
+            if settings_window::exit_decision(code) == ExitDecision::Prevent =>
+        {
             api.prevent_exit();
         }
         tauri::RunEvent::Exit => {
