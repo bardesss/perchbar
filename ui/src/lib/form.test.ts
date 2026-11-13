@@ -2,8 +2,10 @@ import { describe, expect, test } from "vitest";
 import type { SettingField, StatusView } from "../api";
 import {
   checkField,
+  checkInterval,
   errorsByKey,
   instanceLabels,
+  moveItem,
   parseMaxWidth,
   saveErrorMessage,
   settingsPayload,
@@ -233,4 +235,34 @@ describe("row text", () => {
     expect(statusLine(inst("a", "w", { state: "loading" }))).toBe("Loading");
     expect(statusLine(inst("a", "w", { state: "ok" }))).toBe("");
   });
+});
+
+test("moveItem moves down and up", () => {
+  expect(moveItem(["a", "b", "c"], 0, 2)).toEqual(["b", "c", "a"]);
+  expect(moveItem(["a", "b", "c"], 2, 0)).toEqual(["c", "a", "b"]);
+});
+
+test("moveItem leaves the list alone and returns a copy", () => {
+  const list = ["a", "b", "c"];
+  expect(moveItem(list, 1, 1)).toEqual(["a", "b", "c"]);
+  expect(moveItem(list, -1, 1)).toEqual(["a", "b", "c"]);
+  expect(moveItem(list, 0, 3)).toEqual(["a", "b", "c"]);
+  expect(moveItem(list, 0, 1)).not.toBe(list);
+  expect(list).toEqual(["a", "b", "c"]);
+});
+
+test("interval bounds", () => {
+  expect(checkInterval(2)).not.toBeNull();
+  expect(checkInterval(3)).toBeNull();
+  expect(checkInterval(3601)).not.toBeNull();
+});
+
+test("interval as typed: whole seconds only", () => {
+  expect(checkInterval("8")).toBeNull();
+  expect(checkInterval(" 3600 ")).toBeNull();
+  expect(checkInterval("")).not.toBeNull();
+  expect(checkInterval("4.5")).not.toBeNull();
+  expect(checkInterval(4.5)).not.toBeNull();
+  expect(checkInterval("1e3")).not.toBeNull();
+  expect(checkInterval(null)).not.toBeNull();
 });

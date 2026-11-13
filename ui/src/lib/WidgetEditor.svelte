@@ -27,6 +27,7 @@
   import LogView from "./LogView.svelte";
   import SecretField from "./SecretField.svelte";
   import SettingField from "./SettingField.svelte";
+  import { createSaver, type Slot } from "./saving";
 
   interface Props {
     instance: InstanceView;
@@ -57,16 +58,6 @@
   let notice: string | null = $state(null);
   let confirmRemove = $state(false);
   let busy = $state(false);
-  const savedTimers = new Map<string, ReturnType<typeof setTimeout>>();
-
-  /** One input's draft and messages, for the shared save routine. */
-  interface Slot {
-    /** The current draft, or undefined when there is none. */
-    draft(): unknown;
-    clearDraft(): void;
-    setError(message: string | null): void;
-    setSaved(on: boolean): void;
-  }
 
   function settingSlot(key: string): Slot {
     return {
@@ -84,40 +75,8 @@
     setSaved: (on) => (width.saved = on),
   };
 
-  function flashSaved(name: string, slot: Slot) {
-    slot.setSaved(true);
-    clearTimeout(savedTimers.get(name));
-    savedTimers.set(
-      name,
-      setTimeout(() => slot.setSaved(false), 2000),
-    );
-  }
-
-  /** Saves run one at a time, so each sends the state the last one left. */
-  let queue: Promise<void> = Promise.resolve();
-
-  /**
-   * Saves one input: waits its turn, skips a draft edited again meanwhile
-   * (that edit saves on its own commit), sends, and waits for the refetched
-   * state before dropping the draft. `send` reads the instance only when it
-   * runs, so it builds on everything saved before it.
-   */
-  function save(name: string, slot: Slot, value: unknown, send: () => Promise<void>, failed: (e: CommandError) => void) {
-    const job = async () => {
-      if (slot.draft() !== value) return;
-      try {
-        await send();
-        slot.setError(null);
-        // Resolves once state at least this new is in (latestRefresher).
-        await onchanged();
-        if (slot.draft() === value) slot.clearDraft();
-        flashSaved(name, slot);
-      } catch (e) {
-        failed(e as CommandError);
-      }
-    };
-    queue = queue.then(job, job);
-  }
+  // Saves run one at a time, so each sends the state the last one left.
+  const { save } = createSaver(() => onchanged());
 
   function shown(key: string, fallback: FormValue): FormValue {
     return key in drafts ? drafts[key] : fallback;

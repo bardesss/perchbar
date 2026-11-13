@@ -20,6 +20,8 @@ export const MAX_WIDTH_MAX = 600;
 /** Allowed group rotation interval, in seconds. */
 export const GROUP_INTERVAL_MIN = 3;
 export const GROUP_INTERVAL_MAX = 3600;
+/** Rotation interval of a new group, in seconds. */
+export const NEW_GROUP_INTERVAL = 8;
 
 /**
  * What an input holds: a string for text-like kinds and numbers (as typed),
@@ -253,4 +255,24 @@ export function statusLine(inst: Pick<InstanceView, "hidden" | "status">): strin
   if ((state === "error" || state === "blocked") && message) return message;
   if (text) return text;
   return state === "loading" ? "Loading" : "";
+}
+
+/**
+ * `list` with the item at `from` moved to `to`, as a new array. Indexes
+ * outside the list leave it as it is.
+ */
+export function moveItem<T>(list: T[], from: number, to: number): T[] {
+  const next = list.slice();
+  if (from < 0 || from >= list.length || to < 0 || to >= list.length) return next;
+  const [item] = next.splice(from, 1);
+  next.splice(to, 0, item);
+  return next;
+}
+
+/** Why a rotation interval (whole seconds, a number or as typed) would be
+ * refused, or null when it is fine (validate.rs group_interval). */
+export function checkInterval(v: unknown): string | null {
+  const n = typeof v === "string" && /^\s*\d+\s*$/.test(v) ? Number(v) : v;
+  const ok = typeof n === "number" && Number.isInteger(n) && n >= GROUP_INTERVAL_MIN && n <= GROUP_INTERVAL_MAX;
+  return ok ? null : `Rotation interval is ${GROUP_INTERVAL_MIN} to ${GROUP_INTERVAL_MAX} seconds`;
 }

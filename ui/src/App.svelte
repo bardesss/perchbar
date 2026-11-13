@@ -3,6 +3,7 @@
   import { getState, onFocus, onStateChanged, sendReady, type CommandError, type StateView } from "./api";
   import AddWidgetDialog from "./lib/AddWidgetDialog.svelte";
   import AppSettings from "./lib/AppSettings.svelte";
+  import GroupEditor from "./lib/GroupEditor.svelte";
   import { instanceLabels } from "./lib/form";
   import { latestRefresher } from "./lib/latest";
   import WidgetEditor from "./lib/WidgetEditor.svelte";
@@ -11,6 +12,7 @@
   let view: StateView | null = $state(null);
   let loadError: string | null = $state(null);
   let notice: string | null = $state(null);
+  /** The instance or group shown in the main pane. */
   let selectedId: string | null = $state(null);
   /** Goes up on every state change; open logs refetch on it. */
   let changes = $state(0);
@@ -28,6 +30,7 @@
   const labels = $derived(view ? instanceLabels(view.instances, view.widgets) : {});
   const selected = $derived(view?.instances.find((i) => i.id === selectedId));
   const selectedWidget = $derived(view?.widgets.find((w) => w.id === selected?.widget));
+  const selectedGroup = $derived(view?.groups.find((g) => g.id === selectedId));
 
   /** A focus request for an instance the state does not have yet. */
   let wantedId: string | null = null;
@@ -49,10 +52,11 @@
   function reconcileSelection() {
     if (!view) return;
     const has = (id: string | null) => id !== null && view!.instances.some((i) => i.id === id);
+    const isGroup = (id: string | null) => id !== null && view!.groups.some((g) => g.id === id);
     if (wantedId && has(wantedId)) {
       selectedId = wantedId;
       wantedId = null;
-    } else if (!has(selectedId)) {
+    } else if (!has(selectedId) && !isGroup(selectedId)) {
       selectedId = stripInstances[0] ?? null;
     }
   }
@@ -130,6 +134,15 @@
       <p class="field-error" role="alert">{loadError}</p>
     {:else if !view}
       <p class="muted">Loading</p>
+    {:else if selectedGroup}
+      {#key selectedGroup.id}
+        <GroupEditor
+          group={selectedGroup}
+          {labels}
+          onselect={select}
+          onchanged={refresh}
+        />
+      {/key}
     {:else if selected}
       {#key selected.id}
         <WidgetEditor
