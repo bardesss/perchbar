@@ -130,7 +130,7 @@ fn clip(redactor: &Redactor, msg: impl Into<String>) -> String {
 /// Runs `widget.js` once in a fresh runtime and returns its parsed output.
 /// Storage changes are saved even when the run fails or times out.
 pub async fn run(ctx: RunContext) -> Result<Output, RunError> {
-    let source = std::fs::read_to_string(ctx.widget_dir.join("widget.js")).map_err(|e| {
+    let source = crate::manifest::read_script(&ctx.widget_dir).map_err(|e| {
         RunError::Script(clip(&ctx.redactor, format!("cannot read widget.js: {e}")))
     })?;
     let storage = Arc::new(Mutex::new(host::Storage::load(ctx.storage_path.clone())));
@@ -460,6 +460,35 @@ mod tests {
         );
         let out = f.run().await.unwrap();
         assert_eq!(text(&out), "hi");
+    }
+
+    #[tokio::test]
+    async fn oversized_or_linked_script_is_a_run_error() {
+        let big = format!(
+            "{}\n{}",
+            " ".repeat(crate::manifest::SCRIPT_MAX_BYTES as usize),
+            returning("1")
+        );
+        let f = Fixture::new(&big);
+        match f.run().await {
+            Err(RunError::Script(m)) => assert!(m.contains("larger"), "{m}"),
+            other => panic!("expected a script error, got {other:?}"),
+        }
+
+        // A link to a script elsewhere is refused. Creating links needs a
+        // privilege on Windows; without it only the size case is checked.
+        let f = Fixture::new(&returning("1"));
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("real.js");
+        std::fs::write(&target, returning("\"outside\"")).unwrap();
+        let link = f.dir.path().join("widget.js");
+        std::fs::remove_file(&link).unwrap();
+        if std::os::windows::fs::symlink_file(&target, &link).is_ok() {
+            match f.run().await {
+                Err(RunError::Script(m)) => assert!(m.contains("link"), "{m}"),
+                other => panic!("expected a script error, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]

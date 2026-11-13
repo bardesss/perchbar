@@ -104,15 +104,7 @@ fn default_refresh() -> u32 {
 /// Both must be plain files (links are refused, so nothing outside the
 /// folder is read) within the size limits. Nothing is run.
 pub fn load(dir: &Path) -> Result<Manifest, ManifestError> {
-    let json = dir.join("widget.json");
-    plain_file(&json, "widget.json", MANIFEST_MAX_BYTES)?;
-    let mut bytes = Vec::new();
-    std::fs::File::open(&json)?
-        .take(MANIFEST_MAX_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MANIFEST_MAX_BYTES {
-        return Err(ManifestError::TooLarge("widget.json", MANIFEST_MAX_BYTES));
-    }
+    let bytes = read_bounded(&dir.join("widget.json"), "widget.json", MANIFEST_MAX_BYTES)?;
     let text = String::from_utf8(bytes)
         .map_err(|_| ManifestError::Json("widget.json is not UTF-8 text".into()))?;
     // Some Windows editors save UTF-8 with a byte order mark.
@@ -129,10 +121,46 @@ pub fn load(dir: &Path) -> Result<Manifest, ManifestError> {
     Ok(manifest)
 }
 
-/// Checks that `path` is a regular file (not a link) of at most `max` bytes.
+/// Reads `dir/widget.js` for a run, with the same checks as `load`: a
+/// plain file (no link) of at most `SCRIPT_MAX_BYTES`.
+pub fn read_script(dir: &Path) -> Result<String, ManifestError> {
+    let bytes = read_bounded(&dir.join("widget.js"), "widget.js", SCRIPT_MAX_BYTES)?;
+    String::from_utf8(bytes)
+        .map_err(|_| ManifestError::Invalid("widget.js is not UTF-8 text".into()))
+}
+
+/// Reads a plain file of at most `max` bytes. The read itself is bounded
+/// too, so a file that grows after the check is still refused.
+fn read_bounded(path: &Path, name: &'static str, max: u64) -> Result<Vec<u8>, ManifestError> {
+    plain_file(path, name, max)?;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(max + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Err(ManifestError::TooLarge(name, max));
+    }
+    Ok(bytes)
+}
+
+/// Windows reparse points (symlinks, junctions and the like).
+#[cfg(windows)]
+fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_meta: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// Checks that `path` is a regular file (not a link or other reparse
+/// point) of at most `max` bytes.
 fn plain_file(path: &Path, name: &'static str, max: u64) -> Result<(), ManifestError> {
     let meta = std::fs::symlink_metadata(path)?;
-    if !meta.is_file() || meta.file_type().is_symlink() {
+    if !meta.is_file() || meta.file_type().is_symlink() || is_reparse_point(&meta) {
         return Err(ManifestError::NotAFile(name));
     }
     if meta.len() > max {
