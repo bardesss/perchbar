@@ -14,6 +14,7 @@ use serde_json::{json, Map, Value};
 
 use super::{permissions, HttpClient, HttpFuture, HttpRequest, HttpResponse};
 use crate::logbook::{LogBook, LogLevel};
+use crate::secrets::Redactor;
 
 /// Maximum serialized size of one instance's storage object.
 pub const STORAGE_MAX_BYTES: usize = 64 * 1024;
@@ -169,6 +170,15 @@ fn truncate_to_boundary(msg: &str, max: usize) -> String {
     msg[..end].to_string()
 }
 
+/// The log book level for a `__host_log` level name from the prelude.
+fn log_level(name: &str) -> LogLevel {
+    match name {
+        "warn" => LogLevel::Warn,
+        "error" => LogLevel::Error,
+        _ => LogLevel::Info,
+    }
+}
+
 /// One instance's persisted key/value store (a single JSON object on disk).
 #[derive(Debug)]
 pub struct Storage {
@@ -273,6 +283,7 @@ pub fn install<'js>(
     storage: Arc<Mutex<Storage>>,
     instance_id: String,
     logbook: LogBook,
+    redactor: Arc<Redactor>,
 ) -> rquickjs::Result<()> {
     let globals = ctx.globals();
 
@@ -298,10 +309,19 @@ pub fn install<'js>(
     globals.set("__host_storage_set", set)?;
 
     let limiter = Mutex::new(LogLimiter::default());
-    let log = Function::new(ctx.clone(), move |msg: String| {
-        if let Some(line) = limiter.lock().unwrap().admit(&msg) {
-            log::info!(target: super::WIDGET_LOG_TARGET, "[{instance_id}] {line}");
-            logbook.push(&instance_id, LogLevel::Info, line);
+    let log = Function::new(ctx.clone(), move |msg: String, level: String| {
+        // Redact before cutting, so a cut cannot leave half a secret, and
+        // again after, in case blanking control characters formed one.
+        let admitted = limiter.lock().unwrap().admit(&redactor.apply(&msg));
+        if let Some(line) = admitted.map(|l| redactor.apply(&l)) {
+            let level = log_level(&level);
+            let file_level = match level {
+                LogLevel::Info => log::Level::Info,
+                LogLevel::Warn => log::Level::Warn,
+                LogLevel::Error => log::Level::Error,
+            };
+            log::log!(target: super::WIDGET_LOG_TARGET, file_level, "[{instance_id}] {line}");
+            logbook.push(&instance_id, level, line);
         }
     })?;
     globals.set("__host_log", log)?;

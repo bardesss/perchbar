@@ -95,6 +95,7 @@ impl Installed {
             limits: Limits::default(),
             permissions: self.manifest(id).permissions,
             logbook: LogBook::default(),
+            redactor: Default::default(),
         })
         .await
     }

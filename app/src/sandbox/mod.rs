@@ -22,6 +22,7 @@ use serde_json::{Map, Value};
 use crate::display::Output;
 use crate::logbook::LogBook;
 use crate::manifest::{Manifest, Permissions};
+use crate::secrets::Redactor;
 
 /// Wall-time and JS heap limits for one run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +80,8 @@ pub struct RunContext {
     pub permissions: Permissions,
     /// Widget log lines are also kept here, under `instance_id`.
     pub logbook: LogBook,
+    /// Replaces the instance's secret values in widget log lines.
+    pub redactor: Arc<Redactor>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -179,12 +182,13 @@ async fn execute(
     let http = ctx.http.clone();
     let allowed = ctx.permissions.network.clone();
     let logbook = ctx.logbook.clone();
+    let redactor = ctx.redactor.clone();
     let seen = violation.clone();
     let settings = Value::Object(ctx.settings.clone()).to_string();
     js.async_with(async move |ctx| {
         let result: rquickjs::Result<Option<String>> = async {
-            host::install(&ctx, storage, instance_id, logbook)?;
-            install_fetch(&ctx, http, allowed, seen)?;
+            install_fetch(&ctx, http, allowed, seen, redactor.clone())?;
+            host::install(&ctx, storage, instance_id, logbook, redactor)?;
             let invoke: Function = ctx.eval(PRELUDE)?;
             let (module, loaded) = Module::declare(ctx.clone(), "widget.js", source)?.eval()?;
             loaded.into_future::<()>().await?;
@@ -235,6 +239,7 @@ fn install_fetch<'js>(
     http: Arc<dyn HttpClient>,
     allowed: Vec<String>,
     violation: Violation,
+    redactor: Arc<Redactor>,
 ) -> rquickjs::Result<()> {
     // Per run (each run installs fetch into a fresh context): a cap on
     // requests in flight and on the total response bytes.
@@ -246,6 +251,7 @@ fn install_fetch<'js>(
             let http = http.clone();
             let allowed = allowed.clone();
             let violation = violation.clone();
+            let redactor = redactor.clone();
             let in_flight = in_flight.clone();
             let received = received.clone();
             async move {
@@ -267,7 +273,7 @@ fn install_fetch<'js>(
                 let resp = match send(http.as_ref(), req, &allowed).await {
                     Ok(resp) => resp,
                     Err(SendError::Denied(msg)) => {
-                        log::warn!("blocked widget request: {msg}");
+                        log::warn!("blocked widget request: {}", redactor.apply(&msg));
                         *violation.lock().unwrap() = Some(msg.clone());
                         return Err(Exception::throw_type(&ctx, &msg));
                     }
@@ -346,6 +352,7 @@ mod tests {
         approved: Option<Vec<String>>,
         logbook: LogBook,
         http: Option<Arc<dyn HttpClient>>,
+        redactor: Arc<Redactor>,
     }
 
     /// An HTTP client whose requests never complete.
@@ -370,6 +377,7 @@ mod tests {
                 approved: None,
                 logbook: LogBook::default(),
                 http: None,
+                redactor: Arc::default(),
             }
         }
 
@@ -402,6 +410,7 @@ mod tests {
                     ..Permissions::default()
                 },
                 logbook: self.logbook.clone(),
+                redactor: self.redactor.clone(),
             }
         }
 
@@ -671,6 +680,50 @@ mod tests {
             })
             .collect();
         assert_eq!(lines, vec!["a 1 {\"b\":2}", "c"]);
+    }
+
+    #[tokio::test]
+    async fn console_levels_reach_the_logbook() {
+        use crate::logbook::LogLevel;
+        let f = Fixture::new(&returning(
+            "(() => { console.info(\"i\"); console.warn(\"w\"); console.error(\"e\"); return 1; })()",
+        ));
+        f.run().await.unwrap();
+        let got: Vec<(LogLevel, String)> = f
+            .logbook
+            .lines("inst-1")
+            .into_iter()
+            .map(|l| (l.level, l.text))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (LogLevel::Info, "i".to_string()),
+                (LogLevel::Warn, "w".to_string()),
+                (LogLevel::Error, "e".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn widget_log_lines_are_redacted() {
+        let mut f = Fixture::new(&returning(
+            "(() => { log(\"key=\" + settings.apiKey + \"\\n\" + \"x\".repeat(1009) + settings.apiKey); return 1; })()",
+        ));
+        f.settings.insert("apiKey".into(), json!("sk-12345"));
+        f.redactor = Arc::new(Redactor::new(["sk-12345".to_string()]));
+        f.run().await.unwrap();
+        let lines = f.logbook.lines("inst-1");
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].text.starts_with("key=[secret] "),
+            "{}",
+            lines[0].text
+        );
+        // The second copy straddles the 1,024-byte cut: redacted first, so
+        // no fragment of the secret survives the cut.
+        assert_eq!(lines[0].text.len(), 1024);
+        assert!(lines[0].text.ends_with("x[s"), "{}", lines[0].text);
     }
 
     #[tokio::test]

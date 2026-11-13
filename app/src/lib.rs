@@ -9,5 +9,6 @@ pub mod manifest;
 pub mod paths;
 pub mod sandbox;
 pub mod scheduler;
+pub mod secrets;
 pub mod setup;
 pub mod strip;

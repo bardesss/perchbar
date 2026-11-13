@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use perchbar::sandbox::ReqwestClient;
 use perchbar::scheduler::{Scheduler, WidgetEntry};
+use perchbar::secrets::{self, SecretStore};
 use perchbar::strip::{self, StripEvent};
 use perchbar::{instances, logger, paths, setup};
 
@@ -91,6 +92,20 @@ fn main() {
         data.instances.len()
     );
 
+    // Secret settings never stay in instances.json: move any found there
+    // (hand edits, older builds) into the encrypted store.
+    let secret_store = SecretStore::new(paths::data_dir().join("secrets"));
+    let manifests: HashMap<String, Arc<_>> = widgets
+        .iter()
+        .map(|(id, (m, _))| (id.clone(), m.clone()))
+        .collect();
+    if secrets::migrate(&mut data, &manifests, &secret_store) {
+        log::info!("moved secret settings out of instances.json");
+        if let Err(e) = instances::save(&paths::instances_file(), &data) {
+            log::warn!("cannot save {}: {e}", paths::instances_file().display());
+        }
+    }
+
     // Every installed widget runs with what its manifest declares, as in
     // Plan 1; permission review comes with the settings window.
     let widgets: HashMap<String, WidgetEntry> = widgets
@@ -107,6 +122,7 @@ fn main() {
             widgets,
             data,
             Arc::new(ReqwestClient::new()),
+            secret_store,
             move |model| {
                 // Runs on scheduler threads under the publish lock: never block.
                 let _ = publish_tx.send(StripEvent::Model(model));

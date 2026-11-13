@@ -30,6 +30,7 @@ use crate::logbook::{LogBook, LogLevel};
 use crate::manifest::{Manifest, Permissions};
 use crate::paths;
 use crate::sandbox::{self, HttpClient, Limits, RunContext, RunError};
+use crate::secrets::{Redactor, SecretStore};
 use crate::strip::model::{Member, Slot, SlotKind, SlotState, StripModel};
 
 const MAX_CONCURRENT_RUNS: usize = 4;
@@ -298,6 +299,8 @@ struct Shared {
     /// Writes instances.json in the background.
     saver: Saver,
     logbook: LogBook,
+    /// Secret settings, overlaid on each run's settings.
+    secrets: SecretStore,
     inner: Mutex<Inner>,
 }
 
@@ -441,12 +444,14 @@ impl Scheduler {
         widgets: HashMap<String, WidgetEntry>,
         instances: Instances,
         http: Arc<dyn HttpClient>,
+        secrets: SecretStore,
         publish: impl Fn(StripModel) + Send + Sync + 'static,
     ) -> SchedulerHandle {
         Self::start_with_runner(
             widgets,
             instances,
             http,
+            secrets,
             sandbox_runner(),
             paths::instances_file(),
             publish,
@@ -457,6 +462,7 @@ impl Scheduler {
         widgets: HashMap<String, WidgetEntry>,
         instances: Instances,
         http: Arc<dyn HttpClient>,
+        secrets: SecretStore,
         runner: Runner,
         instances_path: PathBuf,
         publish: impl Fn(StripModel) + Send + Sync + 'static,
@@ -465,6 +471,7 @@ impl Scheduler {
             widgets,
             instances,
             http,
+            secrets,
             runner,
             instances_path,
             Arc::new(|p: &Path, d: &Instances| instances::save(p, d)),
@@ -472,10 +479,12 @@ impl Scheduler {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn start_with_writer(
         widgets: HashMap<String, WidgetEntry>,
         instances: Instances,
         http: Arc<dyn HttpClient>,
+        secrets: SecretStore,
         runner: Runner,
         instances_path: PathBuf,
         writer: Writer,
@@ -490,6 +499,7 @@ impl Scheduler {
             publish_lock: Mutex::new(()),
             saver: Saver::start(instances_path, writer),
             logbook: LogBook::default(),
+            secrets,
             inner: Mutex::new(Inner {
                 widgets: widgets
                     .into_iter()
@@ -560,6 +570,7 @@ async fn instance_loop(
         // Aborting this loop (stop, shutdown) only drops the join handle, so
         // the permit and guard are released when the run itself ends, never
         // earlier. The real runner's blocking work is covered by this too.
+        let redactor = ctx.redactor.clone();
         let fut = (shared.runner)(ctx);
         let result = tokio::spawn(async move {
             let _held = (run_guard, permit);
@@ -567,7 +578,12 @@ async fn instance_loop(
         })
         .await
         .unwrap_or_else(|e| Err(RunError::Script(format!("run aborted: {e}"))));
-        let failure = result.as_ref().err().map(ToString::to_string);
+        // A widget can put a secret into its error message; hide it before
+        // the message reaches the log, the log book or the tooltip.
+        let failure = result
+            .as_ref()
+            .err()
+            .map(|e| redactor.apply(&e.to_string()));
         let state = match result {
             Ok(output) => {
                 log::debug!("widget run ok for {id}");
@@ -575,13 +591,14 @@ async fn instance_loop(
                 last_good = Some(output.clone());
                 SlotState::Ok(output)
             }
-            Err(e) => {
+            Err(_) => {
                 failures = failures.saturating_add(1);
-                log::warn!("widget run failed for {id}: {e}");
+                let message = failure.clone().unwrap_or_default();
+                log::warn!("widget run failed for {id}: {message}");
                 match &last_good {
                     Some(prev) => SlotState::Stale(prev.clone()),
                     None => SlotState::Error {
-                        message: e.to_string(),
+                        message,
                         last: None,
                     },
                 }
@@ -604,28 +621,40 @@ async fn instance_loop(
     }
 }
 
-/// Reads the instance's current settings and its widget's approved
-/// permissions. `None` when the instance or its widget is gone or blocked.
+/// Reads the instance's current settings (with its secrets overlaid) and its
+/// widget's approved permissions. `None` when the instance or its widget is
+/// gone or blocked.
 fn make_context(shared: &Shared, id: &str) -> Option<(RunContext, u32, u64)> {
-    let inner = shared.lock();
-    let inst = inner.data.instances.iter().find(|i| i.id == id)?;
-    let widget = inner
-        .widgets
-        .get(&inst.widget)
-        .filter(|w| w.blocked.is_none())?;
-    let manifest = &widget.manifest;
-    let ctx = RunContext {
-        manifest: manifest.clone(),
-        widget_dir: widget.dir.as_ref().clone(),
-        instance_id: id.to_string(),
-        settings: inner.data.effective_settings(inst, manifest),
-        http: shared.http.clone(),
-        storage_path: paths::storage_file(id),
-        limits: Limits::default(),
-        permissions: widget.approved.clone(),
-        logbook: shared.logbook.clone(),
+    let (mut ctx, refresh, epoch) = {
+        let inner = shared.lock();
+        let inst = inner.data.instances.iter().find(|i| i.id == id)?;
+        let widget = inner
+            .widgets
+            .get(&inst.widget)
+            .filter(|w| w.blocked.is_none())?;
+        let manifest = &widget.manifest;
+        let ctx = RunContext {
+            manifest: manifest.clone(),
+            widget_dir: widget.dir.as_ref().clone(),
+            instance_id: id.to_string(),
+            settings: inner.data.effective_settings(inst, manifest),
+            http: shared.http.clone(),
+            storage_path: paths::storage_file(id),
+            limits: Limits::default(),
+            permissions: widget.approved.clone(),
+            logbook: shared.logbook.clone(),
+            redactor: Arc::default(),
+        };
+        (ctx, manifest.refresh, inner.epoch(id))
     };
-    Some((ctx, manifest.refresh, inner.epoch(id)))
+    // Decrypting reads the disk: done outside the state lock.
+    let secrets = shared.secrets.load(id);
+    if secrets.unreadable {
+        log::debug!("secrets of {id} cannot be read; they need to be entered again");
+    }
+    ctx.redactor = Arc::new(Redactor::from_values(&secrets.values));
+    ctx.settings.extend(secrets.values);
+    Some((ctx, refresh, epoch))
 }
 
 pub struct SchedulerHandle {
@@ -802,6 +831,7 @@ mod tests {
     use crate::logbook::LogLevel;
     use crate::manifest::Permissions;
     use crate::sandbox::{HttpFuture, HttpRequest};
+    use crate::secrets::SecretStore;
     use crate::strip::model::{Member, SlotKind, SlotState};
     use serde_json::{json, Map};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -867,6 +897,7 @@ mod tests {
         published: Published,
         written: Arc<Mutex<Vec<Instances>>>,
         path: PathBuf,
+        secrets: SecretStore,
         _dir: tempfile::TempDir,
     }
 
@@ -904,10 +935,12 @@ mod tests {
             });
             let published: Published = Arc::default();
             let sink = published.clone();
+            let secrets = test_store(&dir);
             let handle = Scheduler::start_with_writer(
                 widgets,
                 data,
                 Arc::new(NoHttp),
+                secrets.clone(),
                 runner,
                 path.clone(),
                 writer,
@@ -918,6 +951,7 @@ mod tests {
                 published,
                 written,
                 path,
+                secrets,
                 _dir: dir,
             }
         }
@@ -929,6 +963,10 @@ mod tests {
         fn count(&self) -> usize {
             self.published.lock().unwrap().len()
         }
+    }
+
+    fn test_store(dir: &tempfile::TempDir) -> SecretStore {
+        SecretStore::new(dir.path().join("secrets"))
     }
 
     async fn advance(secs: u64) {
@@ -1102,6 +1140,7 @@ mod tests {
                 widgets(),
                 data(vec![inst(1, true)]),
                 Arc::new(NoHttp),
+                test_store(&dir),
                 Arc::new(|_| Box::pin(async { Ok(out("x")) })),
                 dir.path().join("i.json"),
                 move |m| sink.lock().unwrap().push(m),
@@ -1172,6 +1211,7 @@ mod tests {
                 widgets(),
                 data(vec![inst(1, false), inst(2, false)]),
                 Arc::new(NoHttp),
+                test_store(&dir),
                 Arc::new(|_| Box::pin(std::future::pending())),
                 path.clone(),
                 writer,
@@ -1297,6 +1337,7 @@ mod tests {
             widgets,
             data(vec![inst(1, false)]),
             Arc::new(NoHttp),
+            test_store(&dir),
             runner,
             dir.path().join("i.json"),
             |_| {},
@@ -1352,6 +1393,7 @@ mod tests {
             widgets,
             data((1..=count).map(|n| inst(n, false)).collect()),
             Arc::new(NoHttp),
+            test_store(&dir),
             slow_runner(c),
             dir.path().join("i.json"),
             |_| {},
@@ -1685,6 +1727,72 @@ mod tests {
         assert_eq!(s[&id(1)], SlotState::Ok(out(&id(1))));
         assert_eq!(s[&id(3)], SlotState::Ok(out(&id(3))));
         assert!(!s.contains_key(&id(2)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_settings_include_secrets() {
+        let mut first = inst(1, false);
+        first.settings.insert("city".into(), json!("Oslo"));
+        let got: Arc<Mutex<Option<Map<String, serde_json::Value>>>> = Arc::default();
+        let g = got.clone();
+        let rig = Rig::start_ctx(data(vec![first]), move |ctx| {
+            *g.lock().unwrap() = Some(ctx.settings.clone());
+            Box::pin(async { Ok(out("x")) })
+        });
+        // The first run waits for its start jitter, so this lands before it.
+        rig.secrets.set(&id(1), "apiKey", "sk-12345").unwrap();
+        advance(3).await;
+        let settings = got.lock().unwrap().clone().expect("a run");
+        assert_eq!(settings["apiKey"], json!("sk-12345"));
+        assert_eq!(settings["city"], json!("Oslo"));
+        // Nothing secret went into the instance data.
+        assert!(!rig.handle.snapshot().instances[0]
+            .settings
+            .contains_key("apiKey"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn widget_log_redacts_secret_values() {
+        let wdir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            wdir.path().join("widget.js"),
+            "export default async function update({ settings, log }) {\n\
+             log(\"key is \" + settings.apiKey);\n\
+             console.error(\"bad \" + settings.apiKey);\n\
+             throw new Error(\"failed with \" + settings.apiKey);\n}",
+        )
+        .unwrap();
+        let widgets = HashMap::from([(
+            "w".to_string(),
+            WidgetEntry::bundled(manifest(), wdir.path().to_path_buf()),
+        )]);
+        let rig = Rig::start_full(
+            widgets,
+            data(vec![inst(1, false)]),
+            Arc::new(|ctx| Box::pin(sandbox::run(ctx))),
+        );
+        rig.secrets.set(&id(1), "apiKey", "sk-12345").unwrap();
+        advance(3).await;
+        let lines = rig.handle.logbook().lines(&id(1));
+        let texts: Vec<(LogLevel, &str)> =
+            lines.iter().map(|l| (l.level, l.text.as_str())).collect();
+        assert_eq!(texts.len(), 3, "{texts:?}");
+        assert_eq!(texts[0], (LogLevel::Info, "key is [secret]"));
+        assert_eq!(texts[1], (LogLevel::Error, "bad [secret]"));
+        assert_eq!(texts[2].0, LogLevel::Error);
+        assert!(
+            texts[2].1.contains("failed with [secret]"),
+            "{}",
+            texts[2].1
+        );
+        assert!(lines.iter().all(|l| !l.text.contains("sk-12345")));
+        match single_state(&rig.last(), 0) {
+            SlotState::Error { message, .. } => {
+                assert!(!message.contains("sk-12345"), "{message}");
+                assert!(message.contains("[secret]"), "{message}");
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
     }
 
     #[tokio::test(start_paused = true)]
