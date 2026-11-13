@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, SettingKind};
 
 /// Lowest allowed group rotation interval in seconds; smaller values are raised.
 pub const MIN_GROUP_INTERVAL_SECS: u32 = 3;
@@ -71,9 +71,13 @@ fn random_id(prefix: &str) -> String {
     format!("{prefix}{:08x}", rand::random::<u32>())
 }
 
+/// The manifest's defaults. Secret fields never get one: secrets live in
+/// the secret store, never in instances.json (validation also refuses a
+/// default on a secret field).
 fn manifest_defaults(m: &Manifest) -> Map<String, Value> {
     m.settings
         .iter()
+        .filter(|f| f.kind != SettingKind::Secret)
         .filter_map(|f| f.default.clone().map(|d| (f.key.clone(), d)))
         .collect()
 }
@@ -282,6 +286,26 @@ mod tests {
         assert_eq!(i.widget, "weather");
         assert_eq!(i.settings["unit"], json!("C"));
         assert!(!i.settings.contains_key("city"));
+    }
+
+    #[test]
+    fn secret_defaults_never_reach_settings() {
+        // Manifest validation refuses this; built directly, it still must
+        // not put a value in instances.json or the run settings.
+        let m: Manifest = serde_json::from_value(json!({
+            "id": "w", "name": "W", "formatVersion": 1,
+            "settings": [
+                {"key": "apiKey", "label": "API key", "kind": "secret", "default": "sk-author"},
+                {"key": "unit", "label": "Unit", "kind": "text", "default": "C"}
+            ]
+        }))
+        .unwrap();
+        let mut data = Instances::default();
+        data.new_instance(&m);
+        let i = data.instances[0].clone();
+        assert!(!i.settings.contains_key("apiKey"));
+        assert_eq!(i.settings["unit"], json!("C"));
+        assert!(!data.effective_settings(&i, &m).contains_key("apiKey"));
     }
 
     #[test]

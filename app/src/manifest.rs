@@ -199,6 +199,11 @@ fn validate(m: &mut Manifest) -> Result<(), ManifestError> {
         if s.kind == SettingKind::Select && s.options.is_empty() {
             return invalid(format!("select setting {:?} needs options", s.key));
         }
+        // A secret is the user's own: a default would be stored as if the
+        // user had saved it.
+        if s.kind == SettingKind::Secret && s.default.is_some() {
+            return invalid(format!("secret setting {:?} cannot have a default", s.key));
+        }
     }
     Ok(())
 }
@@ -358,5 +363,19 @@ mod tests {
         j["settings"] = json!([{"key": "unit", "label": "Unit", "kind": "select", "options": []}]);
         let dir = fixture(j, true);
         assert!(matches!(load(dir.path()), Err(ManifestError::Invalid(_))));
+    }
+
+    #[test]
+    fn secret_setting_has_no_default() {
+        let mut j = base();
+        j["settings"] = json!([
+            {"key": "apiKey", "label": "API key", "kind": "secret", "default": "sk-author"}
+        ]);
+        let dir = fixture(j, true);
+        assert!(matches!(load(dir.path()), Err(ManifestError::Invalid(_))));
+        let mut j = base();
+        j["settings"] = json!([{"key": "apiKey", "label": "API key", "kind": "secret"}]);
+        let dir = fixture(j, true);
+        assert!(load(dir.path()).is_ok());
     }
 }
