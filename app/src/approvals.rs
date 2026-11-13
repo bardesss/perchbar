@@ -52,21 +52,24 @@ pub fn added(asked: &Permissions, approved: &Permissions) -> Permissions {
 
 /// The scheduler entry for a widget given its approval. Within the approval
 /// it runs with what its manifest asks (never more than approved);
-/// otherwise it is blocked and keeps only the old approval.
+/// otherwise it is blocked and keeps only the old approval. A widget that
+/// asks for nothing is within any approval, even none.
 pub fn entry(manifest: Arc<Manifest>, dir: PathBuf, approved: Option<&Permissions>) -> WidgetEntry {
-    match approved {
-        Some(a) if is_within(&manifest.permissions, a) => WidgetEntry {
+    let approved = approved.cloned().unwrap_or_default();
+    if is_within(&manifest.permissions, &approved) {
+        WidgetEntry {
             approved: manifest.permissions.clone(),
             manifest,
             dir,
             blocked: None,
-        },
-        _ => WidgetEntry {
-            approved: approved.cloned().unwrap_or_default(),
+        }
+    } else {
+        WidgetEntry {
+            approved,
             manifest,
             dir,
             blocked: Some(REVIEW_REASON.to_string()),
-        },
+        }
     }
 }
 
@@ -74,18 +77,42 @@ pub fn entry(manifest: Arc<Manifest>, dir: PathBuf, approved: Option<&Permission
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Approvals {
     by_widget: BTreeMap<String, Permissions>,
+    /// The file could not be read: it is never overwritten.
+    unreadable: bool,
 }
 
 impl Approvals {
     /// Reads `approvals.json`. Missing gives none; a corrupt file is moved
-    /// aside, so its widgets wait for review again.
+    /// aside, so its widgets wait for review again. A file that cannot be
+    /// read (or moved aside) gives none and is never saved over.
     pub fn load(path: &Path) -> Approvals {
-        Approvals {
-            by_widget: read_json(path),
+        match read_json(path) {
+            Ok(by_widget) => Approvals {
+                by_widget,
+                unreadable: false,
+            },
+            Err(e) => {
+                log::warn!(
+                    "cannot read {}: {e}; approvals will not be saved",
+                    path.display()
+                );
+                Approvals {
+                    by_widget: BTreeMap::new(),
+                    unreadable: true,
+                }
+            }
         }
     }
 
+    /// Whether `save` may write the file.
+    pub fn is_readable(&self) -> bool {
+        !self.unreadable
+    }
+
     pub fn save(&self, path: &Path) -> io::Result<()> {
+        if self.unreadable {
+            return Err(unreadable_error(path));
+        }
         write_json(path, &self.by_widget)
     }
 
@@ -102,9 +129,18 @@ impl Approvals {
     }
 }
 
+pub(crate) fn unreadable_error(path: &Path) -> io::Error {
+    io::Error::other(format!(
+        "{} could not be read at startup, so it is not overwritten",
+        path.display()
+    ))
+}
+
 /// Reads `local.json`. Entries that are not absolute paths are dropped.
-pub fn load_local(path: &Path) -> LocalFolders {
-    let mut local: LocalFolders = read_json(path);
+/// An error means the file exists but cannot be read; it must not be
+/// saved over.
+pub fn load_local(path: &Path) -> io::Result<LocalFolders> {
+    let mut local: LocalFolders = read_json(path)?;
     local.retain(|id, dir| {
         let ok = dir.is_absolute();
         if !ok {
@@ -115,7 +151,7 @@ pub fn load_local(path: &Path) -> LocalFolders {
         }
         ok
     });
-    local
+    Ok(local)
 }
 
 pub fn save_local(path: &Path, local: &LocalFolders) -> io::Result<()> {
@@ -123,14 +159,17 @@ pub fn save_local(path: &Path, local: &LocalFolders) -> io::Result<()> {
 }
 
 /// Missing gives the default; a corrupt file is renamed to
-/// `<name>.bak-<unix seconds>` and gives the default.
-fn read_json<T: DeserializeOwned + Default>(path: &Path) -> T {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return T::default();
+/// `<name>.bak-<unix seconds>` and gives the default. Any other read
+/// error, or a corrupt file that cannot be moved aside, is an error.
+fn read_json<T: DeserializeOwned + Default>(path: &Path) -> io::Result<T> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(T::default()),
+        Err(e) => return Err(e),
     };
     let json = text.strip_prefix('\u{feff}').unwrap_or(&text);
     match serde_json::from_str(json) {
-        Ok(v) => v,
+        Ok(v) => Ok(v),
         Err(e) => {
             log::warn!("{} is not valid ({e}); starting without it", path.display());
             let unix = std::time::SystemTime::now()
@@ -138,8 +177,8 @@ fn read_json<T: DeserializeOwned + Default>(path: &Path) -> T {
                 .map_or(0, |d| d.as_secs());
             let mut name = path.file_name().unwrap_or_default().to_os_string();
             name.push(format!(".bak-{unix}"));
-            let _ = std::fs::rename(path, path.with_file_name(name));
-            T::default()
+            std::fs::rename(path, path.with_file_name(name))?;
+            Ok(T::default())
         }
     }
 }
@@ -186,6 +225,41 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_files_are_never_overwritten() {
+        // A folder where the file goes: reading fails with something other
+        // than "not found".
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("approvals.json");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep"), "x").unwrap();
+        let mut a = Approvals::load(&path);
+        assert!(!a.is_readable());
+        a.set("x", Permissions::default());
+        assert!(a.save(&path).is_err());
+        assert!(path.join("keep").is_file());
+        assert!(load_local(&path).is_err());
+        // Missing is fine: nothing to lose.
+        let missing = dir.path().join("none.json");
+        assert!(Approvals::load(&missing).is_readable());
+        assert!(load_local(&missing).unwrap().is_empty());
+    }
+
+    #[test]
+    fn empty_permissions_are_never_blocked() {
+        let m: Manifest = serde_json::from_value(serde_json::json!(
+            {"id": "x", "name": "X", "formatVersion": 1}
+        ))
+        .unwrap();
+        let e = entry(Arc::new(m.clone()), PathBuf::from("x"), None);
+        assert_eq!(e.blocked, None);
+        let mut asks = m;
+        asks.permissions.network = vec!["a.com".into()];
+        let e = entry(Arc::new(asks), PathBuf::from("x"), None);
+        assert_eq!(e.blocked.as_deref(), Some(REVIEW_REASON));
+        assert_eq!(e.approved, Permissions::default());
+    }
+
+    #[test]
     fn added_lists_only_what_is_new() {
         let asked = perms(&["a.com", "B.com", "c.com"], &["f"], &["cpu"]);
         let approved = perms(&["A.com", "b.com"], &["f"], &[]);
@@ -224,10 +298,10 @@ mod tests {
         let abs = dir.path().join("w");
         let json = serde_json::json!({ "good": abs, "bad": "relative\\w" });
         std::fs::write(&path, json.to_string()).unwrap();
-        let local = load_local(&path);
+        let local = load_local(&path).unwrap();
         assert_eq!(local.len(), 1);
         assert_eq!(local["good"], abs);
         save_local(&path, &local).unwrap();
-        assert_eq!(load_local(&path), local);
+        assert_eq!(load_local(&path).unwrap(), local);
     }
 }

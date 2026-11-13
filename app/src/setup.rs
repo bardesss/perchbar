@@ -131,12 +131,23 @@ pub fn approve_bundled(approvals: &mut Approvals, copied: &[&str]) -> bool {
 }
 
 /// Adds the local widgets in `local` to `widgets`. One whose folder is
-/// missing or broken, whose manifest has another id, or whose id is already
-/// taken is logged and left out; its instances stay in the data.
-pub fn add_local(widgets: &mut HashMap<String, (Arc<Manifest>, PathBuf)>, local: &LocalFolders) {
+/// missing or broken, or whose manifest has another id, is logged and left
+/// out; its instances stay in the data and its entry stays, so the folder
+/// can come back. Returns the ids already taken by an installed widget (a
+/// newer bundled template, or the folder copied into `widgets\`): those
+/// entries no longer name the widget with that id and should be dropped.
+pub fn add_local(
+    widgets: &mut HashMap<String, (Arc<Manifest>, PathBuf)>,
+    local: &LocalFolders,
+) -> Vec<String> {
+    let mut shadowed = Vec::new();
     for (id, dir) in local {
         if widgets.contains_key(id) {
-            log::warn!("skipping local widget {id}: an installed widget has that id");
+            log::warn!(
+                "local widget {id} in {} is shadowed by the installed widget with that id; dropping it from local.json",
+                dir.display()
+            );
+            shadowed.push(id.clone());
             continue;
         }
         match manifest::load(dir) {
@@ -151,6 +162,7 @@ pub fn add_local(widgets: &mut HashMap<String, (Arc<Manifest>, PathBuf)>, local:
             Err(e) => log::warn!("skipping local widget {id} in {}: {e}", dir.display()),
         }
     }
+    shadowed
 }
 
 /// The scheduler entries: each widget runs with its approved permissions,
@@ -317,7 +329,8 @@ mod tests {
         local.insert("world-clock".into(), clash);
 
         let mut widgets = load_widgets(&widgets_dir);
-        add_local(&mut widgets, &local);
+        // Only the collision is reported for dropping; a missing folder is not.
+        assert_eq!(add_local(&mut widgets, &local), ["world-clock"]);
         assert!(!widgets.contains_key("gone-widget"));
         assert_eq!(widgets["world-clock"].1, widgets_dir.join("world-clock"));
 
@@ -327,6 +340,65 @@ mod tests {
         let known: HashSet<String> = widgets.keys().cloned().collect();
         data.normalize(&known);
         assert!(data.instances.iter().any(|i| i.id == id));
+    }
+
+    fn user_folder(parent: &Path, name: &str, id: &str, hosts: &[&str]) -> PathBuf {
+        let dir = parent.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = json!({"id": id, "name": "Mine", "formatVersion": 1, "permissions": {"network": hosts}});
+        std::fs::write(dir.join("widget.json"), json.to_string()).unwrap();
+        std::fs::write(dir.join("widget.js"), "").unwrap();
+        dir
+    }
+
+    #[test]
+    fn local_widget_shadowed_after_a_template_upgrade() {
+        // The user loaded their own "world-clock" before Perchbar shipped one.
+        let dir = tempfile::tempdir().unwrap();
+        let widgets_dir = dir.path().join("widgets");
+        let mine = user_folder(dir.path(), "mine", "world-clock", &["evil.example.com"]);
+        let local = LocalFolders::from([("world-clock".to_string(), mine)]);
+        let copied = install_bundled(&widgets_dir).unwrap();
+        assert!(copied.contains(&"world-clock"));
+        let mut widgets = load_widgets(&widgets_dir);
+        assert_eq!(add_local(&mut widgets, &local), ["world-clock"]);
+        assert_eq!(widgets["world-clock"].1, widgets_dir.join("world-clock"));
+        let mut approvals = Approvals::default();
+        approve_bundled(&mut approvals, &copied);
+        let entries = entries(widgets, &approvals);
+        assert!(entries["world-clock"].approved.network.is_empty());
+    }
+
+    #[test]
+    fn local_widget_copied_into_widgets_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let widgets_dir = dir.path().join("widgets");
+        let mine = user_folder(dir.path(), "mine", "mine", &[]);
+        user_folder(&widgets_dir, "mine", "mine", &[]);
+        let local = LocalFolders::from([("mine".to_string(), mine)]);
+        let mut widgets = load_widgets(&widgets_dir);
+        assert_eq!(add_local(&mut widgets, &local), ["mine"]);
+        assert_eq!(widgets["mine"].1, widgets_dir.join("mine"));
+    }
+
+    #[test]
+    fn local_widget_without_approval_is_blocked() {
+        // approvals.json is corrupt: it is moved aside and nothing is approved.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("approvals.json");
+        std::fs::write(&path, "{ broken").unwrap();
+        let approvals = Approvals::load(&path);
+        assert!(approvals.is_readable());
+        let mine = user_folder(dir.path(), "mine", "mine", &["a.example.com"]);
+        let local = LocalFolders::from([("mine".to_string(), mine)]);
+        let mut widgets = HashMap::new();
+        assert!(add_local(&mut widgets, &local).is_empty());
+        let entries = entries(widgets, &approvals);
+        assert_eq!(
+            entries["mine"].blocked.as_deref(),
+            Some(crate::approvals::REVIEW_REASON)
+        );
+        assert!(entries["mine"].approved.network.is_empty());
     }
 
     #[test]

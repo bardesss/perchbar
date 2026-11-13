@@ -104,9 +104,24 @@ fn main() {
         }
     }
 
-    // Installed widgets first; a local one with a taken id is skipped.
+    // Installed widgets first; a local one with a taken id is skipped and
+    // dropped from local.json, so it is never mistaken for the installed one.
     let mut widgets = setup::load_widgets(&widgets_dir);
-    setup::add_local(&mut widgets, &approvals::load_local(&paths::local_file()));
+    match approvals::load_local(&paths::local_file()) {
+        Ok(mut local) => {
+            let shadowed = setup::add_local(&mut widgets, &local);
+            if !shadowed.is_empty() {
+                local.retain(|id, _| !shadowed.contains(id));
+                if let Err(e) = approvals::save_local(&paths::local_file(), &local) {
+                    log::warn!("cannot save {}: {e}", paths::local_file().display());
+                }
+            }
+        }
+        Err(e) => log::warn!(
+            "cannot read {}: {e}; local widgets are left out",
+            paths::local_file().display()
+        ),
+    }
     let known: HashSet<String> = widgets.keys().cloned().collect();
     let names: HashMap<PathBuf, String> = widgets
         .values()

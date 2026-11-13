@@ -10,7 +10,7 @@
 //!
 //! Secret values never appear in `get_state`, in an error or in a log line.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -79,10 +79,56 @@ pub struct AppState {
 }
 
 /// What `approvals.json` and `local.json` hold, kept in step with them.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct Registry {
     approvals: Approvals,
     local: LocalFolders,
+    /// local.json could not be read at startup: it is never overwritten.
+    local_unreadable: bool,
+}
+
+/// How an id relates to local.json.
+enum LocalKind {
+    /// Registered from the folder local.json names.
+    Registered(PathBuf),
+    /// In local.json but not registered (folder missing or broken).
+    Missing(PathBuf),
+    /// Not in local.json, or the registered widget with this id comes from
+    /// another folder.
+    NotLocal,
+}
+
+/// Whether two folders are the same, comparing canonical forms.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+impl Registry {
+    fn kind(&self, widgets: &HashMap<String, WidgetEntry>, id: &str) -> LocalKind {
+        let Some(dir) = self.local.get(id) else {
+            return LocalKind::NotLocal;
+        };
+        match widgets.get(id) {
+            None => LocalKind::Missing(dir.clone()),
+            Some(e) if same_dir(&e.dir, dir) => LocalKind::Registered(dir.clone()),
+            Some(_) => LocalKind::NotLocal,
+        }
+    }
+}
+
+/// A local widget whose folder is missing or broken: not registered, but
+/// its instances and local.json entry are kept.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissingLocalView {
+    pub id: String,
+    pub folder: String,
 }
 
 /// What `inspect_folder` found in a folder. Nothing in it ran. All text
@@ -115,6 +161,8 @@ pub struct WidgetView {
     pub permissions: Permissions,
     /// What the manifest asks for beyond the approval (shown for review).
     pub added: Permissions,
+    /// Blocked, and nothing was ever approved for it.
+    pub first_review: bool,
     pub local: bool,
     pub blocked: Option<String>,
     pub folder: Option<String>,
@@ -151,6 +199,8 @@ pub struct InstanceView {
 #[serde(rename_all = "camelCase")]
 pub struct StateView {
     pub widgets: Vec<WidgetView>,
+    /// Local widgets whose folder is missing or broken.
+    pub missing_local: Vec<MissingLocalView>,
     pub instances: Vec<InstanceView>,
     pub groups: Vec<Group>,
     pub order: Vec<String>,
@@ -302,9 +352,23 @@ impl AppState {
             secrets,
             logbook,
             autostart,
-            registry: Mutex::new(Registry {
-                approvals: Approvals::load(&data_dir.join(APPROVALS_FILE)),
-                local: approvals::load_local(&data_dir.join(LOCAL_FILE)),
+            registry: Mutex::new({
+                let local_path = data_dir.join(LOCAL_FILE);
+                let (local, local_unreadable) = match approvals::load_local(&local_path) {
+                    Ok(local) => (local, false),
+                    Err(e) => {
+                        log::warn!(
+                            "cannot read {}: {e}; it will not be changed",
+                            local_path.display()
+                        );
+                        (LocalFolders::new(), true)
+                    }
+                };
+                Registry {
+                    approvals: Approvals::load(&data_dir.join(APPROVALS_FILE)),
+                    local,
+                    local_unreadable,
+                }
             }),
             data_dir,
         }
@@ -314,18 +378,42 @@ impl AppState {
         self.registry.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Writes both files from `reg`.
-    fn save_registry(&self, reg: &Registry) -> CommandResult<()> {
-        let approvals = self.data_dir.join(APPROVALS_FILE);
-        let local = self.data_dir.join(LOCAL_FILE);
-        reg.approvals
-            .save(&approvals)
-            .map_err(|e| (approvals, e))
-            .and_then(|()| approvals::save_local(&local, &reg.local).map_err(|e| (local, e)))
-            .map_err(|(path, e)| {
-                log::warn!("cannot save {}: {e}", path.display());
-                CommandError::new("Cannot save the widget list")
-            })
+    /// Writes `next` over `prev` on disk: local.json first, then
+    /// approvals.json; if the second write fails, local.json is put back.
+    /// So a failure never leaves a new approval on disk. Files that could
+    /// not be read at startup are never written.
+    fn save_registry(&self, next: &Registry, prev: &Registry) -> CommandResult<()> {
+        let approvals_path = self.data_dir.join(APPROVALS_FILE);
+        let local_path = self.data_dir.join(LOCAL_FILE);
+        let unreadable = if prev.local_unreadable {
+            Some(LOCAL_FILE)
+        } else if !prev.approvals.is_readable() {
+            Some(APPROVALS_FILE)
+        } else {
+            None
+        };
+        if let Some(name) = unreadable {
+            return Err(CommandError::new(format!(
+                "Perchbar could not read {name} at startup, so it does not change it. Fix or remove that file in the data folder and restart Perchbar."
+            )));
+        }
+        let failed = |path: &Path, e: std::io::Error| {
+            log::warn!("cannot save {}: {e}", path.display());
+            CommandError::new("Cannot save the widget list")
+        };
+        let local_changed = next.local != prev.local;
+        if local_changed {
+            approvals::save_local(&local_path, &next.local).map_err(|e| failed(&local_path, e))?;
+        }
+        if let Err(e) = next.approvals.save(&approvals_path) {
+            if local_changed {
+                if let Err(e) = approvals::save_local(&local_path, &prev.local) {
+                    log::warn!("cannot restore {}: {e}", local_path.display());
+                }
+            }
+            return Err(failed(&approvals_path, e));
+        }
+        Ok(())
     }
 
     /// Edits the instance data under the scheduler's state lock, the one
@@ -381,11 +469,27 @@ impl AppState {
         let data = self.sched.snapshot();
         let entries = self.sched.widgets();
         let statuses = self.sched.statuses();
-        let local = self.registry().local.clone();
+        let reg = self.registry().clone();
 
         let mut widgets: Vec<WidgetView> = entries
             .iter()
-            .map(|(id, e)| widget_view(id, e, local.get(id)))
+            .map(|(id, e)| {
+                let folder = match reg.kind(&entries, id) {
+                    LocalKind::Registered(dir) => Some(dir),
+                    _ => None,
+                };
+                let first_review = e.blocked.is_some() && reg.approvals.get(id).is_none();
+                widget_view(id, e, folder.as_ref(), first_review)
+            })
+            .collect();
+        let missing_local = reg
+            .local
+            .iter()
+            .filter(|(id, _)| !entries.contains_key(*id))
+            .map(|(id, dir)| MissingLocalView {
+                id: id.clone(),
+                folder: dir.display().to_string(),
+            })
             .collect();
         widgets.sort_by(|a, b| {
             let by_name = a.name.to_lowercase().cmp(&b.name.to_lowercase());
@@ -450,6 +554,7 @@ impl AppState {
 
         Ok(StateView {
             widgets,
+            missing_local,
             instances,
             groups: data.groups,
             order: data.order,
@@ -729,12 +834,21 @@ impl AppState {
         report.author = m.author.clone();
         report.description = m.description.clone();
         report.permissions = m.permissions.clone();
-        let taken = self.sched.widgets().contains_key(&m.id) || reg.local.contains_key(&m.id);
-        if taken {
-            report.errors.push(format!(
-                "A widget with the id \"{}\" is already installed. Change the id in widget.json, or use Reload on the installed one.",
-                m.id
-            ));
+        // An id is free when nothing is registered under it. A local
+        // widget whose folder is missing may be pointed at a new folder.
+        let widgets = self.sched.widgets();
+        if widgets.contains_key(&m.id) {
+            let message = match reg.kind(&widgets, &m.id) {
+                LocalKind::Registered(_) => format!(
+                    "The widget \"{}\" is already loaded from a folder. Use Reload on it, or change the id in widget.json.",
+                    m.id
+                ),
+                _ => format!(
+                    "A widget with the id \"{}\" is already installed. Change the id in widget.json.",
+                    m.id
+                ),
+            };
+            report.errors.push(message);
             return (report, None);
         }
         (report, Some((folder, m)))
@@ -756,13 +870,11 @@ impl AppState {
             return Err(permissions_changed());
         }
         let id = m.id.clone();
-        reg.approvals.set(&id, m.permissions.clone());
-        reg.local.insert(id.clone(), folder.clone());
-        if let Err(e) = self.save_registry(&reg) {
-            reg.approvals.remove(&id);
-            reg.local.remove(&id);
-            return Err(e);
-        }
+        let mut next = reg.clone();
+        next.approvals.set(&id, m.permissions.clone());
+        next.local.insert(id.clone(), folder.clone());
+        self.save_registry(&next, &reg)?;
+        *reg = next;
         let entry = approvals::entry(Arc::new(m), folder, reg.approvals.get(&id).as_ref());
         self.sched.upsert_widget(&id, entry);
         log::info!("installed local widget {id}");
@@ -774,7 +886,10 @@ impl AppState {
     /// fails to load leaves the widget as it was.
     pub fn reload_widget(&self, id: &str) -> CommandResult<()> {
         let reg = self.registry();
-        let folder = reg.local.get(id).cloned().ok_or_else(not_local)?;
+        let folder = match reg.kind(&self.sched.widgets(), id) {
+            LocalKind::Registered(dir) | LocalKind::Missing(dir) => dir,
+            LocalKind::NotLocal => return Err(not_local()),
+        };
         let m = manifest::load(&folder)
             .map_err(|e| CommandError::new(format!("Cannot reload: {}", manifest_problem(&e))))?;
         if m.id != id {
@@ -801,15 +916,10 @@ impl AppState {
         if !approvals::is_within(&asked, shown) {
             return Err(permissions_changed());
         }
-        let before = reg.approvals.get(id);
-        reg.approvals.set(id, asked.clone());
-        if let Err(e) = self.save_registry(&reg) {
-            match before {
-                Some(p) => reg.approvals.set(id, p),
-                None => reg.approvals.remove(id),
-            }
-            return Err(e);
-        }
+        let mut next = reg.clone();
+        next.approvals.set(id, asked.clone());
+        self.save_registry(&next, &reg)?;
+        *reg = next;
         let entry = approvals::entry(current.manifest, current.dir, Some(&asked));
         self.sched.upsert_widget(id, entry);
         log::info!("approved the permissions of {id}");
@@ -817,12 +927,20 @@ impl AppState {
     }
 
     /// Removes a local widget and every instance of it (with their secrets,
-    /// storage and log books). The user's folder is left alone.
+    /// storage and log books). The user's folder is left alone. The files
+    /// are saved first, so a failed save changes nothing.
     pub fn remove_widget(&self, id: &str) -> CommandResult<()> {
         let mut reg = self.registry();
-        if !reg.local.contains_key(id) {
-            return Err(not_local());
-        }
+        let registered = match reg.kind(&self.sched.widgets(), id) {
+            LocalKind::Registered(_) => true,
+            LocalKind::Missing(_) => false,
+            LocalKind::NotLocal => return Err(not_local()),
+        };
+        let mut next = reg.clone();
+        next.local.remove(id);
+        next.approvals.remove(id);
+        self.save_registry(&next, &reg)?;
+        *reg = next;
         let removed = self.edit(|data| {
             let ids: Vec<String> = data
                 .instances
@@ -836,10 +954,9 @@ impl AppState {
         for inst in &removed {
             self.forget_instance(inst);
         }
-        self.sched.remove_widget(id);
-        reg.local.remove(id);
-        reg.approvals.remove(id);
-        self.save_registry(&reg)?;
+        if registered {
+            self.sched.remove_widget(id);
+        }
         log::info!("removed local widget {id}");
         Ok(())
     }
@@ -889,7 +1006,12 @@ fn simplify(p: PathBuf) -> PathBuf {
     }
 }
 
-fn widget_view(id: &str, e: &WidgetEntry, folder: Option<&PathBuf>) -> WidgetView {
+fn widget_view(
+    id: &str,
+    e: &WidgetEntry,
+    folder: Option<&PathBuf>,
+    first_review: bool,
+) -> WidgetView {
     let m = &e.manifest;
     let added = if e.blocked.is_some() {
         approvals::added(&m.permissions, &e.approved)
@@ -905,6 +1027,7 @@ fn widget_view(id: &str, e: &WidgetEntry, folder: Option<&PathBuf>) -> WidgetVie
         settings: m.settings.clone(),
         permissions: m.permissions.clone(),
         added,
+        first_review,
         local: folder.is_some(),
         blocked: e.blocked.clone(),
         folder: folder.map(|f| f.display().to_string()),
@@ -1079,12 +1202,11 @@ pub mod ipc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::approvals::{load_local, Approvals, REVIEW_REASON};
+    use crate::approvals::{load_local, Approvals, LocalFolders, REVIEW_REASON};
     use crate::display::{Color, Frame, TextSize};
     use crate::sandbox::{HttpClient, HttpFuture, HttpRequest, RunError};
     use crate::scheduler::{Runner, Scheduler};
     use serde_json::json;
-    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct NoHttp;
@@ -1151,7 +1273,25 @@ mod tests {
 
         /// `runner` gets the data folder.
         fn start_with(data: Instances, runner: impl FnOnce(PathBuf) -> Runner) -> Rig {
+            Rig::start_full(data, runner, |_| {})
+        }
+
+        /// `prepare` gets the data folder before the state is built.
+        fn start_prepared(prepare: impl FnOnce(&std::path::Path)) -> Rig {
+            Rig::start_full(
+                Instances::default(),
+                |_| Arc::new(|_| Box::pin(async { Ok::<_, RunError>(out("x")) })),
+                prepare,
+            )
+        }
+
+        fn start_full(
+            data: Instances,
+            runner: impl FnOnce(PathBuf) -> Runner,
+            prepare: impl FnOnce(&std::path::Path),
+        ) -> Rig {
             let dir = tempfile::tempdir().unwrap();
+            prepare(dir.path());
             let widgets = HashMap::from([(
                 "w".to_string(),
                 WidgetEntry::bundled(manifest(), dir.path().join("widgets").join("w")),
@@ -1632,7 +1772,7 @@ mod tests {
             approved_on_disk(&rig, "mine"),
             Some(network(&["api.example.com"]))
         );
-        let local = load_local(&rig.dir.path().join("local.json"));
+        let local = load_local(&rig.dir.path().join("local.json")).unwrap();
         assert_eq!(
             local["mine"],
             simplify(std::fs::canonicalize(&dir).unwrap())
@@ -1753,8 +1893,196 @@ mod tests {
         assert!(!storage.exists());
         assert!(rig.state.logbook.lines(&b).is_empty());
         assert_eq!(approved_on_disk(&rig, "mine"), None);
-        assert!(!load_local(&rig.dir.path().join("local.json")).contains_key("mine"));
+        assert!(!load_local(&rig.dir.path().join("local.json"))
+            .unwrap()
+            .contains_key("mine"));
         assert!(rig.state.remove_widget("mine").is_err());
+    }
+
+    fn local_on_disk(rig: &Rig) -> LocalFolders {
+        load_local(&rig.dir.path().join("local.json")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn first_review_is_marked_and_allowed() {
+        let rig = Rig::start();
+        let dir = local_folder(&rig, "mine", &["a.example.com"]);
+        // As if dropped in by hand: registered, never approved.
+        let m = Arc::new(manifest::load(&dir).unwrap());
+        rig.state
+            .sched
+            .upsert_widget("mine", approvals::entry(m, dir.clone(), None));
+        let view = rig.state.get_state().unwrap();
+        let w = view.widgets.iter().find(|w| w.id == "mine").unwrap();
+        assert!(w.first_review);
+        assert_eq!(w.added, network(&["a.example.com"]));
+        rig.state
+            .approve_permissions("mine", &network(&["a.example.com"]))
+            .unwrap();
+        let view = rig.state.get_state().unwrap();
+        let w = view.widgets.iter().find(|w| w.id == "mine").unwrap();
+        assert!(!w.first_review);
+        assert_eq!(w.blocked, None);
+        rig.state.add_instance("mine").unwrap();
+    }
+
+    /// A local.json entry whose id now belongs to another folder: a newer
+    /// bundled template, or the user's folder copied into widgets.
+    fn assert_not_local(rig: &Rig, id: &str, registered_dir: &std::path::Path) {
+        let inst = rig.state.add_instance(id).unwrap();
+        let before = approved_on_disk(rig, id);
+        let view = rig.state.get_state().unwrap();
+        let w = view.widgets.iter().find(|w| w.id == id).unwrap();
+        assert!(!w.local);
+        assert_eq!(w.folder, None);
+        assert!(view.missing_local.is_empty());
+        assert!(rig.state.reload_widget(id).is_err());
+        assert_eq!(rig.state.sched.widgets()[id].dir, registered_dir);
+        assert!(rig.state.remove_widget(id).is_err());
+        let view = rig.state.get_state().unwrap();
+        assert!(view.instances.iter().any(|i| i.id == inst));
+        assert_eq!(approved_on_disk(rig, id), before);
+    }
+
+    #[tokio::test]
+    async fn local_entry_shadowed_by_a_template_is_not_local() {
+        let rig = Rig::start();
+        // The user's own "w", recorded as local; the bundled "w" is loaded.
+        let mine = local_folder(&rig, "w", &["evil.example.com"]);
+        rig.state.registry().local.insert("w".into(), mine);
+        assert_not_local(&rig, "w", &rig.dir.path().join("widgets").join("w"));
+    }
+
+    #[tokio::test]
+    async fn local_folder_copied_into_widgets_is_not_local() {
+        let rig = Rig::start();
+        let mine = local_folder(&rig, "mine", &[]);
+        rig.state
+            .install_local(&path_str(&mine), &network(&[]))
+            .unwrap();
+        // Next start: the copy in widgets wins, local.json still points away.
+        let copy = rig.dir.path().join("widgets").join("mine");
+        std::fs::create_dir_all(&copy).unwrap();
+        for f in ["widget.json", "widget.js"] {
+            std::fs::copy(mine.join(f), copy.join(f)).unwrap();
+        }
+        let m = Arc::new(manifest::load(&copy).unwrap());
+        rig.state
+            .sched
+            .upsert_widget("mine", WidgetEntry::bundled(m, copy.clone()));
+        assert_not_local(&rig, "mine", &copy);
+    }
+
+    #[tokio::test]
+    async fn install_local_repoints_a_missing_folder() {
+        let rig = Rig::start();
+        let old = local_folder(&rig, "mine", &[]);
+        rig.state
+            .install_local(&path_str(&old), &network(&[]))
+            .unwrap();
+        let inst = rig.state.add_instance("mine").unwrap();
+        // Next start without the folder: the widget is left out.
+        std::fs::remove_dir_all(&old).unwrap();
+        rig.state.sched.remove_widget("mine");
+        let view = rig.state.get_state().unwrap();
+        assert!(view.widgets.iter().all(|w| w.id != "mine"));
+        assert_eq!(view.missing_local.len(), 1);
+        assert_eq!(view.missing_local[0].id, "mine");
+        assert!(view.instances.iter().any(|i| i.id == inst));
+
+        let new = rig.dir.path().join("moved");
+        std::fs::create_dir_all(&new).unwrap();
+        write_manifest(&new, "mine", &["a.example.com"]);
+        std::fs::write(new.join("widget.js"), "").unwrap();
+        let report = rig.state.inspect_folder(&path_str(&new)).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        // The usual guard still applies.
+        assert!(rig
+            .state
+            .install_local(&path_str(&new), &network(&[]))
+            .is_err());
+        rig.state
+            .install_local(&path_str(&new), &network(&["a.example.com"]))
+            .unwrap();
+        assert_eq!(
+            local_on_disk(&rig)["mine"],
+            simplify(std::fs::canonicalize(&new).unwrap())
+        );
+        let view = rig.state.get_state().unwrap();
+        assert!(view.missing_local.is_empty());
+        assert!(view.widgets.iter().any(|w| w.id == "mine" && w.local));
+        assert!(view.instances.iter().any(|i| i.id == inst));
+    }
+
+    #[tokio::test]
+    async fn missing_local_widget_can_be_removed() {
+        let rig = Rig::start();
+        let old = local_folder(&rig, "mine", &[]);
+        rig.state
+            .install_local(&path_str(&old), &network(&[]))
+            .unwrap();
+        let inst = rig.state.add_instance("mine").unwrap();
+        std::fs::remove_dir_all(&old).unwrap();
+        rig.state.sched.remove_widget("mine");
+        rig.state.remove_widget("mine").unwrap();
+        let view = rig.state.get_state().unwrap();
+        assert!(view.missing_local.is_empty());
+        assert!(view.instances.iter().all(|i| i.id != inst));
+        assert!(!local_on_disk(&rig).contains_key("mine"));
+    }
+
+    #[tokio::test]
+    async fn remove_widget_save_failure_changes_nothing() {
+        let rig = Rig::start();
+        let dir = local_folder(&rig, "mine", &[]);
+        rig.state
+            .install_local(&path_str(&dir), &network(&[]))
+            .unwrap();
+        let inst = rig.state.add_instance("mine").unwrap();
+        // The temporary file cannot be written: a folder is in the way.
+        std::fs::create_dir(rig.dir.path().join("local.json.tmp")).unwrap();
+        assert!(rig.state.remove_widget("mine").is_err());
+        let view = rig.state.get_state().unwrap();
+        assert!(view.instances.iter().any(|i| i.id == inst));
+        assert!(view.widgets.iter().any(|w| w.id == "mine" && w.local));
+        assert!(local_on_disk(&rig).contains_key("mine"));
+        assert!(approved_on_disk(&rig, "mine").is_some());
+    }
+
+    #[tokio::test]
+    async fn failed_install_leaves_no_approval_on_disk() {
+        for blocked in ["local.json.tmp", "approvals.json.tmp"] {
+            let rig = Rig::start();
+            let dir = local_folder(&rig, "mine", &["a.example.com"]);
+            std::fs::create_dir(rig.dir.path().join(blocked)).unwrap();
+            let shown = network(&["a.example.com"]);
+            assert!(
+                rig.state.install_local(&path_str(&dir), &shown).is_err(),
+                "{blocked}"
+            );
+            assert_eq!(approved_on_disk(&rig, "mine"), None, "{blocked}");
+            assert!(!local_on_disk(&rig).contains_key("mine"), "{blocked}");
+            assert!(!rig.state.sched.widgets().contains_key("mine"), "{blocked}");
+            // In memory too: the id is free.
+            std::fs::remove_dir(rig.dir.path().join(blocked)).unwrap();
+            rig.state.install_local(&path_str(&dir), &shown).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_registry_refuses_changes() {
+        let rig = Rig::start_prepared(|data| {
+            std::fs::create_dir(data.join("approvals.json")).unwrap();
+            std::fs::write(data.join("approvals.json").join("keep"), "x").unwrap();
+        });
+        let dir = local_folder(&rig, "mine", &[]);
+        let e = rig
+            .state
+            .install_local(&path_str(&dir), &network(&[]))
+            .unwrap_err();
+        assert!(e.message.contains("approvals.json"), "{}", e.message);
+        assert!(rig.dir.path().join("approvals.json").join("keep").is_file());
+        assert!(!rig.dir.path().join("local.json").exists());
     }
 
     #[test]
