@@ -165,6 +165,28 @@ pub fn add_local(
     shadowed
 }
 
+/// Drops the `shadowed` ids (from `add_local`) from `local`. For an id
+/// that is not a bundled template, the approval is dropped too: it was
+/// given to the local folder, so the widget now loaded under that id gets
+/// a first review. Templates keep theirs (see `approve_bundled`). Returns
+/// whether the approvals changed.
+pub fn drop_shadowed(
+    local: &mut LocalFolders,
+    approvals: &mut Approvals,
+    shadowed: &[String],
+) -> bool {
+    let mut changed = false;
+    for id in shadowed {
+        local.remove(id);
+        let bundled = BUNDLED.iter().any(|t| t.id == id);
+        if !bundled && approvals.get(id).is_some() {
+            approvals.remove(id);
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// The scheduler entries: each widget runs with its approved permissions,
 /// or waits for review when it asks for more.
 pub fn entries(
@@ -206,6 +228,7 @@ pub fn seed_first_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::Permissions;
     use serde_json::json;
     use std::collections::HashSet;
 
@@ -357,28 +380,60 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let widgets_dir = dir.path().join("widgets");
         let mine = user_folder(dir.path(), "mine", "world-clock", &["evil.example.com"]);
-        let local = LocalFolders::from([("world-clock".to_string(), mine)]);
+        let mut local = LocalFolders::from([("world-clock".to_string(), mine)]);
+        // The local widget's approval is wider than the template's.
+        let mut approvals = Approvals::default();
+        approvals.set(
+            "world-clock",
+            Permissions {
+                network: vec!["evil.example.com".into()],
+                ..Permissions::default()
+            },
+        );
         let copied = install_bundled(&widgets_dir).unwrap();
         assert!(copied.contains(&"world-clock"));
-        let mut widgets = load_widgets(&widgets_dir);
-        assert_eq!(add_local(&mut widgets, &local), ["world-clock"]);
-        assert_eq!(widgets["world-clock"].1, widgets_dir.join("world-clock"));
-        let mut approvals = Approvals::default();
         approve_bundled(&mut approvals, &copied);
+        let mut widgets = load_widgets(&widgets_dir);
+        let shadowed = add_local(&mut widgets, &local);
+        assert_eq!(shadowed, ["world-clock"]);
+        assert_eq!(widgets["world-clock"].1, widgets_dir.join("world-clock"));
+        drop_shadowed(&mut local, &mut approvals, &shadowed);
+        assert!(local.is_empty());
+        // approve_bundled replaced the wider approval with the template's.
+        assert_eq!(approvals.get("world-clock"), Some(Permissions::default()));
         let entries = entries(widgets, &approvals);
         assert!(entries["world-clock"].approved.network.is_empty());
+        assert_eq!(entries["world-clock"].blocked, None);
     }
 
     #[test]
     fn local_widget_copied_into_widgets_dir() {
         let dir = tempfile::tempdir().unwrap();
         let widgets_dir = dir.path().join("widgets");
-        let mine = user_folder(dir.path(), "mine", "mine", &[]);
-        user_folder(&widgets_dir, "mine", "mine", &[]);
-        let local = LocalFolders::from([("mine".to_string(), mine)]);
+        let mine = user_folder(dir.path(), "mine", "mine", &["a.example.com"]);
+        user_folder(&widgets_dir, "mine", "mine", &["a.example.com"]);
+        let mut local = LocalFolders::from([("mine".to_string(), mine)]);
+        let mut approvals = Approvals::default();
+        approvals.set(
+            "mine",
+            Permissions {
+                network: vec!["a.example.com".into()],
+                ..Permissions::default()
+            },
+        );
         let mut widgets = load_widgets(&widgets_dir);
-        assert_eq!(add_local(&mut widgets, &local), ["mine"]);
+        let shadowed = add_local(&mut widgets, &local);
+        assert_eq!(shadowed, ["mine"]);
         assert_eq!(widgets["mine"].1, widgets_dir.join("mine"));
+        // Not a template: the copy gets a first review of its own.
+        assert!(drop_shadowed(&mut local, &mut approvals, &shadowed));
+        assert!(local.is_empty());
+        assert_eq!(approvals.get("mine"), None);
+        let entries = entries(widgets, &approvals);
+        assert_eq!(
+            entries["mine"].blocked.as_deref(),
+            Some(crate::approvals::REVIEW_REASON)
+        );
     }
 
     #[test]

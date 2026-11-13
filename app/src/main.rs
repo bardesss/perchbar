@@ -111,7 +111,11 @@ fn main() {
         Ok(mut local) => {
             let shadowed = setup::add_local(&mut widgets, &local);
             if !shadowed.is_empty() {
-                local.retain(|id, _| !shadowed.contains(id));
+                if setup::drop_shadowed(&mut local, &mut approvals, &shadowed) {
+                    if let Err(e) = approvals.save(&paths::approvals_file()) {
+                        log::warn!("cannot save {}: {e}", paths::approvals_file().display());
+                    }
+                }
                 if let Err(e) = approvals::save_local(&paths::local_file(), &local) {
                     log::warn!("cannot save {}: {e}", paths::local_file().display());
                 }
