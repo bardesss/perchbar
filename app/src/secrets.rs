@@ -148,7 +148,24 @@ fn bad_id() -> io::Error {
 enum Read {
     Missing,
     Values(Map<String, Value>),
+    /// The file was read but cannot be decrypted or parsed: it is lost and
+    /// may be replaced.
     Unreadable,
+    /// Reading the file failed (locked, access denied). It may be fine, so
+    /// it must not be replaced.
+    Failed(io::Error),
+}
+
+impl Read {
+    /// The values an update starts from. Never starts from scratch over a
+    /// file that merely could not be read right now.
+    fn for_update(self) -> io::Result<Map<String, Value>> {
+        match self {
+            Read::Values(values) => Ok(values),
+            Read::Missing | Read::Unreadable => Ok(Map::new()),
+            Read::Failed(e) => Err(e),
+        }
+    }
 }
 
 impl SecretStore {
@@ -174,13 +191,13 @@ impl SecretStore {
         let blob = match std::fs::read(self.file(instance_id)) {
             Ok(blob) => blob,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Read::Missing,
-            Err(_) => return Read::Unreadable,
+            Err(e) => return Read::Failed(e),
         };
-        let Ok(plain) = unprotect(&blob) else {
+        let Ok(mut plain) = unprotect(&blob) else {
             return Read::Unreadable;
         };
         let parsed = serde_json::from_slice::<Map<String, Value>>(&plain);
-        drop(plain);
+        plain.fill(0);
         match parsed {
             Ok(values) if values.values().all(Value::is_string) => Read::Values(values),
             _ => Read::Unreadable,
@@ -195,13 +212,15 @@ impl SecretStore {
                 _ => Ok(()),
             };
         }
-        let plain = serde_json::to_vec(values).map_err(|_| io::Error::other("cannot encode"))?;
-        let blob = protect(&plain)?;
-        drop(plain);
-        write_atomic(&path, &blob)
+        let mut plain =
+            serde_json::to_vec(values).map_err(|_| io::Error::other("cannot encode"))?;
+        let blob = protect(&plain);
+        plain.fill(0);
+        write_atomic(&path, &blob?)
     }
 
-    /// The instance's secrets. A missing file gives none.
+    /// The instance's secrets. A missing file gives none. A file that
+    /// cannot be read, decrypted or parsed gives none and `unreadable`.
     pub fn load(&self, instance_id: &str) -> SecretLoad {
         let _g = self.guard();
         match self.read(instance_id) {
@@ -213,7 +232,7 @@ impl SecretStore {
                 values,
                 unreadable: false,
             },
-            Read::Unreadable => SecretLoad {
+            Read::Unreadable | Read::Failed(_) => SecretLoad {
                 values: Map::new(),
                 unreadable: true,
             },
@@ -221,7 +240,8 @@ impl SecretStore {
     }
 
     /// Stores one secret. Values over `SECRET_MAX_CHARS` characters are
-    /// rejected with `InvalidInput`. An unreadable file is replaced.
+    /// rejected with `InvalidInput`. A file that cannot be decrypted or
+    /// parsed is replaced; one that cannot be read gives the read error.
     pub fn set(&self, instance_id: &str, key: &str, value: &str) -> io::Result<()> {
         if !valid_id(instance_id) {
             return Err(bad_id());
@@ -233,23 +253,23 @@ impl SecretStore {
             ));
         }
         let _g = self.guard();
-        let mut values = match self.read(instance_id) {
-            Read::Values(values) => values,
-            Read::Missing | Read::Unreadable => Map::new(),
-        };
+        let mut values = self.read(instance_id).for_update()?;
         values.insert(key.to_string(), Value::String(value.to_string()));
         self.write(instance_id, &values)
     }
 
-    /// Forgets one secret. Removes the file once it holds none. An
-    /// unreadable file is left alone.
+    /// Forgets one secret. Removes the file once it holds none. A file that
+    /// cannot be decrypted or parsed is left alone; one that cannot be read
+    /// gives the read error.
     pub fn clear(&self, instance_id: &str, key: &str) -> io::Result<()> {
         if !valid_id(instance_id) {
             return Err(bad_id());
         }
         let _g = self.guard();
-        let Read::Values(mut values) = self.read(instance_id) else {
-            return Ok(());
+        let mut values = match self.read(instance_id) {
+            Read::Values(values) => values,
+            Read::Failed(e) => return Err(e),
+            Read::Missing | Read::Unreadable => return Ok(()),
         };
         if values.remove(key).is_none() {
             return Ok(());
@@ -288,7 +308,9 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     tmp_name.push(".tmp");
     let tmp = path.with_file_name(tmp_name);
     std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 /// `v` as it appears inside a JSON string (no outer quotes).
@@ -484,6 +506,47 @@ mod tests {
         let none = s.load("inst-00000002");
         assert!(!none.unreadable);
         assert!(none.values.is_empty());
+    }
+
+    #[test]
+    fn read_error_keeps_the_file() {
+        // A file that merely could not be read is never started over.
+        let failed = Read::Failed(io::Error::from(io::ErrorKind::PermissionDenied));
+        assert_eq!(
+            failed.for_update().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(Read::Unreadable.for_update().unwrap().is_empty());
+        assert!(Read::Missing.for_update().unwrap().is_empty());
+
+        // A path that cannot be read as a file: set and clear fail, and the
+        // load reports it as unreadable.
+        let (s, _dir) = store();
+        std::fs::create_dir_all(s.file(ID)).unwrap();
+        assert!(s.set(ID, "apiKey", "v").is_err());
+        assert!(s.clear(ID, "apiKey").is_err());
+        assert!(s.load(ID).unreadable);
+        assert!(s.file(ID).is_dir());
+    }
+
+    #[test]
+    fn set_replaces_an_undecryptable_file() {
+        let (s, _dir) = store();
+        std::fs::create_dir_all(s.file(ID).parent().unwrap()).unwrap();
+        std::fs::write(s.file(ID), b"garbage").unwrap();
+        s.set(ID, "apiKey", "v").unwrap();
+        let loaded = s.load(ID);
+        assert!(!loaded.unreadable);
+        assert_eq!(loaded.values["apiKey"], json!("v"));
+    }
+
+    #[test]
+    fn failed_rename_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("x.bin");
+        std::fs::create_dir(&target).unwrap();
+        assert!(write_atomic(&target, b"data").is_err());
+        assert!(!dir.path().join("x.bin.tmp").exists());
     }
 
     #[test]

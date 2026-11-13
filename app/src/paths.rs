@@ -38,11 +38,14 @@ pub fn storage_file(instance_id: &str) -> PathBuf {
         .join(format!("{instance_id}.json"))
 }
 
+/// The folder of the DPAPI-encrypted secret files.
+pub fn secrets_dir() -> PathBuf {
+    data_dir().join("secrets")
+}
+
 /// The DPAPI-encrypted secrets of one instance.
 pub fn secrets_file(instance_id: &str) -> PathBuf {
-    data_dir()
-        .join("secrets")
-        .join(format!("{instance_id}.bin"))
+    secrets_dir().join(format!("{instance_id}.bin"))
 }
 
 pub fn log_file() -> PathBuf {
@@ -76,6 +79,7 @@ mod tests {
         assert_eq!(widgets_dir(), d.join("widgets"));
         assert_eq!(instances_file(), d.join("instances.json"));
         assert_eq!(storage_file("abc"), d.join("storage").join("abc.json"));
+        assert_eq!(secrets_dir(), d.join("secrets"));
         assert_eq!(secrets_file("abc"), d.join("secrets").join("abc.bin"));
         assert_eq!(log_file(), d.join("perchbar.log"));
     }

@@ -27,10 +27,11 @@ use tokio::task::JoinHandle;
 use crate::display::Output;
 use crate::instances::{self, Instances};
 use crate::logbook::{LogBook, LogLevel};
+use crate::manifest::SettingKind;
 use crate::manifest::{Manifest, Permissions};
 use crate::paths;
 use crate::sandbox::{self, HttpClient, Limits, RunContext, RunError};
-use crate::secrets::{Redactor, SecretStore};
+use crate::secrets::{Redactor, SecretLoad, SecretStore};
 use crate::strip::model::{Member, Slot, SlotKind, SlotState, StripModel};
 
 const MAX_CONCURRENT_RUNS: usize = 4;
@@ -560,9 +561,20 @@ async fn instance_loop(
         // A run left over from before a stop may still be executing; its
         // task holds the guard, so wait for it before starting another.
         let run_guard = guard.clone().lock_owned().await;
-        let Some((ctx, refresh, epoch)) = make_context(&shared, &id) else {
+        let Some((mut ctx, refresh, epoch)) = make_context(&shared, &id) else {
             return;
         };
+        // Decrypting reads the disk and calls DPAPI: done on the blocking
+        // pool, never on an async worker.
+        let store = shared.secrets.clone();
+        let owner = id.clone();
+        let secrets = tokio::task::spawn_blocking(move || store.load(&owner))
+            .await
+            .unwrap_or(SecretLoad {
+                values: Default::default(),
+                unreadable: true,
+            });
+        add_secrets(&mut ctx, secrets);
         let Ok(permit) = shared.semaphore.clone().acquire_owned().await else {
             return;
         };
@@ -621,40 +633,59 @@ async fn instance_loop(
     }
 }
 
-/// Reads the instance's current settings (with its secrets overlaid) and its
-/// widget's approved permissions. `None` when the instance or its widget is
-/// gone or blocked.
+/// Reads the instance's current settings and its widget's approved
+/// permissions. Secrets are added later by `add_secrets`. `None` when the
+/// instance or its widget is gone or blocked.
 fn make_context(shared: &Shared, id: &str) -> Option<(RunContext, u32, u64)> {
-    let (mut ctx, refresh, epoch) = {
-        let inner = shared.lock();
-        let inst = inner.data.instances.iter().find(|i| i.id == id)?;
-        let widget = inner
-            .widgets
-            .get(&inst.widget)
-            .filter(|w| w.blocked.is_none())?;
-        let manifest = &widget.manifest;
-        let ctx = RunContext {
-            manifest: manifest.clone(),
-            widget_dir: widget.dir.as_ref().clone(),
-            instance_id: id.to_string(),
-            settings: inner.data.effective_settings(inst, manifest),
-            http: shared.http.clone(),
-            storage_path: paths::storage_file(id),
-            limits: Limits::default(),
-            permissions: widget.approved.clone(),
-            logbook: shared.logbook.clone(),
-            redactor: Arc::default(),
-        };
-        (ctx, manifest.refresh, inner.epoch(id))
+    let inner = shared.lock();
+    let inst = inner.data.instances.iter().find(|i| i.id == id)?;
+    let widget = inner
+        .widgets
+        .get(&inst.widget)
+        .filter(|w| w.blocked.is_none())?;
+    let manifest = &widget.manifest;
+    let ctx = RunContext {
+        manifest: manifest.clone(),
+        widget_dir: widget.dir.as_ref().clone(),
+        instance_id: id.to_string(),
+        settings: inner.data.effective_settings(inst, manifest),
+        http: shared.http.clone(),
+        storage_path: paths::storage_file(id),
+        limits: Limits::default(),
+        permissions: widget.approved.clone(),
+        logbook: shared.logbook.clone(),
+        redactor: Arc::default(),
     };
-    // Decrypting reads the disk: done outside the state lock.
-    let secrets = shared.secrets.load(id);
+    Some((ctx, manifest.refresh, inner.epoch(id)))
+}
+
+/// Overlays the stored secrets on the run settings and builds the run's
+/// redactor from every stored secret and every `secret`-kind value in the
+/// final settings (one that could not be moved out of `instances.json` is
+/// still hidden).
+fn add_secrets(ctx: &mut RunContext, secrets: SecretLoad) {
     if secrets.unreadable {
-        log::debug!("secrets of {id} cannot be read; they need to be entered again");
+        log::debug!(
+            "secrets of {} cannot be read; they need to be entered again",
+            ctx.instance_id
+        );
     }
-    ctx.redactor = Arc::new(Redactor::from_values(&secrets.values));
+    let text = |v: &serde_json::Value| match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    };
+    let mut hidden: Vec<String> = secrets.values.values().filter_map(text).collect();
     ctx.settings.extend(secrets.values);
-    Some((ctx, refresh, epoch))
+    hidden.extend(
+        ctx.manifest
+            .settings
+            .iter()
+            .filter(|f| f.kind == SettingKind::Secret)
+            .filter_map(|f| ctx.settings.get(&f.key))
+            .filter_map(text),
+    );
+    ctx.redactor = Arc::new(Redactor::new(hidden));
 }
 
 pub struct SchedulerHandle {
@@ -1829,6 +1860,41 @@ mod tests {
             }
             other => panic!("expected an error, got {other:?}"),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unmigrated_secret_in_settings_is_still_redacted() {
+        let declared: Manifest = serde_json::from_value(json!({
+            "id": "w", "name": "W", "formatVersion": 1, "refresh": 60,
+            "settings": [{"key": "apiKey", "label": "API key", "kind": "secret"}]
+        }))
+        .unwrap();
+        let wdir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            wdir.path().join("widget.js"),
+            "export default async function update({ settings, log }) {\n\
+             log(\"key is \" + settings.apiKey);\n\
+             return { blocks: [] };\n}",
+        )
+        .unwrap();
+        let widgets = HashMap::from([(
+            "w".to_string(),
+            WidgetEntry::bundled(Arc::new(declared), wdir.path().to_path_buf()),
+        )]);
+        // Left in instances.json: `migrate` could not move it.
+        let mut first = inst(1, false);
+        first
+            .settings
+            .insert("apiKey".into(), json!("sk-unmoved-1"));
+        let rig = Rig::start_full(
+            widgets,
+            data(vec![first]),
+            Arc::new(|ctx| Box::pin(sandbox::run(ctx))),
+        );
+        advance(3).await;
+        let lines = rig.handle.logbook().lines(&id(1));
+        let texts: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["key is [secret]"]);
     }
 
     #[tokio::test(start_paused = true)]

@@ -94,7 +94,7 @@ fn main() {
 
     // Secret settings never stay in instances.json: move any found there
     // (hand edits, older builds) into the encrypted store.
-    let secret_store = SecretStore::new(paths::data_dir().join("secrets"));
+    let secret_store = SecretStore::new(paths::secrets_dir());
     let manifests: HashMap<String, Arc<_>> = widgets
         .iter()
         .map(|(id, (m, _))| (id.clone(), m.clone()))
