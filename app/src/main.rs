@@ -9,7 +9,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use perchbar::sandbox::ReqwestClient;
-use perchbar::scheduler::Scheduler;
+use perchbar::scheduler::{Scheduler, WidgetEntry};
 use perchbar::strip::{self, StripEvent};
 use perchbar::{instances, logger, paths, setup};
 
@@ -90,6 +90,13 @@ fn main() {
         widgets.len(),
         data.instances.len()
     );
+
+    // Every installed widget runs with what its manifest declares, as in
+    // Plan 1; permission review comes with the settings window.
+    let widgets: HashMap<String, WidgetEntry> = widgets
+        .into_iter()
+        .map(|(id, (m, dir))| (id, WidgetEntry::bundled(m, dir)))
+        .collect();
 
     let (tx, rx) = mpsc::channel();
     let publish_tx = tx.clone();

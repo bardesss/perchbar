@@ -13,6 +13,7 @@ use rquickjs::{Ctx, Exception, Function};
 use serde_json::{json, Map, Value};
 
 use super::{permissions, HttpClient, HttpFuture, HttpRequest, HttpResponse};
+use crate::logbook::{LogBook, LogLevel};
 
 /// Maximum serialized size of one instance's storage object.
 pub const STORAGE_MAX_BYTES: usize = 64 * 1024;
@@ -271,6 +272,7 @@ pub fn install<'js>(
     ctx: &Ctx<'js>,
     storage: Arc<Mutex<Storage>>,
     instance_id: String,
+    logbook: LogBook,
 ) -> rquickjs::Result<()> {
     let globals = ctx.globals();
 
@@ -299,6 +301,7 @@ pub fn install<'js>(
     let log = Function::new(ctx.clone(), move |msg: String| {
         if let Some(line) = limiter.lock().unwrap().admit(&msg) {
             log::info!(target: super::WIDGET_LOG_TARGET, "[{instance_id}] {line}");
+            logbook.push(&instance_id, LogLevel::Info, line);
         }
     })?;
     globals.set("__host_log", log)?;

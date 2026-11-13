@@ -20,7 +20,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::display::Output;
-use crate::manifest::Manifest;
+use crate::logbook::LogBook;
+use crate::manifest::{Manifest, Permissions};
 
 /// Wall-time and JS heap limits for one run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +74,11 @@ pub struct RunContext {
     /// Per-instance storage file (`paths::storage_file(&instance_id)`).
     pub storage_path: PathBuf,
     pub limits: Limits,
+    /// The permissions the user approved. URLs are checked against these,
+    /// never against what the manifest declares.
+    pub permissions: Permissions,
+    /// Widget log lines are also kept here, under `instance_id`.
+    pub logbook: LogBook,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -171,12 +177,13 @@ async fn execute(
 
     let instance_id = ctx.instance_id.clone();
     let http = ctx.http.clone();
-    let allowed = ctx.manifest.permissions.network.clone();
+    let allowed = ctx.permissions.network.clone();
+    let logbook = ctx.logbook.clone();
     let seen = violation.clone();
     let settings = Value::Object(ctx.settings.clone()).to_string();
     js.async_with(async move |ctx| {
         let result: rquickjs::Result<Option<String>> = async {
-            host::install(&ctx, storage, instance_id)?;
+            host::install(&ctx, storage, instance_id, logbook)?;
             install_fetch(&ctx, http, allowed, seen)?;
             let invoke: Function = ctx.eval(PRELUDE)?;
             let (module, loaded) = Module::declare(ctx.clone(), "widget.js", source)?.eval()?;
@@ -335,6 +342,9 @@ mod tests {
         limits: Limits,
         http_body: String,
         network: Vec<String>,
+        /// Approved hosts; `None` approves exactly what the manifest declares.
+        approved: Option<Vec<String>>,
+        logbook: LogBook,
         http: Option<Arc<dyn HttpClient>>,
     }
 
@@ -357,6 +367,8 @@ mod tests {
                 limits: Limits::default(),
                 http_body: "{}".into(),
                 network: Vec::new(),
+                approved: None,
+                logbook: LogBook::default(),
                 http: None,
             }
         }
@@ -385,6 +397,11 @@ mod tests {
                 }),
                 storage_path: self.storage_path(),
                 limits: self.limits,
+                permissions: Permissions {
+                    network: self.approved.clone().unwrap_or(self.network.clone()),
+                    ..Permissions::default()
+                },
+                logbook: self.logbook.clone(),
             }
         }
 
@@ -644,6 +661,32 @@ mod tests {
             "(() => { console.log(\"a\", 1, { b: 2 }); log(\"c\"); return \"logged\"; })()",
         ));
         assert_eq!(text(&f.run().await.unwrap()), "logged");
+        let lines: Vec<String> = f
+            .logbook
+            .lines("inst-1")
+            .into_iter()
+            .map(|l| {
+                assert_eq!(l.level, crate::logbook::LogLevel::Info);
+                l.text
+            })
+            .collect();
+        assert_eq!(lines, vec!["a 1 {\"b\":2}", "c"]);
+    }
+
+    #[tokio::test]
+    async fn fetch_checks_approved_hosts_not_the_manifest() {
+        let mut f = Fixture::new(&format!(
+            "export default async function update() {{ {UNDECLARED_FETCH}; return {{ blocks: [] }}; }}"
+        ));
+        // Declared in the manifest, but the user approved nothing.
+        f.network = vec!["evil.com".into()];
+        f.approved = Some(Vec::new());
+        match f.run().await {
+            Err(RunError::Permission(m)) => {
+                assert!(m.contains("host not allowed: evil.com"), "{m}")
+            }
+            other => panic!("expected Permission error, got {other:?}"),
+        }
     }
 
     /// Keeps every log record of the test binary as (target, level, text).

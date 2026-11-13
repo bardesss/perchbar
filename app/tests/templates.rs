@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Map, Value};
 
 use perchbar::display::{Block, Color, Output};
+use perchbar::logbook::LogBook;
 use perchbar::manifest::{self, Manifest};
 use perchbar::sandbox::{
     self, HttpClient, HttpFuture, HttpRequest, HttpResponse, Limits, RunContext, RunError,
@@ -92,6 +93,8 @@ impl Installed {
             http,
             storage_path: self.dir.path().join("storage").join("inst-00000001.json"),
             limits: Limits::default(),
+            permissions: self.manifest(id).permissions,
+            logbook: LogBook::default(),
         })
         .await
     }

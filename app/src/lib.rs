@@ -3,6 +3,7 @@
 
 pub mod display;
 pub mod instances;
+pub mod logbook;
 pub mod logger;
 pub mod manifest;
 pub mod paths;
