@@ -144,20 +144,20 @@ pub struct FolderReport {
     pub author: String,
     pub description: String,
     pub permissions: Permissions,
-    /// Set when the id is a local widget whose folder is missing: installing
-    /// points that widget at this folder, and its instances (settings and
-    /// saved secrets) carry over.
+    /// Set when the id is a local widget whose folder is missing, or when
+    /// instances of the id are left from a widget that is not loaded:
+    /// installing takes them over (settings and saved secrets carry over).
     pub replaces: Option<ReplacedView>,
     /// Why the folder cannot be installed; empty when it can.
     pub errors: Vec<String>,
 }
 
-/// The missing local widget an install would replace.
+/// The missing widget an install would replace.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReplacedView {
-    /// Its old folder.
-    pub folder: String,
+    /// Its old folder, when local.json names one.
+    pub folder: Option<String>,
     /// How many of its instances are on the taskbar.
     pub instances: usize,
     /// Whether any of them has a saved secret.
@@ -868,22 +868,31 @@ impl AppState {
             report.errors.push(message);
             return (report, None);
         }
-        if let LocalKind::Missing(old) = reg.kind(&widgets, &m.id) {
-            if !same_dir(&old, &folder) {
-                let ids: Vec<String> = self
-                    .sched
-                    .snapshot()
-                    .instances
-                    .into_iter()
-                    .filter(|i| i.widget == m.id)
-                    .map(|i| i.id)
-                    .collect();
-                report.replaces = Some(ReplacedView {
-                    folder: old.display().to_string(),
-                    instances: ids.len(),
-                    secrets: ids.iter().any(|i| !self.secrets.keys_set(i).is_empty()),
-                });
-            }
+        // The id is not registered here. Its instances, if any, carry over
+        // with their settings and saved secrets, so taking them over needs
+        // the explicit replace: both for a local widget whose folder is
+        // missing and for instances whose widget failed to load and is not
+        // in local.json.
+        let ids: Vec<String> = self
+            .sched
+            .snapshot()
+            .instances
+            .into_iter()
+            .filter(|i| i.widget == m.id)
+            .map(|i| i.id)
+            .collect();
+        let old = match reg.kind(&widgets, &m.id) {
+            LocalKind::Missing(old) if same_dir(&old, &folder) => None,
+            LocalKind::Missing(old) => Some(Some(old)),
+            _ if !ids.is_empty() => Some(None),
+            _ => None,
+        };
+        if let Some(old) = old {
+            report.replaces = Some(ReplacedView {
+                folder: old.map(|o| o.display().to_string()),
+                instances: ids.len(),
+                secrets: ids.iter().any(|i| !self.secrets.keys_set(i).is_empty()),
+            });
         }
         (report, Some((folder, m)))
     }
@@ -891,7 +900,8 @@ impl AppState {
     /// Installs the folder as a local widget, used in place, and approves
     /// its permissions. `shown` is what the user reviewed: if the folder
     /// now asks for anything more, nothing is installed. Pointing a missing
-    /// local widget (and its instances) at this folder needs `replace`.
+    /// local widget, or instances left from a widget that is not loaded, at
+    /// this folder needs `replace`.
     /// Returns the id.
     pub fn install_local(
         &self,
@@ -912,8 +922,7 @@ impl AppState {
         }
         if report.replaces.is_some() && !replace {
             return Err(CommandError::new(format!(
-                "This folder would replace the missing widget \"{}\" and take over its widgets on the taskbar. Review it again and confirm the replace.",
-                m.id
+                "This folder would replace the missing widget \"{}\" and take over its widgets on the taskbar. Review it again and confirm the replace.",                m.id
             )));
         }
         let id = m.id.clone();
@@ -2053,7 +2062,7 @@ mod tests {
         let replaces = report
             .replaces
             .expect("the report names the replaced widget");
-        assert_eq!(replaces.folder, path_str(&old));
+        assert_eq!(replaces.folder, Some(path_str(&old)));
         assert_eq!(replaces.instances, 1);
         assert!(replaces.secrets);
         let shown = network(&["a.example.com"]);
@@ -2082,6 +2091,64 @@ mod tests {
         assert!(view.missing_local.is_empty());
         assert!(view.widgets.iter().any(|w| w.id == "mine" && w.local));
         assert!(view.instances.iter().any(|i| i.id == inst));
+    }
+
+    #[tokio::test]
+    async fn install_local_over_orphaned_instances_needs_replace() {
+        let rig = Rig::start();
+        let old = local_folder(&rig, "mine", &[]);
+        rig.state
+            .install_local(&path_str(&old), &network(&[]), false)
+            .unwrap();
+        let inst = rig.state.add_instance("mine").unwrap();
+        rig.state.secrets.set(&inst, "apiKey", "sk-kept").unwrap();
+        // A widget that failed to load and is not in local.json (a hand
+        // install in widgets, say): only its instances are left.
+        rig.state.sched.remove_widget("mine");
+        rig.state.registry().local.remove("mine");
+
+        let new = rig.dir.path().join("unrelated");
+        std::fs::create_dir_all(&new).unwrap();
+        write_manifest(&new, "mine", &[]);
+        std::fs::write(new.join("widget.js"), "").unwrap();
+        let report = rig.state.inspect_folder(&path_str(&new)).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let replaces = report
+            .replaces
+            .expect("the report names the orphaned widgets");
+        assert_eq!(replaces.folder, None);
+        assert_eq!(replaces.instances, 1);
+        assert!(replaces.secrets);
+
+        let e = rig
+            .state
+            .install_local(&path_str(&new), &network(&[]), false)
+            .unwrap_err();
+        assert!(e.message.contains("replace"), "{}", e.message);
+        assert!(!rig.state.sched.widgets().contains_key("mine"));
+        // Nothing was saved: local.json on disk still names the old folder.
+        assert_eq!(
+            local_on_disk(&rig)["mine"],
+            simplify(std::fs::canonicalize(&old).unwrap())
+        );
+
+        rig.state
+            .install_local(&path_str(&new), &network(&[]), true)
+            .unwrap();
+        let view = rig.state.get_state().unwrap();
+        assert!(view.widgets.iter().any(|w| w.id == "mine" && w.local));
+        assert!(view.instances.iter().any(|i| i.id == inst));
+    }
+
+    #[tokio::test]
+    async fn install_local_without_orphans_needs_no_replace() {
+        let rig = Rig::start();
+        let dir = local_folder(&rig, "fresh", &[]);
+        let report = rig.state.inspect_folder(&path_str(&dir)).unwrap();
+        assert!(report.replaces.is_none());
+        rig.state
+            .install_local(&path_str(&dir), &network(&[]), false)
+            .unwrap();
     }
 
     #[tokio::test]

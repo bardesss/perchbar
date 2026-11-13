@@ -34,3 +34,12 @@ test("replacing a missing widget says what carries over", () => {
     "This replaces my-clock, whose folder is missing (C:/old).",
   );
 });
+
+test("taking over widgets left from an earlier install says so", () => {
+  expect(replaceNotice("my-clock", { folder: null, instances: 2, secrets: true })).toBe(
+    "Perchbar still has 2 widgets from an earlier my-clock on your taskbar. This folder takes them over, and they keep their settings and saved keys.",
+  );
+  expect(replaceNotice("my-clock", { folder: null, instances: 1, secrets: false })).toBe(
+    "Perchbar still has 1 widget from an earlier my-clock on your taskbar. This folder takes it over, and it keeps its settings.",
+  );
+});

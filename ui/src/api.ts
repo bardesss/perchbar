@@ -56,15 +56,19 @@ export interface FolderReport {
   author: string;
   description: string;
   permissions: Permissions;
-  /** Set when installing would replace a local widget whose folder is missing. */
+  /**
+   * Set when installing would replace a local widget whose folder is
+   * missing, or take over widgets left from one that is not loaded.
+   */
   replaces: ReplacedView | null;
   /** Why the folder cannot be installed; empty when it can. */
   errors: string[];
 }
 
-/** The missing local widget an install would replace. */
+/** The missing widget an install would replace. */
 export interface ReplacedView {
-  folder: string;
+  /** Its old folder, or null when it was not a local widget. */
+  folder: string | null;
   instances: number;
   /** Whether any of its instances has a saved secret. */
   secrets: boolean;
