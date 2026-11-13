@@ -5,6 +5,7 @@ import {
   errorsByKey,
   instanceLabels,
   parseMaxWidth,
+  saveErrorMessage,
   settingsPayload,
   statusLine,
   toFormModel,
@@ -119,9 +120,63 @@ describe("toWire", () => {
     expect(toWire(num, "")).toBeNull();
     expect(toWire(sel, "")).toBeNull();
     expect(toWire(color, "")).toBeNull();
-    expect(toWire(text, "")).toBe("");
+    expect(toWire(text, "Hi there")).toBe("Hi there");
     expect(toWire(list, [" a ", "", "b"])).toEqual(["a", "b"]);
     expect(toWire(toggle, true)).toBe(true);
+  });
+});
+
+describe("clearing a text field", () => {
+  test("sends null, so the default comes back", () => {
+    expect(toWire(text, "")).toBeNull();
+    expect(toWire(textWithDefault, "   ")).toBeNull();
+    expect(toWire(place, "")).toBeNull();
+    const model = toFormModel([textWithDefault], { city: toWire(textWithDefault, "") });
+    expect(model[0].value).toBe("Amsterdam");
+  });
+
+  test("a required text with a default may be cleared", () =>
+    expect(checkField(field("t", "text", { required: true, default: "x" }), "")).toBeNull());
+});
+
+describe("saveErrorMessage", () => {
+  const fields = [text, secret];
+  const apiKey = { ...secret, label: "API key" };
+
+  test("the edited field's own message wins", () =>
+    expect(
+      saveErrorMessage([text, apiKey], "title", {
+        message: "Some settings need fixing",
+        fields: [{ key: "title", message: "At most 2000 characters" }],
+      }),
+    ).toBe("At most 2000 characters"));
+
+  test("a missing secret elsewhere points at that secret", () =>
+    expect(
+      saveErrorMessage([text, apiKey], "title", {
+        message: "Some settings need fixing",
+        fields: [{ key: "apiKey", message: "Required" }],
+      }),
+    ).toBe("Save the API key first"));
+
+  test("another field's problem names that field", () =>
+    expect(
+      saveErrorMessage([text, place], "title", {
+        message: "Some settings need fixing",
+        fields: [{ key: "place", message: "Required" }],
+      }),
+    ).toBe("Fix place first"));
+
+  test("a whole-map problem or a plain error shows its own message", () => {
+    expect(
+      saveErrorMessage(fields, "title", {
+        message: "Some settings need fixing",
+        fields: [{ key: "", message: "Settings are at most 16 KB in total" }],
+      }),
+    ).toBe("Settings are at most 16 KB in total");
+    expect(saveErrorMessage(fields, "title", { message: "This widget is not installed" })).toBe(
+      "This widget is not installed",
+    );
   });
 });
 

@@ -4,6 +4,7 @@
   // their group (group editing comes with the groups UI).
   import { setHidden, setOrder, type CommandError, type StateView } from "../api";
   import { statusLine } from "./form";
+  import { moveBefore, moveBy } from "./order";
 
   interface Props {
     view: StateView;
@@ -25,12 +26,8 @@
   const instances = $derived(new Map(view.instances.map((i) => [i.id, i])));
   const groups = $derived(new Map(view.groups.map((g) => [g.id, g])));
 
-  async function move(id: string, to: number) {
-    const from = order.indexOf(id);
-    if (from < 0 || to < 0 || to >= order.length || to === from) return;
-    const next = order.slice();
-    next.splice(from, 1);
-    next.splice(to, 0, id);
+  async function apply(next: string[] | null) {
+    if (!next) return;
     pendingOrder = next;
     try {
       await setOrder(next);
@@ -42,8 +39,8 @@
     }
   }
 
-  async function moveBy(id: string, delta: number, button: HTMLElement) {
-    await move(id, order.indexOf(id) + delta);
+  async function step(id: string, delta: -1 | 1, button: HTMLElement) {
+    await apply(moveBy(order, id, delta));
     // The row moved; keep focus on the same button of the same row.
     const row = button.closest("li[data-id]");
     const name = button.dataset.move;
@@ -79,7 +76,8 @@
     const from = dragging;
     dragging = null;
     dropTarget = null;
-    if (from && from !== id) void move(from, order.indexOf(id));
+    // Lands before the row it was dropped on, in either direction.
+    if (from) void apply(moveBefore(order, from, id));
   }
 
   function ondragend() {
@@ -128,7 +126,7 @@
       aria-label={`Move ${name} up`}
       title="Move up"
       disabled={index === 0}
-      onclick={(e) => moveBy(id, -1, e.currentTarget)}
+      onclick={(e) => step(id, -1, e.currentTarget)}
     >
       <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 10l4-4 4 4" /></svg>
     </button>
@@ -139,7 +137,7 @@
       aria-label={`Move ${name} down`}
       title="Move down"
       disabled={index === order.length - 1}
-      onclick={(e) => moveBy(id, 1, e.currentTarget)}
+      onclick={(e) => step(id, 1, e.currentTarget)}
     >
       <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4" /></svg>
     </button>

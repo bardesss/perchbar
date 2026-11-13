@@ -96,11 +96,28 @@ export function toWire(field: SettingField, value: unknown): unknown {
       return Array.isArray(value)
         ? value.map((s) => (typeof s === "string" ? s.trim() : s)).filter((s) => s !== "")
         : value;
+    case "text":
+    case "location":
+      // Cleared: back to the default rather than storing "".
+      return typeof value === "string" && value.trim() === "" ? null : value;
     case "secret":
       throw new Error("secrets are saved with set_secret");
     default:
       return value;
   }
+}
+
+/**
+ * What to show at the edited field when a save is refused: its own
+ * message, else a pointer to the field the core named (a missing secret
+ * must be saved first), else the error's own message.
+ */
+export function saveErrorMessage(fields: SettingField[], key: string, err: CommandError): string {
+  const byKey = errorsByKey(err);
+  if (byKey[key]) return byKey[key];
+  const other = fields.find((f) => f.key !== key && byKey[f.key]);
+  if (other) return other.kind === "secret" ? `Save the ${other.label} first` : `Fix ${other.label} first`;
+  return byKey[""] ?? err.message;
 }
 
 function isFilled(v: unknown): boolean {

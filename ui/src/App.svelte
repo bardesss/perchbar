@@ -4,6 +4,7 @@
   import AddWidgetDialog from "./lib/AddWidgetDialog.svelte";
   import AppSettings from "./lib/AppSettings.svelte";
   import { instanceLabels } from "./lib/form";
+  import { latestRefresher } from "./lib/latest";
   import WidgetEditor from "./lib/WidgetEditor.svelte";
   import WidgetList from "./lib/WidgetList.svelte";
 
@@ -30,21 +31,20 @@
 
   /** A focus request for an instance the state does not have yet. */
   let wantedId: string | null = null;
-  let fetchSeq = 0;
 
-  /** Refetches the state. Only the newest answer is applied. */
-  async function refresh(): Promise<void> {
-    const mine = ++fetchSeq;
-    try {
-      const next = await getState();
-      if (mine !== fetchSeq) return;
+  /**
+   * Refetches the state. Resolves once state at least as new as this fetch
+   * is in, so callers that await it read what they just changed.
+   */
+  const refresh = latestRefresher(
+    getState,
+    (next) => {
       view = next;
       loadError = null;
       reconcileSelection();
-    } catch (e) {
-      if (mine === fetchSeq) loadError = (e as CommandError).message;
-    }
-  }
+    },
+    (e) => (loadError = (e as CommandError).message),
+  );
 
   function reconcileSelection() {
     if (!view) return;

@@ -16,6 +16,7 @@
     checkField,
     errorsByKey,
     parseMaxWidth,
+    saveErrorMessage,
     settingsPayload,
     statusLine,
     toFormModel,
@@ -40,35 +41,86 @@
 
   let { instance, widget, label, changes, onchanged, onremoved }: Props = $props();
 
-  const MAX_WIDTH = "maxWidth";
-
   const fields = $derived(widget?.settings ?? []);
   const model = $derived(toFormModel(fields, instance.settings));
+  // Setting state, keyed by setting key.
   let drafts: Record<string, FormValue> = $state({});
   let errors: Record<string, string> = $state({});
   let saved: Record<string, boolean> = $state({});
+  // Maximum width state, apart from the settings so no setting key can
+  // collide with it. The draft is the text typed; empty means automatic.
+  let width: { draft: string | null; error: string | null; saved: boolean } = $state({
+    draft: null,
+    error: null,
+    saved: false,
+  });
   let notice: string | null = $state(null);
   let confirmRemove = $state(false);
   let busy = $state(false);
   const savedTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+  /** One input's draft and messages, for the shared save routine. */
+  interface Slot {
+    /** The current draft, or undefined when there is none. */
+    draft(): unknown;
+    clearDraft(): void;
+    setError(message: string | null): void;
+    setSaved(on: boolean): void;
+  }
+
+  function settingSlot(key: string): Slot {
+    return {
+      draft: () => (key in drafts ? drafts[key] : undefined),
+      clearDraft: () => delete drafts[key],
+      setError: (m) => (m === null ? delete errors[key] : (errors[key] = m)),
+      setSaved: (on) => (saved[key] = on),
+    };
+  }
+
+  const widthSlot: Slot = {
+    draft: () => width.draft ?? undefined,
+    clearDraft: () => (width.draft = null),
+    setError: (m) => (width.error = m),
+    setSaved: (on) => (width.saved = on),
+  };
+
+  function flashSaved(name: string, slot: Slot) {
+    slot.setSaved(true);
+    clearTimeout(savedTimers.get(name));
+    savedTimers.set(
+      name,
+      setTimeout(() => slot.setSaved(false), 2000),
+    );
+  }
+
   /** Saves run one at a time, so each sends the state the last one left. */
   let queue: Promise<void> = Promise.resolve();
-  function enqueue(job: () => Promise<void>) {
+
+  /**
+   * Saves one input: waits its turn, skips a draft edited again meanwhile
+   * (that edit saves on its own commit), sends, and waits for the refetched
+   * state before dropping the draft. `send` reads the instance only when it
+   * runs, so it builds on everything saved before it.
+   */
+  function save(name: string, slot: Slot, value: unknown, send: () => Promise<void>, failed: (e: CommandError) => void) {
+    const job = async () => {
+      if (slot.draft() !== value) return;
+      try {
+        await send();
+        slot.setError(null);
+        // Resolves once state at least this new is in (latestRefresher).
+        await onchanged();
+        if (slot.draft() === value) slot.clearDraft();
+        flashSaved(name, slot);
+      } catch (e) {
+        failed(e as CommandError);
+      }
+    };
     queue = queue.then(job, job);
   }
 
   function shown(key: string, fallback: FormValue): FormValue {
     return key in drafts ? drafts[key] : fallback;
-  }
-
-  function flashSaved(key: string) {
-    saved[key] = true;
-    clearTimeout(savedTimers.get(key));
-    savedTimers.set(
-      key,
-      setTimeout(() => (saved[key] = false), 2000),
-    );
   }
 
   function edit(field: Field, value: FormValue) {
@@ -88,57 +140,43 @@
       errors[key] = problem;
       return;
     }
-    enqueue(async () => {
-      // Edited again while waiting: that edit saves on its own commit.
-      if (drafts[key] !== value) return;
-      try {
-        const payload = settingsPayload(fields, instance.settings, { [key]: toWire(field, value) });
-        await updateSettings(instance.id, payload);
-        delete errors[key];
-        await onchanged();
-        if (drafts[key] === value) delete drafts[key];
-        flashSaved(key);
-      } catch (e) {
-        const err = e as CommandError;
-        // Problems in other fields show next to those fields too.
-        const byKey = errorsByKey(err);
-        for (const [k, message] of Object.entries(byKey)) if (k !== "") errors[k] = message;
-        errors[key] = byKey[key] ?? byKey[""] ?? err.message;
-      }
-    });
+    save(
+      `setting:${key}`,
+      settingSlot(key),
+      value,
+      () =>
+        updateSettings(instance.id, settingsPayload(fields, instance.settings, { [key]: toWire(field, value) })),
+      (err) => {
+        // Problems in other fields (a missing secret too) show there.
+        for (const [k, message] of Object.entries(errorsByKey(err))) if (k !== "") errors[k] = message;
+        errors[key] = saveErrorMessage(fields, key, err);
+      },
+    );
   }
 
-  // Maximum width: a draft string; empty means automatic.
   const savedWidth = $derived(instance.maxWidth === null ? "" : String(instance.maxWidth));
 
   function editWidth(raw: string) {
-    drafts[MAX_WIDTH] = raw;
-    saved[MAX_WIDTH] = false;
-    const { error } = parseMaxWidth(raw);
-    if (error) errors[MAX_WIDTH] = error;
-    else delete errors[MAX_WIDTH];
+    width.draft = raw;
+    width.saved = false;
+    width.error = parseMaxWidth(raw).error;
   }
 
   function commitWidth() {
-    if (!(MAX_WIDTH in drafts)) return;
-    const raw = drafts[MAX_WIDTH] as string;
+    if (width.draft === null) return;
+    const raw = width.draft;
     const { value, error } = parseMaxWidth(raw);
     if (error) {
-      errors[MAX_WIDTH] = error;
+      width.error = error;
       return;
     }
-    enqueue(async () => {
-      if (drafts[MAX_WIDTH] !== raw) return;
-      try {
-        await setMaxWidth(instance.id, value);
-        delete errors[MAX_WIDTH];
-        await onchanged();
-        if (drafts[MAX_WIDTH] === raw) delete drafts[MAX_WIDTH];
-        flashSaved(MAX_WIDTH);
-      } catch (e) {
-        errors[MAX_WIDTH] = (e as CommandError).message;
-      }
-    });
+    save(
+      "maxWidth",
+      widthSlot,
+      raw,
+      () => setMaxWidth(instance.id, value),
+      (err) => (width.error = err.message),
+    );
   }
 
   async function refresh() {
@@ -193,6 +231,8 @@
             {field}
             isSet={instance.secretsSet.includes(f.key)}
             unreadable={instance.secretsUnreadable}
+            error={errors[f.key] ?? null}
+            onsaved={() => delete errors[f.key]}
             {onchanged}
           />
         {:else if f.kind === "list"}
@@ -229,8 +269,8 @@
         inputmode="numeric"
         autocomplete="off"
         placeholder="Automatic"
-        value={shown(MAX_WIDTH, savedWidth) as string}
-        aria-invalid={errors[MAX_WIDTH] ? "true" : undefined}
+        value={width.draft ?? savedWidth}
+        aria-invalid={width.error ? "true" : undefined}
         aria-describedby="max-width-hint max-width-msg"
         oninput={(e) => editWidth((e.currentTarget as HTMLInputElement).value)}
         onblur={commitWidth}
@@ -242,9 +282,9 @@
         }}
       />
       <span id="max-width-msg" class="msg" aria-live="polite">
-        {#if errors[MAX_WIDTH]}
-          <span class="field-error">{errors[MAX_WIDTH]}</span>
-        {:else if saved[MAX_WIDTH]}
+        {#if width.error}
+          <span class="field-error">{width.error}</span>
+        {:else if width.saved}
           <span class="field-saved">Saved</span>
         {/if}
       </span>

@@ -12,10 +12,14 @@
     field: SettingField;
     isSet: boolean;
     unreadable: boolean;
+    /** The core's message for this key from a refused settings save. */
+    error: string | null;
+    /** Called after a secret is saved, so that message can go. */
+    onsaved: () => void;
     onchanged: () => Promise<void>;
   }
 
-  let { instanceId, field, isSet, unreadable, onchanged }: Props = $props();
+  let { instanceId, field, isSet, unreadable, error: coreError, onsaved, onchanged }: Props = $props();
 
   let replacing = $state(false);
   let value = $state("");
@@ -44,6 +48,7 @@
       error = null;
       replacing = false;
       ok = true;
+      onsaved();
       await onchanged();
     } catch (e) {
       const err = e as CommandError;
@@ -106,7 +111,7 @@
         autocomplete="off"
         spellcheck="false"
         bind:value
-        aria-invalid={error ? "true" : undefined}
+        aria-invalid={error || coreError ? "true" : undefined}
         aria-describedby={`${id}-msg`}
         onkeydown={(e) => {
           if (e.key === "Enter") {
@@ -135,8 +140,8 @@
     </div>
   {/if}
   <span id={`${id}-msg`} class="msg" aria-live="polite">
-    {#if error}
-      <span class="field-error">{error}</span>
+    {#if error || coreError}
+      <span class="field-error">{error ?? coreError}</span>
     {:else if hint}
       <span class={hint === "Required" ? "muted" : "field-error"}>{hint}</span>
     {/if}
