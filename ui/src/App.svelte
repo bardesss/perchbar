@@ -178,6 +178,7 @@
   <AddWidgetDialog
     open={adding}
     widgets={view.widgets}
+    onchanged={refresh}
     onclose={() => (adding = false)}
     onadded={(id) => {
       adding = false;

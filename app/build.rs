@@ -20,6 +20,11 @@ const COMMANDS: &[&str] = &[
     "get_logs",
     "set_autostart",
     "open_log_folder",
+    "inspect_folder",
+    "install_local",
+    "reload_widget",
+    "approve_permissions",
+    "remove_widget",
 ];
 
 fn main() {

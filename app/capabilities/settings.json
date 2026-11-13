@@ -23,6 +23,12 @@
     "allow-refresh-now",
     "allow-get-logs",
     "allow-set-autostart",
-    "allow-open-log-folder"
+    "allow-open-log-folder",
+    "allow-inspect-folder",
+    "allow-install-local",
+    "allow-reload-widget",
+    "allow-approve-permissions",
+    "allow-remove-widget",
+    "dialog:allow-open"
   ]
 }

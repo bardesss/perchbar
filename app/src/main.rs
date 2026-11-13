@@ -8,6 +8,7 @@ use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use perchbar::approvals::{self, Approvals};
 use perchbar::commands::AppState;
 use perchbar::prefs::{self, Autostart, NoAutostart, RegistryAutostart};
 use perchbar::sandbox::ReqwestClient;
@@ -84,13 +85,28 @@ fn main() {
     }
 
     let widgets_dir = paths::widgets_dir();
-    match setup::install_bundled(&widgets_dir) {
-        Ok(copied) if !copied.is_empty() => log::info!("installed templates: {copied:?}"),
-        Ok(_) => {}
-        Err(e) => log::warn!("cannot install bundled templates: {e}"),
+    let copied = match setup::install_bundled(&widgets_dir) {
+        Ok(copied) => {
+            if !copied.is_empty() {
+                log::info!("installed templates: {copied:?}");
+            }
+            copied
+        }
+        Err(e) => {
+            log::warn!("cannot install bundled templates: {e}");
+            Vec::new()
+        }
+    };
+    let mut approvals = Approvals::load(&paths::approvals_file());
+    if setup::approve_bundled(&mut approvals, &copied) {
+        if let Err(e) = approvals.save(&paths::approvals_file()) {
+            log::warn!("cannot save {}: {e}", paths::approvals_file().display());
+        }
     }
 
-    let widgets = setup::load_widgets(&widgets_dir);
+    // Installed widgets first; a local one with a taken id is skipped.
+    let mut widgets = setup::load_widgets(&widgets_dir);
+    setup::add_local(&mut widgets, &approvals::load_local(&paths::local_file()));
     let known: HashSet<String> = widgets.keys().cloned().collect();
     let names: HashMap<PathBuf, String> = widgets
         .values()
@@ -127,12 +143,9 @@ fn main() {
         }
     }
 
-    // Every installed widget runs with what its manifest declares, as in
-    // Plan 1; permission review comes with the settings window.
-    let widgets: HashMap<String, WidgetEntry> = widgets
-        .into_iter()
-        .map(|(id, (m, dir))| (id, WidgetEntry::bundled(m, dir)))
-        .collect();
+    // Each widget runs with the permissions the user approved; one that
+    // asks for more waits for review in the settings window.
+    let widgets: HashMap<String, WidgetEntry> = setup::entries(widgets, &approvals);
 
     let (tx, rx) = mpsc::channel();
     let publish_tx = tx.clone();
@@ -163,6 +176,7 @@ fn main() {
         paths::data_dir(),
     );
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(state)
         .invoke_handler(settings_window::invoke_handler())
         .build(tauri::generate_context!())

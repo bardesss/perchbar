@@ -10,17 +10,19 @@
 //!
 //! Secret values never appear in `get_state`, in an error or in a log line.
 
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::Serialize;
 use serde_json::{Map, Value};
 
+use crate::approvals::{self, Approvals, LocalFolders};
 use crate::display::{Block, Output};
 use crate::instances::{Group, Instance, Instances};
 use crate::logbook::{LogBook, LogLevel};
-use crate::manifest::{Manifest, Permissions, SettingField, SettingKind};
+use crate::manifest::{self, Manifest, ManifestError, Permissions, SettingField, SettingKind};
+use crate::paths::{APPROVALS_FILE, LOCAL_FILE};
 use crate::prefs::{self, AppPrefs, Autostart};
 use crate::scheduler::{SchedulerHandle, WidgetEntry};
 use crate::secrets::{SecretStore, SECRET_MAX_CHARS};
@@ -70,9 +72,34 @@ pub struct AppState {
     autostart: Arc<dyn Autostart + Send + Sync>,
     /// The data folder: `app.json`, `storage\` and the log file live here.
     data_dir: PathBuf,
-    /// Local widget folders by widget id. Filled by the local widget
-    /// loading (with approvals) later; empty until then.
-    pub local_folders: Mutex<HashMap<String, PathBuf>>,
+    /// Approvals and local folders. Held across a whole install, reload,
+    /// approval or removal so those run one at a time; taken before the
+    /// scheduler's lock, never while holding it.
+    registry: Mutex<Registry>,
+}
+
+/// What `approvals.json` and `local.json` hold, kept in step with them.
+#[derive(Debug, Default)]
+struct Registry {
+    approvals: Approvals,
+    local: LocalFolders,
+}
+
+/// What `inspect_folder` found in a folder. Nothing in it ran. All text
+/// comes from the folder and is untrusted.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderReport {
+    /// The folder, as it will be recorded.
+    pub folder: String,
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub author: String,
+    pub description: String,
+    pub permissions: Permissions,
+    /// Why the folder cannot be installed; empty when it can.
+    pub errors: Vec<String>,
 }
 
 /// One installed widget, as the page lists it.
@@ -86,6 +113,8 @@ pub struct WidgetView {
     pub version: String,
     pub settings: Vec<SettingField>,
     pub permissions: Permissions,
+    /// What the manifest asks for beyond the approval (shown for review).
+    pub added: Permissions,
     pub local: bool,
     pub blocked: Option<String>,
     pub folder: Option<String>,
@@ -273,9 +302,30 @@ impl AppState {
             secrets,
             logbook,
             autostart,
+            registry: Mutex::new(Registry {
+                approvals: Approvals::load(&data_dir.join(APPROVALS_FILE)),
+                local: approvals::load_local(&data_dir.join(LOCAL_FILE)),
+            }),
             data_dir,
-            local_folders: Mutex::default(),
         }
+    }
+
+    fn registry(&self) -> MutexGuard<'_, Registry> {
+        self.registry.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Writes both files from `reg`.
+    fn save_registry(&self, reg: &Registry) -> CommandResult<()> {
+        let approvals = self.data_dir.join(APPROVALS_FILE);
+        let local = self.data_dir.join(LOCAL_FILE);
+        reg.approvals
+            .save(&approvals)
+            .map_err(|e| (approvals, e))
+            .and_then(|()| approvals::save_local(&local, &reg.local).map_err(|e| (local, e)))
+            .map_err(|(path, e)| {
+                log::warn!("cannot save {}: {e}", path.display());
+                CommandError::new("Cannot save the widget list")
+            })
     }
 
     /// Edits the instance data under the scheduler's state lock, the one
@@ -331,11 +381,7 @@ impl AppState {
         let data = self.sched.snapshot();
         let entries = self.sched.widgets();
         let statuses = self.sched.statuses();
-        let local = self
-            .local_folders
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
+        let local = self.registry().local.clone();
 
         let mut widgets: Vec<WidgetView> = entries
             .iter()
@@ -425,6 +471,12 @@ impl AppState {
             data.instances.retain(|i| i.id != id);
             Ok(())
         })?;
+        self.forget_instance(id);
+        Ok(())
+    }
+
+    /// Deletes a removed instance's secrets, storage file and log book.
+    fn forget_instance(&self, id: &str) {
         self.secrets.remove_instance(id);
         self.logbook.remove(id);
         // A run still in flight saves its storage (and may log) when it
@@ -440,7 +492,6 @@ impl AppState {
             }
             logbook.remove(&owner);
         });
-        Ok(())
     }
 
     pub fn update_settings(&self, id: &str, settings: &Map<String, Value>) -> CommandResult<()> {
@@ -637,10 +688,214 @@ impl AppState {
             CommandError::new("Start with Windows changed, but the choice could not be saved")
         })
     }
+
+    /// Reads a folder's `widget.json` and checks it could be installed.
+    /// Runs nothing and changes nothing.
+    pub fn inspect_folder(&self, path: &str) -> CommandResult<FolderReport> {
+        let reg = self.registry();
+        Ok(self.inspect(&reg, path).0)
+    }
+
+    /// The report, with the folder and manifest when they loaded.
+    fn inspect(&self, reg: &Registry, path: &str) -> (FolderReport, Option<(PathBuf, Manifest)>) {
+        let mut report = FolderReport {
+            folder: path.to_string(),
+            id: String::new(),
+            name: String::new(),
+            version: String::new(),
+            author: String::new(),
+            description: String::new(),
+            permissions: Permissions::default(),
+            errors: Vec::new(),
+        };
+        let folder = match canonical_folder(path) {
+            Ok(f) => f,
+            Err(message) => {
+                report.errors.push(message);
+                return (report, None);
+            }
+        };
+        report.folder = folder.display().to_string();
+        let m = match manifest::load(&folder) {
+            Ok(m) => m,
+            Err(e) => {
+                report.errors.push(manifest_problem(&e));
+                return (report, None);
+            }
+        };
+        report.id = m.id.clone();
+        report.name = m.name.clone();
+        report.version = m.version.clone();
+        report.author = m.author.clone();
+        report.description = m.description.clone();
+        report.permissions = m.permissions.clone();
+        let taken = self.sched.widgets().contains_key(&m.id) || reg.local.contains_key(&m.id);
+        if taken {
+            report.errors.push(format!(
+                "A widget with the id \"{}\" is already installed. Change the id in widget.json, or use Reload on the installed one.",
+                m.id
+            ));
+            return (report, None);
+        }
+        (report, Some((folder, m)))
+    }
+
+    /// Installs the folder as a local widget, used in place, and approves
+    /// its permissions. `shown` is what the user reviewed: if the folder
+    /// now asks for anything more, nothing is installed. Returns the id.
+    pub fn install_local(&self, path: &str, shown: &Permissions) -> CommandResult<String> {
+        let mut reg = self.registry();
+        let (report, loaded) = self.inspect(&reg, path);
+        let Some((folder, m)) = loaded else {
+            let first = report.errors.into_iter().next();
+            return Err(CommandError::new(
+                first.unwrap_or_else(|| "This folder cannot be installed".into()),
+            ));
+        };
+        if !approvals::is_within(&m.permissions, shown) {
+            return Err(permissions_changed());
+        }
+        let id = m.id.clone();
+        reg.approvals.set(&id, m.permissions.clone());
+        reg.local.insert(id.clone(), folder.clone());
+        if let Err(e) = self.save_registry(&reg) {
+            reg.approvals.remove(&id);
+            reg.local.remove(&id);
+            return Err(e);
+        }
+        let entry = approvals::entry(Arc::new(m), folder, reg.approvals.get(&id).as_ref());
+        self.sched.upsert_widget(&id, entry);
+        log::info!("installed local widget {id}");
+        Ok(id)
+    }
+
+    /// Reads a local widget's folder again. Permissions within its approval
+    /// take effect at once; more than that wait for review. A folder that
+    /// fails to load leaves the widget as it was.
+    pub fn reload_widget(&self, id: &str) -> CommandResult<()> {
+        let reg = self.registry();
+        let folder = reg.local.get(id).cloned().ok_or_else(not_local)?;
+        let m = manifest::load(&folder)
+            .map_err(|e| CommandError::new(format!("Cannot reload: {}", manifest_problem(&e))))?;
+        if m.id != id {
+            return Err(CommandError::new(format!(
+                "widget.json now has the id \"{}\". Change it back to \"{id}\", or remove this widget and load the folder again.",
+                m.id
+            )));
+        }
+        let entry = approvals::entry(Arc::new(m), folder, reg.approvals.get(id).as_ref());
+        if entry.blocked.is_some() {
+            log::info!("{id} asks for new permissions; waiting for review");
+        }
+        self.sched.upsert_widget(id, entry);
+        Ok(())
+    }
+
+    /// Approves the widget's current permissions and lets it run. `shown`
+    /// is what the user reviewed; if the widget asks for more, nothing is
+    /// approved.
+    pub fn approve_permissions(&self, id: &str, shown: &Permissions) -> CommandResult<()> {
+        let mut reg = self.registry();
+        let current = self.sched.widgets().remove(id).ok_or_else(unknown_widget)?;
+        let asked = current.manifest.permissions.clone();
+        if !approvals::is_within(&asked, shown) {
+            return Err(permissions_changed());
+        }
+        let before = reg.approvals.get(id);
+        reg.approvals.set(id, asked.clone());
+        if let Err(e) = self.save_registry(&reg) {
+            match before {
+                Some(p) => reg.approvals.set(id, p),
+                None => reg.approvals.remove(id),
+            }
+            return Err(e);
+        }
+        let entry = approvals::entry(current.manifest, current.dir, Some(&asked));
+        self.sched.upsert_widget(id, entry);
+        log::info!("approved the permissions of {id}");
+        Ok(())
+    }
+
+    /// Removes a local widget and every instance of it (with their secrets,
+    /// storage and log books). The user's folder is left alone.
+    pub fn remove_widget(&self, id: &str) -> CommandResult<()> {
+        let mut reg = self.registry();
+        if !reg.local.contains_key(id) {
+            return Err(not_local());
+        }
+        let removed = self.edit(|data| {
+            let ids: Vec<String> = data
+                .instances
+                .iter()
+                .filter(|i| i.widget == id)
+                .map(|i| i.id.clone())
+                .collect();
+            data.instances.retain(|i| i.widget != id);
+            Ok(ids)
+        })?;
+        for inst in &removed {
+            self.forget_instance(inst);
+        }
+        self.sched.remove_widget(id);
+        reg.local.remove(id);
+        reg.approvals.remove(id);
+        self.save_registry(&reg)?;
+        log::info!("removed local widget {id}");
+        Ok(())
+    }
+}
+
+fn not_local() -> CommandError {
+    CommandError::new("Only widgets loaded from a folder can be reloaded or removed")
+}
+
+fn permissions_changed() -> CommandError {
+    CommandError::new("The widget's permissions changed since they were shown. Review them again.")
+}
+
+/// A manifest problem in words for the page.
+fn manifest_problem(e: &ManifestError) -> String {
+    match e {
+        ManifestError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+            "There is no widget.json in this folder".into()
+        }
+        ManifestError::Io(_) => "Cannot read widget.json".into(),
+        other => format!("widget.json: {other}"),
+    }
+}
+
+/// The absolute folder `path` names, without the `\\?\` prefix when the
+/// plain form means the same.
+fn canonical_folder(path: &str) -> Result<PathBuf, String> {
+    let p = Path::new(path);
+    if path.is_empty() || !p.is_absolute() {
+        return Err("Pick a folder".into());
+    }
+    let canonical = std::fs::canonicalize(p).map_err(|_| "Cannot open this folder".to_string())?;
+    if !canonical.is_dir() {
+        return Err("This is not a folder".into());
+    }
+    Ok(simplify(canonical))
+}
+
+fn simplify(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy().into_owned();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => p,
+    }
 }
 
 fn widget_view(id: &str, e: &WidgetEntry, folder: Option<&PathBuf>) -> WidgetView {
     let m = &e.manifest;
+    let added = if e.blocked.is_some() {
+        approvals::added(&m.permissions, &e.approved)
+    } else {
+        Permissions::default()
+    };
     WidgetView {
         id: id.to_string(),
         name: m.name.clone(),
@@ -649,6 +904,7 @@ fn widget_view(id: &str, e: &WidgetEntry, folder: Option<&PathBuf>) -> WidgetVie
         version: m.version.clone(),
         settings: m.settings.clone(),
         permissions: m.permissions.clone(),
+        added,
         local: folder.is_some(),
         blocked: e.blocked.clone(),
         folder: folder.map(|f| f.display().to_string()),
@@ -785,15 +1041,50 @@ pub mod ipc {
     pub fn open_log_folder() -> CommandResult<()> {
         super::open_log_folder()
     }
+
+    #[tauri::command(async)]
+    pub fn inspect_folder(state: State<'_, AppState>, path: String) -> CommandResult<FolderReport> {
+        state.inspect_folder(&path)
+    }
+
+    #[tauri::command(async)]
+    pub fn install_local(
+        state: State<'_, AppState>,
+        path: String,
+        permissions: Permissions,
+    ) -> CommandResult<String> {
+        state.install_local(&path, &permissions)
+    }
+
+    #[tauri::command(async)]
+    pub fn reload_widget(state: State<'_, AppState>, id: String) -> CommandResult<()> {
+        state.reload_widget(&id)
+    }
+
+    #[tauri::command(async)]
+    pub fn approve_permissions(
+        state: State<'_, AppState>,
+        id: String,
+        permissions: Permissions,
+    ) -> CommandResult<()> {
+        state.approve_permissions(&id, &permissions)
+    }
+
+    #[tauri::command(async)]
+    pub fn remove_widget(state: State<'_, AppState>, id: String) -> CommandResult<()> {
+        state.remove_widget(&id)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approvals::{load_local, Approvals, REVIEW_REASON};
     use crate::display::{Color, Frame, TextSize};
     use crate::sandbox::{HttpClient, HttpFuture, HttpRequest, RunError};
     use crate::scheduler::{Runner, Scheduler};
     use serde_json::json;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct NoHttp;
@@ -1220,6 +1511,250 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].level, "warn");
         assert_eq!(lines[0].text, "careful");
+    }
+
+    /// A widget folder outside the data folder, as a user would pick it.
+    fn local_folder(rig: &Rig, id: &str, hosts: &[&str]) -> PathBuf {
+        let dir = rig.dir.path().join("mine").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_manifest(&dir, id, hosts);
+        std::fs::write(
+            dir.join("widget.js"),
+            "export default async function update() { return { text: 'x' }; }",
+        )
+        .unwrap();
+        dir
+    }
+
+    fn write_manifest(dir: &std::path::Path, id: &str, hosts: &[&str]) {
+        let json = json!({
+            "id": id, "name": "Mine", "author": "Me", "version": "1.2.3",
+            "description": "Local one", "formatVersion": 1,
+            "permissions": {"network": hosts}
+        });
+        std::fs::write(dir.join("widget.json"), json.to_string()).unwrap();
+    }
+
+    fn network(hosts: &[&str]) -> Permissions {
+        Permissions {
+            network: hosts.iter().map(|h| h.to_string()).collect(),
+            ..Permissions::default()
+        }
+    }
+
+    fn approved_on_disk(rig: &Rig, id: &str) -> Option<Permissions> {
+        Approvals::load(&rig.dir.path().join("approvals.json")).get(id)
+    }
+
+    fn path_str(p: &std::path::Path) -> String {
+        p.display().to_string()
+    }
+
+    #[tokio::test]
+    async fn inspect_reports_bad_manifest() {
+        let rig = Rig::start();
+        let empty = rig.dir.path().join("mine").join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let report = rig.state.inspect_folder(&path_str(&empty)).unwrap();
+        assert!(!report.errors.is_empty());
+        assert!(rig
+            .state
+            .install_local(&path_str(&empty), &network(&[]))
+            .is_err());
+        let view = rig.state.get_state().unwrap();
+        assert_eq!(view.widgets.len(), 1);
+        assert!(!rig.dir.path().join("local.json").exists());
+
+        // widget.js is required too, and nothing in the folder runs.
+        let no_js = rig.dir.path().join("mine").join("no-js");
+        std::fs::create_dir_all(&no_js).unwrap();
+        write_manifest(&no_js, "no-js", &[]);
+        let report = rig.state.inspect_folder(&path_str(&no_js)).unwrap();
+        assert!(report.errors.iter().any(|e| e.contains("widget.js")));
+    }
+
+    #[tokio::test]
+    async fn inspect_reports_id_collision() {
+        let rig = Rig::start();
+        let btc: Arc<Manifest> = Arc::new(
+            serde_json::from_value(
+                json!({"id": "bitcoin-price", "name": "Bitcoin", "formatVersion": 1}),
+            )
+            .unwrap(),
+        );
+        rig.state.sched.upsert_widget(
+            "bitcoin-price",
+            WidgetEntry::bundled(btc, rig.dir.path().join("widgets").join("bitcoin-price")),
+        );
+        let dir = local_folder(&rig, "bitcoin-price", &["evil.example.com"]);
+        let report = rig.state.inspect_folder(&path_str(&dir)).unwrap();
+        assert_eq!(report.id, "bitcoin-price");
+        assert!(report.errors.iter().any(|e| e.contains("bitcoin-price")));
+        assert!(rig
+            .state
+            .install_local(&path_str(&dir), &network(&["evil.example.com"]))
+            .is_err());
+        let widgets = rig.state.sched.widgets();
+        assert!(widgets["bitcoin-price"]
+            .manifest
+            .permissions
+            .network
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn install_local_registers_and_approves() {
+        let rig = Rig::start();
+        let dir = local_folder(&rig, "mine", &["api.example.com"]);
+        let report = rig.state.inspect_folder(&path_str(&dir)).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.id, "mine");
+        assert_eq!(report.name, "Mine");
+        assert_eq!(report.author, "Me");
+        assert_eq!(report.version, "1.2.3");
+        assert_eq!(report.description, "Local one");
+        assert_eq!(report.permissions, network(&["api.example.com"]));
+
+        // Permissions other than the ones shown are not approved.
+        let e = rig
+            .state
+            .install_local(&path_str(&dir), &network(&[]))
+            .unwrap_err();
+        assert!(e.message.contains("changed"), "{}", e.message);
+        assert_eq!(approved_on_disk(&rig, "mine"), None);
+
+        let id = rig
+            .state
+            .install_local(&path_str(&dir), &report.permissions)
+            .unwrap();
+        assert_eq!(id, "mine");
+        assert_eq!(
+            approved_on_disk(&rig, "mine"),
+            Some(network(&["api.example.com"]))
+        );
+        let local = load_local(&rig.dir.path().join("local.json"));
+        assert_eq!(
+            local["mine"],
+            simplify(std::fs::canonicalize(&dir).unwrap())
+        );
+        assert!(!local["mine"].display().to_string().starts_with(r"\\?\"));
+
+        let view = rig.state.get_state().unwrap();
+        let w = view.widgets.iter().find(|w| w.id == "mine").unwrap();
+        assert!(w.local);
+        assert!(w.folder.is_some());
+        assert_eq!(w.blocked, None);
+        let entry = &rig.state.sched.widgets()["mine"];
+        assert_eq!(entry.approved, network(&["api.example.com"]));
+        rig.state.add_instance("mine").unwrap();
+
+        // Installing it twice is a collision.
+        let again = rig.state.inspect_folder(&path_str(&dir)).unwrap();
+        assert!(!again.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reload_with_new_host_blocks_until_approved() {
+        let rig = Rig::start();
+        let dir = local_folder(&rig, "mine", &["a.example.com"]);
+        rig.state
+            .install_local(&path_str(&dir), &network(&["a.example.com"]))
+            .unwrap();
+        let inst = rig.state.add_instance("mine").unwrap();
+
+        write_manifest(&dir, "mine", &["a.example.com", "b.example.com"]);
+        rig.state.reload_widget("mine").unwrap();
+        let view = rig.state.get_state().unwrap();
+        let w = view.widgets.iter().find(|w| w.id == "mine").unwrap();
+        assert_eq!(w.blocked.as_deref(), Some(REVIEW_REASON));
+        assert_eq!(w.added, network(&["b.example.com"]));
+        let i = view.instances.iter().find(|i| i.id == inst).unwrap();
+        assert_eq!(i.status.state, "blocked");
+        // The new host never reaches the sandbox before Allow.
+        let entry = &rig.state.sched.widgets()["mine"];
+        assert!(!entry
+            .approved
+            .network
+            .contains(&"b.example.com".to_string()));
+        assert_eq!(
+            approved_on_disk(&rig, "mine"),
+            Some(network(&["a.example.com"]))
+        );
+
+        // Allow approves only what the page showed.
+        assert!(rig
+            .state
+            .approve_permissions("mine", &network(&["a.example.com"]))
+            .is_err());
+        assert!(rig.state.sched.widgets()["mine"].blocked.is_some());
+
+        let both = network(&["a.example.com", "b.example.com"]);
+        rig.state.approve_permissions("mine", &both).unwrap();
+        let view = rig.state.get_state().unwrap();
+        let w = view.widgets.iter().find(|w| w.id == "mine").unwrap();
+        assert_eq!(w.blocked, None);
+        assert_eq!(w.added, Permissions::default());
+        assert_eq!(rig.state.sched.widgets()["mine"].approved, both);
+        assert_eq!(approved_on_disk(&rig, "mine"), Some(both));
+    }
+
+    #[tokio::test]
+    async fn reload_with_fewer_permissions_does_not_block() {
+        let rig = Rig::start();
+        let dir = local_folder(&rig, "mine", &["a.example.com", "b.example.com"]);
+        rig.state
+            .install_local(
+                &path_str(&dir),
+                &network(&["a.example.com", "b.example.com"]),
+            )
+            .unwrap();
+        write_manifest(&dir, "mine", &["A.example.com"]);
+        rig.state.reload_widget("mine").unwrap();
+        let entry = &rig.state.sched.widgets()["mine"];
+        assert_eq!(entry.blocked, None);
+        assert_eq!(entry.manifest.permissions, network(&["A.example.com"]));
+
+        // A broken folder leaves the loaded widget as it was.
+        std::fs::write(dir.join("widget.json"), "{").unwrap();
+        assert!(rig.state.reload_widget("mine").is_err());
+        assert!(rig.state.sched.widgets().contains_key("mine"));
+        // A changed id is refused.
+        write_manifest(&dir, "other", &[]);
+        assert!(rig.state.reload_widget("mine").is_err());
+        // Only local widgets reload.
+        assert!(rig.state.reload_widget("w").is_err());
+    }
+
+    #[tokio::test]
+    async fn remove_widget_keeps_user_folder() {
+        let rig = Rig::start();
+        let dir = local_folder(&rig, "mine", &[]);
+        rig.state
+            .install_local(&path_str(&dir), &network(&[]))
+            .unwrap();
+        let a = rig.state.add_instance("mine").unwrap();
+        let b = rig.state.add_instance("mine").unwrap();
+        let other = rig.state.add_instance("w").unwrap();
+        let storage = rig.dir.path().join("storage").join(format!("{a}.json"));
+        std::fs::create_dir_all(storage.parent().unwrap()).unwrap();
+        std::fs::write(&storage, "{}").unwrap();
+        rig.state.logbook.push(&b, LogLevel::Info, "hi".into());
+
+        // Bundled widgets cannot be removed this way.
+        assert!(rig.state.remove_widget("w").is_err());
+
+        rig.state.remove_widget("mine").unwrap();
+        assert!(dir.join("widget.json").is_file());
+        assert!(dir.join("widget.js").is_file());
+        let view = rig.state.get_state().unwrap();
+        assert!(view.widgets.iter().all(|w| w.id != "mine"));
+        let ids: Vec<&str> = view.instances.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, [other.as_str()]);
+        assert!(!storage.exists());
+        assert!(rig.state.logbook.lines(&b).is_empty());
+        assert_eq!(approved_on_disk(&rig, "mine"), None);
+        assert!(!load_local(&rig.dir.path().join("local.json")).contains_key("mine"));
+        assert!(rig.state.remove_widget("mine").is_err());
     }
 
     #[test]

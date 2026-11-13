@@ -3,6 +3,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 
 export type SettingKind =
   | "text"
@@ -37,9 +38,24 @@ export interface WidgetView {
   version: string;
   settings: SettingField[];
   permissions: Permissions;
+  /** What the manifest asks for beyond the approval, while blocked. */
+  added: Permissions;
   local: boolean;
   blocked: string | null;
   folder: string | null;
+}
+
+/** What inspect_folder found in a folder. All text comes from the folder. */
+export interface FolderReport {
+  folder: string;
+  id: string;
+  name: string;
+  version: string;
+  author: string;
+  description: string;
+  permissions: Permissions;
+  /** Why the folder cannot be installed; empty when it can. */
+  errors: string[];
 }
 
 export interface StatusView {
@@ -138,6 +154,21 @@ export const refreshNow = (id: string) => call<void>("refresh_now", { id });
 export const getLogs = (id: string) => call<LogLine[]>("get_logs", { id });
 export const setAutostart = (on: boolean) => call<void>("set_autostart", { on });
 export const openLogFolder = () => call<void>("open_log_folder");
+export const inspectFolder = (path: string) => call<FolderReport>("inspect_folder", { path });
+/** `permissions` is what the user reviewed; anything more is refused. */
+export const installLocal = (path: string, permissions: Permissions) =>
+  call<string>("install_local", { path, permissions });
+export const reloadWidget = (id: string) => call<void>("reload_widget", { id });
+/** `permissions` is what the user reviewed; anything more is refused. */
+export const approvePermissions = (id: string, permissions: Permissions) =>
+  call<void>("approve_permissions", { id, permissions });
+export const removeWidget = (id: string) => call<void>("remove_widget", { id });
+
+/** The native folder picker. Resolves to null when cancelled. */
+export async function pickFolder(): Promise<string | null> {
+  const picked = await open({ directory: true, multiple: false, title: "Load widget from folder" });
+  return typeof picked === "string" ? picked : null;
+}
 
 /** Widget state changed (at most every 300 ms). */
 export function onStateChanged(cb: () => void): Promise<UnlistenFn> {

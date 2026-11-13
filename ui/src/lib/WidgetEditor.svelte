@@ -3,8 +3,11 @@
   // drafts (typed but not saved) belong to the instance shown. A state
   // refresh updates the saved values but keeps every draft.
   import {
+    approvePermissions,
     refreshNow,
+    reloadWidget,
     removeInstance,
+    removeWidget,
     setMaxWidth,
     updateSettings,
     type CommandError,
@@ -25,6 +28,7 @@
   } from "./form";
   import ListField from "./ListField.svelte";
   import LogView from "./LogView.svelte";
+  import PermissionReview from "./PermissionReview.svelte";
   import SecretField from "./SecretField.svelte";
   import SettingField from "./SettingField.svelte";
   import { createSaver, type Slot } from "./saving";
@@ -57,7 +61,9 @@
   });
   let notice: string | null = $state(null);
   let confirmRemove = $state(false);
+  let confirmRemoveWidget = $state(false);
   let busy = $state(false);
+  let reviewError: string | null = $state(null);
 
   function settingSlot(key: string): Slot {
     return {
@@ -162,6 +168,53 @@
     }
   }
 
+  /** Lets a widget whose permissions grew run with them. */
+  async function allow() {
+    if (!widget) return;
+    busy = true;
+    reviewError = null;
+    try {
+      await approvePermissions(widget.id, widget.permissions);
+      await onchanged();
+    } catch (e) {
+      reviewError = (e as CommandError).message;
+    } finally {
+      busy = false;
+    }
+  }
+
+  /** Reads a local widget's folder again. */
+  async function reload() {
+    if (!widget) return;
+    busy = true;
+    notice = null;
+    try {
+      await reloadWidget(widget.id);
+      await onchanged();
+    } catch (e) {
+      notice = (e as CommandError).message;
+    } finally {
+      busy = false;
+    }
+  }
+
+  /** Removes a local widget and all its instances; the folder stays. */
+  async function uninstall() {
+    if (!widget) return;
+    busy = true;
+    notice = null;
+    try {
+      await removeWidget(widget.id);
+      onremoved();
+      await onchanged();
+    } catch (e) {
+      notice = (e as CommandError).message;
+      confirmRemoveWidget = false;
+    } finally {
+      busy = false;
+    }
+  }
+
   const status = $derived(statusLine(instance));
 </script>
 
@@ -177,6 +230,26 @@
   </header>
 
   {#if notice}<p class="notice field-error" role="alert">{notice}</p>{/if}
+
+  {#if widget?.local}
+    <p class="local muted">
+      <span class="badge">Local: not reviewed</span>
+      {#if widget.folder}<span class="folder">{widget.folder}</span>{/if}
+    </p>
+  {/if}
+
+  {#if widget?.blocked}
+    <section class="card" aria-label="Permission review">
+      <PermissionReview
+        permissions={widget.added}
+        intro={`${widget.name} now asks for more than you allowed. It stays off the taskbar until you allow:`}
+        confirmLabel="Allow"
+        {busy}
+        error={reviewError}
+        onconfirm={allow}
+      />
+    </section>
+  {/if}
 
   {#if !widget}
     <p class="card muted">This widget is not installed, so its settings cannot be shown.</p>
@@ -257,6 +330,9 @@
         Refresh now
       </button>
     {/if}
+    {#if widget?.local}
+      <button type="button" class="btn" disabled={busy} onclick={reload}>Reload</button>
+    {/if}
     {#if confirmRemove}
       <span class="confirm" role="group" aria-label="Confirm removal">
         <span>Remove {label} from the taskbar?</span>
@@ -268,6 +344,17 @@
         <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.5 8.5h6l.5-8.5" /></svg>
         Remove from taskbar
       </button>
+    {/if}
+    {#if widget?.local}
+      {#if confirmRemoveWidget}
+        <span class="confirm" role="group" aria-label="Confirm widget removal">
+          <span>Remove {widget.name} and all of its widgets from the taskbar? The folder stays.</span>
+          <button type="button" class="btn accent" disabled={busy} onclick={uninstall}>Remove widget</button>
+          <button type="button" class="btn" disabled={busy} onclick={() => (confirmRemoveWidget = false)}>Cancel</button>
+        </span>
+      {:else}
+        <button type="button" class="btn danger" onclick={() => (confirmRemoveWidget = true)}>Remove widget</button>
+      {/if}
     {/if}
   </div>
 
@@ -310,6 +397,22 @@
 
   .notice {
     margin: 0;
+  }
+
+  .local {
+    margin: 0;
+    display: grid;
+    gap: 2px;
+    font-size: 12px;
+    line-height: 16px;
+  }
+
+  .badge {
+    font-style: italic;
+  }
+
+  .folder {
+    overflow-wrap: anywhere;
   }
 
   .card {

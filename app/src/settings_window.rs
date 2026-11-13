@@ -250,6 +250,11 @@ pub fn invoke_handler<R: Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + 
         ipc::get_logs,
         ipc::set_autostart,
         ipc::open_log_folder,
+        ipc::inspect_folder,
+        ipc::install_local,
+        ipc::reload_widget,
+        ipc::approve_permissions,
+        ipc::remove_widget,
     ]
 }
 

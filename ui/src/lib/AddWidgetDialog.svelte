@@ -1,34 +1,86 @@
 <script lang="ts">
   // Lists the installed widgets; picking one adds it to the taskbar.
-  import { addInstance, type CommandError, type WidgetView } from "../api";
+  // "Load from folder..." reads a widget folder and shows its permissions
+  // before anything is installed. Text from the folder is untrusted and
+  // goes through text bindings only.
+  import {
+    addInstance,
+    inspectFolder,
+    installLocal,
+    pickFolder,
+    type CommandError,
+    type FolderReport,
+    type WidgetView,
+  } from "../api";
+  import PermissionReview from "./PermissionReview.svelte";
 
   interface Props {
     open: boolean;
     widgets: WidgetView[];
     onadded: (id: string) => void;
+    /** Refetches the state; resolves once the new state is in. */
+    onchanged: () => Promise<void>;
     onclose: () => void;
   }
 
-  let { open, widgets, onadded, onclose }: Props = $props();
+  let { open, widgets, onadded, onchanged, onclose }: Props = $props();
 
   let dialog: HTMLDialogElement | undefined = $state();
   let error: string | null = $state(null);
   let busy = $state(false);
+  /** The folder under review, if any. */
+  let report: FolderReport | null = $state(null);
 
   $effect(() => {
     if (!dialog) return;
     if (open && !dialog.open) {
       error = null;
+      report = null;
       dialog.showModal();
     } else if (!open && dialog.open) {
       dialog.close();
     }
   });
 
-  function meta(w: WidgetView): string {
+  function meta(w: Pick<WidgetView, "author" | "version">): string {
     return [w.author ? `By ${w.author}` : "", w.version ? `version ${w.version}` : ""]
       .filter(Boolean)
       .join(", ");
+  }
+
+  async function loadFolder() {
+    error = null;
+    let path: string | null;
+    try {
+      path = await pickFolder();
+    } catch {
+      error = "Cannot open the folder picker";
+      return;
+    }
+    if (path === null) return;
+    busy = true;
+    try {
+      report = await inspectFolder(path);
+    } catch (e) {
+      error = (e as CommandError).message;
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function install() {
+    if (!report) return;
+    busy = true;
+    error = null;
+    try {
+      await installLocal(report.folder, report.permissions);
+      report = null;
+      await onchanged();
+    } catch (e) {
+      error = (e as CommandError).message;
+    } finally {
+      busy = false;
+    }
   }
 
   async function pick(w: WidgetView) {
@@ -46,8 +98,41 @@
 </script>
 
 <dialog bind:this={dialog} aria-labelledby="add-title" onclose={onclose}>
-  <h2 id="add-title">Add widget</h2>
-  {#if widgets.length === 0}
+  <h2 id="add-title">{report ? "Load from folder" : "Add widget"}</h2>
+  {#if report}
+    <div class="report">
+      {#if report.name}
+        <p class="name">{report.name}</p>
+        {#if report.description}<p class="desc">{report.description}</p>{/if}
+        <p class="meta">{meta(report)}</p>
+      {/if}
+      <p class="meta folder">{report.folder}</p>
+      <p class="badge">Local: not reviewed</p>
+      {#if report.errors.length > 0}
+        <ul class="errors" role="alert">
+          {#each report.errors as message, i (i)}
+            <li class="field-error">{message}</li>
+          {/each}
+        </ul>
+        {#if error}<p class="field-error" role="alert">{error}</p>{/if}
+        <div class="footer">
+          <button type="button" class="btn" onclick={() => (report = null)}>Back</button>
+        </div>
+      {:else}
+        <PermissionReview
+          permissions={report.permissions}
+          confirmLabel="Install"
+          {busy}
+          {error}
+          onconfirm={install}
+          oncancel={() => {
+            report = null;
+            error = null;
+          }}
+        />
+      {/if}
+    </div>
+  {:else if widgets.length === 0}
     <p class="muted">No widgets are installed.</p>
   {:else}
     <ul>
@@ -57,16 +142,20 @@
             <span class="name">{w.name}</span>
             {#if w.description}<span class="desc">{w.description}</span>{/if}
             <span class="meta">{meta(w)}</span>
+            {#if w.local}<span class="badge">Local: not reviewed</span>{/if}
             {#if w.blocked}<span class="field-error">{w.blocked}</span>{/if}
           </button>
         </li>
       {/each}
     </ul>
   {/if}
-  {#if error}<p class="field-error" role="alert">{error}</p>{/if}
-  <div class="footer">
-    <button type="button" class="btn" onclick={() => dialog?.close()}>Cancel</button>
-  </div>
+  {#if !report}
+    {#if error}<p class="field-error" role="alert">{error}</p>{/if}
+    <div class="footer">
+      <button type="button" class="btn" disabled={busy} onclick={loadFolder}>Load from folder...</button>
+      <button type="button" class="btn" onclick={() => dialog?.close()}>Cancel</button>
+    </div>
+  {/if}
 </dialog>
 
 <style>
@@ -134,6 +223,32 @@
   .footer {
     display: flex;
     justify-content: flex-end;
+    gap: 8px;
     margin-top: 16px;
+  }
+
+  .report {
+    display: grid;
+    gap: 8px;
+  }
+
+  .report p {
+    margin: 0;
+  }
+
+  .folder {
+    overflow-wrap: anywhere;
+  }
+
+  .errors {
+    margin: 0;
+    padding-left: 20px;
+  }
+
+  .badge {
+    color: var(--text-muted);
+    font-size: 12px;
+    line-height: 16px;
+    font-style: italic;
   }
 </style>

@@ -57,6 +57,21 @@ pub fn log_file() -> PathBuf {
     data_dir().join("perchbar.log")
 }
 
+/// File name of the approved permissions per widget, in the data folder.
+pub const APPROVALS_FILE: &str = "approvals.json";
+/// File name of the local widget folders, in the data folder.
+pub const LOCAL_FILE: &str = "local.json";
+
+/// `{ "<widget-id>": Permissions }`: what the user approved.
+pub fn approvals_file() -> PathBuf {
+    data_dir().join(APPROVALS_FILE)
+}
+
+/// `{ "<widget-id>": "<absolute folder>" }`: widgets used in place.
+pub fn local_file() -> PathBuf {
+    data_dir().join(LOCAL_FILE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,5 +103,7 @@ mod tests {
         assert_eq!(secrets_file("abc"), d.join("secrets").join("abc.bin"));
         assert_eq!(prefs_file(), d.join("app.json"));
         assert_eq!(log_file(), d.join("perchbar.log"));
+        assert_eq!(approvals_file(), d.join("approvals.json"));
+        assert_eq!(local_file(), d.join("local.json"));
     }
 }

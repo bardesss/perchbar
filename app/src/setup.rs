@@ -5,8 +5,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::approvals::{self, Approvals, LocalFolders};
 use crate::instances::Instances;
 use crate::manifest::{self, Manifest};
+use crate::scheduler::WidgetEntry;
 
 /// A widget folder compiled into the binary.
 pub struct Template {
@@ -103,6 +105,73 @@ pub fn load_widgets(dir: &Path) -> HashMap<String, (Arc<Manifest>, PathBuf)> {
     widgets
 }
 
+/// Records the bundled templates' own permissions as approved: for the
+/// templates just `copied`, and for any template with no approval yet (an
+/// install from before approvals existed). Returns whether anything changed.
+pub fn approve_bundled(approvals: &mut Approvals, copied: &[&str]) -> bool {
+    let mut changed = false;
+    for t in BUNDLED {
+        if !copied.contains(&t.id) && approvals.get(t.id).is_some() {
+            continue;
+        }
+        let Some((_, json)) = t.files.iter().find(|(name, _)| *name == "widget.json") else {
+            continue;
+        };
+        match serde_json::from_str::<Manifest>(json) {
+            Ok(m) => {
+                if approvals.get(t.id).as_ref() != Some(&m.permissions) {
+                    approvals.set(t.id, m.permissions);
+                    changed = true;
+                }
+            }
+            Err(e) => log::warn!("the {} template does not parse: {e}", t.id),
+        }
+    }
+    changed
+}
+
+/// Adds the local widgets in `local` to `widgets`. One whose folder is
+/// missing or broken, whose manifest has another id, or whose id is already
+/// taken is logged and left out; its instances stay in the data.
+pub fn add_local(widgets: &mut HashMap<String, (Arc<Manifest>, PathBuf)>, local: &LocalFolders) {
+    for (id, dir) in local {
+        if widgets.contains_key(id) {
+            log::warn!("skipping local widget {id}: an installed widget has that id");
+            continue;
+        }
+        match manifest::load(dir) {
+            Ok(m) if &m.id != id => log::warn!(
+                "skipping local widget {id}: {} now has the id {}",
+                dir.display(),
+                m.id
+            ),
+            Ok(m) => {
+                widgets.insert(id.clone(), (Arc::new(m), dir.clone()));
+            }
+            Err(e) => log::warn!("skipping local widget {id} in {}: {e}", dir.display()),
+        }
+    }
+}
+
+/// The scheduler entries: each widget runs with its approved permissions,
+/// or waits for review when it asks for more.
+pub fn entries(
+    widgets: HashMap<String, (Arc<Manifest>, PathBuf)>,
+    approvals: &Approvals,
+) -> HashMap<String, WidgetEntry> {
+    widgets
+        .into_iter()
+        .map(|(id, (m, dir))| {
+            let approved = approvals.get(&id);
+            let e = approvals::entry(m, dir, approved.as_ref());
+            if e.blocked.is_some() {
+                log::info!("{id} asks for permissions not approved yet; waiting for review");
+            }
+            (id, e)
+        })
+        .collect()
+}
+
 /// On a first run (no instances yet) adds one instance of each first-run
 /// widget that is installed. Returns whether anything was added.
 pub fn seed_first_run(
@@ -126,6 +195,7 @@ pub fn seed_first_run(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::HashSet;
 
     fn manifest(id: &str) -> Arc<Manifest> {
         Arc::new(serde_json::from_value(json!({"id": id, "name": id, "formatVersion": 1})).unwrap())
@@ -193,6 +263,70 @@ mod tests {
         let mut ids: Vec<String> = load_widgets(dir.path()).into_keys().collect();
         ids.sort();
         assert_eq!(ids, ["bitcoin-price", "world-clock"]);
+    }
+
+    #[test]
+    fn bundled_templates_are_approved() {
+        let dir = tempfile::tempdir().unwrap();
+        let copied = install_bundled(dir.path()).unwrap();
+        let mut approvals = Approvals::default();
+        assert!(approve_bundled(&mut approvals, &copied));
+        let btc = approvals.get("bitcoin-price").unwrap();
+        assert_eq!(btc.network, ["api.coinbase.com"]);
+        assert!(approvals.get("world-clock").is_some());
+        // Nothing new the second time.
+        assert!(!approve_bundled(&mut approvals, &[]));
+
+        // Installed with their approvals, the templates run unblocked.
+        let entries = entries(load_widgets(dir.path()), &approvals);
+        assert_eq!(entries["bitcoin-price"].blocked, None);
+        assert_eq!(entries["bitcoin-price"].approved, btc);
+
+        // A template edited to ask for more waits for review.
+        let json = dir.path().join("bitcoin-price").join("widget.json");
+        let text = std::fs::read_to_string(&json)
+            .unwrap()
+            .replace("api.coinbase.com", "evil.example.com");
+        std::fs::write(&json, text).unwrap();
+        let entries = super::entries(load_widgets(dir.path()), &approvals);
+        assert!(entries["bitcoin-price"].blocked.is_some());
+        assert!(entries["bitcoin-price"]
+            .approved
+            .network
+            .iter()
+            .all(|h| h != "evil.example.com"));
+    }
+
+    #[test]
+    fn missing_local_folder_keeps_instances() {
+        let dir = tempfile::tempdir().unwrap();
+        let widgets_dir = dir.path().join("widgets");
+        install_bundled(&widgets_dir).unwrap();
+        let gone = dir.path().join("gone");
+        let mut local = LocalFolders::new();
+        local.insert("gone-widget".into(), gone);
+        // A local folder with the id of an installed widget is skipped too.
+        let clash = dir.path().join("clash");
+        std::fs::create_dir_all(&clash).unwrap();
+        std::fs::write(
+            clash.join("widget.json"),
+            r#"{"id":"world-clock","name":"Fake","formatVersion":1,"permissions":{"network":["evil.example.com"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(clash.join("widget.js"), "").unwrap();
+        local.insert("world-clock".into(), clash);
+
+        let mut widgets = load_widgets(&widgets_dir);
+        add_local(&mut widgets, &local);
+        assert!(!widgets.contains_key("gone-widget"));
+        assert_eq!(widgets["world-clock"].1, widgets_dir.join("world-clock"));
+
+        let mut data = Instances::default();
+        let m = manifest("gone-widget");
+        let id = data.new_instance(&m);
+        let known: HashSet<String> = widgets.keys().cloned().collect();
+        data.normalize(&known);
+        assert!(data.instances.iter().any(|i| i.id == id));
     }
 
     #[test]
