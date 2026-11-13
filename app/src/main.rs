@@ -62,6 +62,24 @@ fn main() {
         paths::data_dir().display()
     );
 
+    // Dev and test runs (PERCHBAR_DATA_DIR set) must not register themselves
+    // in the real Run key.
+    let dev_mode = std::env::var_os(paths::DATA_DIR_ENV).is_some_and(|v| !v.is_empty());
+    match std::env::current_exe() {
+        Ok(exe) if !dev_mode => {
+            perchbar::prefs::startup(
+                &paths::prefs_file(),
+                &perchbar::prefs::RegistryAutostart { exe: exe.clone() },
+                &exe,
+            );
+        }
+        Ok(exe) => {
+            log::info!("autostart skipped in dev mode");
+            perchbar::prefs::startup(&paths::prefs_file(), &perchbar::prefs::NoAutostart, &exe);
+        }
+        Err(e) => log::warn!("cannot find own exe, Start with Windows unchanged: {e}"),
+    }
+
     let widgets_dir = paths::widgets_dir();
     match setup::install_bundled(&widgets_dir) {
         Ok(copied) if !copied.is_empty() => log::info!("installed templates: {copied:?}"),

@@ -48,6 +48,11 @@ pub fn secrets_file(instance_id: &str) -> PathBuf {
     secrets_dir().join(format!("{instance_id}.bin"))
 }
 
+/// The app preferences (Start with Windows).
+pub fn prefs_file() -> PathBuf {
+    data_dir().join("app.json")
+}
+
 pub fn log_file() -> PathBuf {
     data_dir().join("perchbar.log")
 }
@@ -81,6 +86,7 @@ mod tests {
         assert_eq!(storage_file("abc"), d.join("storage").join("abc.json"));
         assert_eq!(secrets_dir(), d.join("secrets"));
         assert_eq!(secrets_file("abc"), d.join("secrets").join("abc.bin"));
+        assert_eq!(prefs_file(), d.join("app.json"));
         assert_eq!(log_file(), d.join("perchbar.log"));
     }
 }

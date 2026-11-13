@@ -7,6 +7,7 @@ pub mod logbook;
 pub mod logger;
 pub mod manifest;
 pub mod paths;
+pub mod prefs;
 pub mod sandbox;
 pub mod scheduler;
 pub mod secrets;
