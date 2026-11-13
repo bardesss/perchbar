@@ -682,11 +682,19 @@ impl AppState {
     /// Sets the left-to-right order of instances and groups. Ids left out
     /// keep their place at the end.
     pub fn set_order(&self, order: &[String]) -> CommandResult<()> {
+        // Checked before the lock the strip's Hide also takes.
+        if order.len() > validate::ORDER_MAX_ENTRIES {
+            return Err(CommandError::new("The order is too long"));
+        }
         self.edit(|data| {
+            let known: HashSet<&str> = data
+                .instances
+                .iter()
+                .map(|i| i.id.as_str())
+                .chain(data.groups.iter().map(|g| g.id.as_str()))
+                .collect();
             for id in order {
-                let known = data.instances.iter().any(|i| &i.id == id)
-                    || data.groups.iter().any(|g| &g.id == id);
-                if !known {
+                if !known.contains(id.as_str()) {
                     return Err(CommandError::new("The order names a widget that is gone"));
                 }
             }
@@ -1532,6 +1540,19 @@ mod tests {
         assert!(rig.state.add_instance("nope").is_err());
         // A path in place of an id never reaches the disk.
         assert!(rig.state.remove_instance("..\\..\\x").is_err());
+    }
+
+    #[tokio::test]
+    async fn set_order_refuses_an_overlong_list() {
+        let rig = Rig::start();
+        let a = rig.state.add_instance("w").unwrap();
+        let long = vec![a.clone(); validate::ORDER_MAX_ENTRIES + 1];
+        let e = rig.state.set_order(&long).unwrap_err();
+        assert!(e.message.contains("too long"), "{}", e.message);
+        // At the cap the list is checked as usual.
+        let at_cap = vec![a.clone(); validate::ORDER_MAX_ENTRIES];
+        rig.state.set_order(&at_cap).unwrap();
+        rig.state.set_order(&[a]).unwrap();
     }
 
     #[tokio::test]

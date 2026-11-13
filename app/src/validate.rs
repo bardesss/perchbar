@@ -23,6 +23,9 @@ pub const SETTINGS_MAX_BYTES: usize = 16 * 1024;
 pub const MAX_WIDTH_RANGE: std::ops::RangeInclusive<u32> = 40..=600;
 /// Longest group rotation interval, in seconds.
 pub const GROUP_INTERVAL_MAX_SECS: u32 = 3600;
+/// Most ids a `set_order` list may hold. Far more than fit on a taskbar;
+/// it keeps a bad page from holding the scheduler lock for long.
+pub const ORDER_MAX_ENTRIES: usize = 1000;
 
 /// A problem with one setting, shown next to its field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
