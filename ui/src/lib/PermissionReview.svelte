@@ -9,6 +9,8 @@
     permissions: Permissions;
     /** Shown above the list, e.g. what changed. */
     intro?: string;
+    /** A warning shown before everything else. */
+    notice?: string;
     confirmLabel: string;
     busy?: boolean;
     error?: string | null;
@@ -16,12 +18,13 @@
     oncancel?: () => void;
   }
 
-  let { permissions, intro, confirmLabel, busy = false, error = null, onconfirm, oncancel }: Props = $props();
+  let { permissions, intro, notice, confirmLabel, busy = false, error = null, onconfirm, oncancel }: Props = $props();
 
   const lines = $derived(permissionLines(permissions));
 </script>
 
 <section class="review" aria-label="Permissions">
+  {#if notice}<p class="notice" role="note">{notice}</p>{/if}
   {#if intro}<p class="intro">{intro}</p>{/if}
   {#each lines as line (line.lead)}
     <div class="line">
@@ -52,6 +55,12 @@
 
   p {
     margin: 0;
+  }
+
+  .notice {
+    padding: 8px 12px;
+    border: 1px solid var(--danger);
+    border-radius: var(--radius);
   }
 
   .lead {

@@ -1,7 +1,7 @@
 // The permission review text (spec 5.4). Items come from a widget folder
 // and are shown only through text bindings.
 
-import type { Permissions } from "../api";
+import type { Permissions, ReplacedView } from "../api";
 
 export interface PermissionLine {
   lead: string;
@@ -24,4 +24,13 @@ export function permissionLines(p: Permissions): PermissionLine[] {
 export function reviewIntro(name: string, firstReview: boolean): string | undefined {
   if (firstReview) return undefined;
   return `${name} now asks for more than you allowed. It stays off the taskbar until you allow:`;
+}
+
+/** What installing over a missing local widget carries over. */
+export function replaceNotice(id: string, r: ReplacedView): string {
+  const head = `This replaces ${id}, whose folder is missing (${r.folder}).`;
+  if (r.instances === 0) return head;
+  const one = r.instances === 1;
+  const what = r.secrets ? "settings and saved keys" : "settings";
+  return `${head} Its ${r.instances} ${one ? "widget" : "widgets"} on your taskbar ${one ? "keeps its" : "keep their"} ${what}.`;
 }

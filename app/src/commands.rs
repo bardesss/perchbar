@@ -144,8 +144,24 @@ pub struct FolderReport {
     pub author: String,
     pub description: String,
     pub permissions: Permissions,
+    /// Set when the id is a local widget whose folder is missing: installing
+    /// points that widget at this folder, and its instances (settings and
+    /// saved secrets) carry over.
+    pub replaces: Option<ReplacedView>,
     /// Why the folder cannot be installed; empty when it can.
     pub errors: Vec<String>,
+}
+
+/// The missing local widget an install would replace.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplacedView {
+    /// Its old folder.
+    pub folder: String,
+    /// How many of its instances are on the taskbar.
+    pub instances: usize,
+    /// Whether any of them has a saved secret.
+    pub secrets: bool,
 }
 
 /// One installed widget, as the page lists it.
@@ -811,6 +827,7 @@ impl AppState {
             author: String::new(),
             description: String::new(),
             permissions: Permissions::default(),
+            replaces: None,
             errors: Vec::new(),
         };
         let folder = match canonical_folder(path) {
@@ -851,13 +868,37 @@ impl AppState {
             report.errors.push(message);
             return (report, None);
         }
+        if let LocalKind::Missing(old) = reg.kind(&widgets, &m.id) {
+            if !same_dir(&old, &folder) {
+                let ids: Vec<String> = self
+                    .sched
+                    .snapshot()
+                    .instances
+                    .into_iter()
+                    .filter(|i| i.widget == m.id)
+                    .map(|i| i.id)
+                    .collect();
+                report.replaces = Some(ReplacedView {
+                    folder: old.display().to_string(),
+                    instances: ids.len(),
+                    secrets: ids.iter().any(|i| !self.secrets.keys_set(i).is_empty()),
+                });
+            }
+        }
         (report, Some((folder, m)))
     }
 
     /// Installs the folder as a local widget, used in place, and approves
     /// its permissions. `shown` is what the user reviewed: if the folder
-    /// now asks for anything more, nothing is installed. Returns the id.
-    pub fn install_local(&self, path: &str, shown: &Permissions) -> CommandResult<String> {
+    /// now asks for anything more, nothing is installed. Pointing a missing
+    /// local widget (and its instances) at this folder needs `replace`.
+    /// Returns the id.
+    pub fn install_local(
+        &self,
+        path: &str,
+        shown: &Permissions,
+        replace: bool,
+    ) -> CommandResult<String> {
         let mut reg = self.registry();
         let (report, loaded) = self.inspect(&reg, path);
         let Some((folder, m)) = loaded else {
@@ -868,6 +909,12 @@ impl AppState {
         };
         if !approvals::is_within(&m.permissions, shown) {
             return Err(permissions_changed());
+        }
+        if report.replaces.is_some() && !replace {
+            return Err(CommandError::new(format!(
+                "This folder would replace the missing widget \"{}\" and take over its widgets on the taskbar. Review it again and confirm the replace.",
+                m.id
+            )));
         }
         let id = m.id.clone();
         let mut next = reg.clone();
@@ -1175,8 +1222,9 @@ pub mod ipc {
         state: State<'_, AppState>,
         path: String,
         permissions: Permissions,
+        replace: bool,
     ) -> CommandResult<String> {
-        state.install_local(&path, &permissions)
+        state.install_local(&path, &permissions, replace)
     }
 
     #[tauri::command(async)]
@@ -1699,7 +1747,7 @@ mod tests {
         assert!(!report.errors.is_empty());
         assert!(rig
             .state
-            .install_local(&path_str(&empty), &network(&[]))
+            .install_local(&path_str(&empty), &network(&[]), false)
             .is_err());
         let view = rig.state.get_state().unwrap();
         assert_eq!(view.widgets.len(), 1);
@@ -1732,7 +1780,7 @@ mod tests {
         assert!(report.errors.iter().any(|e| e.contains("bitcoin-price")));
         assert!(rig
             .state
-            .install_local(&path_str(&dir), &network(&["evil.example.com"]))
+            .install_local(&path_str(&dir), &network(&["evil.example.com"]), false)
             .is_err());
         let widgets = rig.state.sched.widgets();
         assert!(widgets["bitcoin-price"]
@@ -1758,14 +1806,14 @@ mod tests {
         // Permissions other than the ones shown are not approved.
         let e = rig
             .state
-            .install_local(&path_str(&dir), &network(&[]))
+            .install_local(&path_str(&dir), &network(&[]), false)
             .unwrap_err();
         assert!(e.message.contains("changed"), "{}", e.message);
         assert_eq!(approved_on_disk(&rig, "mine"), None);
 
         let id = rig
             .state
-            .install_local(&path_str(&dir), &report.permissions)
+            .install_local(&path_str(&dir), &report.permissions, false)
             .unwrap();
         assert_eq!(id, "mine");
         assert_eq!(
@@ -1798,7 +1846,7 @@ mod tests {
         let rig = Rig::start();
         let dir = local_folder(&rig, "mine", &["a.example.com"]);
         rig.state
-            .install_local(&path_str(&dir), &network(&["a.example.com"]))
+            .install_local(&path_str(&dir), &network(&["a.example.com"]), false)
             .unwrap();
         let inst = rig.state.add_instance("mine").unwrap();
 
@@ -1846,6 +1894,7 @@ mod tests {
             .install_local(
                 &path_str(&dir),
                 &network(&["a.example.com", "b.example.com"]),
+                false,
             )
             .unwrap();
         write_manifest(&dir, "mine", &["A.example.com"]);
@@ -1870,7 +1919,7 @@ mod tests {
         let rig = Rig::start();
         let dir = local_folder(&rig, "mine", &[]);
         rig.state
-            .install_local(&path_str(&dir), &network(&[]))
+            .install_local(&path_str(&dir), &network(&[]), false)
             .unwrap();
         let a = rig.state.add_instance("mine").unwrap();
         let b = rig.state.add_instance("mine").unwrap();
@@ -1958,7 +2007,7 @@ mod tests {
         let rig = Rig::start();
         let mine = local_folder(&rig, "mine", &[]);
         rig.state
-            .install_local(&path_str(&mine), &network(&[]))
+            .install_local(&path_str(&mine), &network(&[]), false)
             .unwrap();
         // Next start: the copy in widgets wins, local.json still points away.
         let copy = rig.dir.path().join("widgets").join("mine");
@@ -1978,9 +2027,13 @@ mod tests {
         let rig = Rig::start();
         let old = local_folder(&rig, "mine", &[]);
         rig.state
-            .install_local(&path_str(&old), &network(&[]))
+            .install_local(&path_str(&old), &network(&[]), false)
             .unwrap();
+        let old = simplify(std::fs::canonicalize(&old).unwrap());
         let inst = rig.state.add_instance("mine").unwrap();
+        // Nothing to replace while the widget is loaded.
+        let report = rig.state.inspect_folder(&path_str(&old)).unwrap();
+        assert!(report.replaces.is_none());
         // Next start without the folder: the widget is left out.
         std::fs::remove_dir_all(&old).unwrap();
         rig.state.sched.remove_widget("mine");
@@ -1994,15 +2047,32 @@ mod tests {
         std::fs::create_dir_all(&new).unwrap();
         write_manifest(&new, "mine", &["a.example.com"]);
         std::fs::write(new.join("widget.js"), "").unwrap();
+        rig.state.secrets.set(&inst, "apiKey", "sk-kept").unwrap();
         let report = rig.state.inspect_folder(&path_str(&new)).unwrap();
         assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let replaces = report
+            .replaces
+            .expect("the report names the replaced widget");
+        assert_eq!(replaces.folder, path_str(&old));
+        assert_eq!(replaces.instances, 1);
+        assert!(replaces.secrets);
+        let shown = network(&["a.example.com"]);
         // The usual guard still applies.
         assert!(rig
             .state
-            .install_local(&path_str(&new), &network(&[]))
+            .install_local(&path_str(&new), &network(&[]), true)
             .is_err());
+        // Without the explicit replace, nothing changes.
+        let e = rig
+            .state
+            .install_local(&path_str(&new), &shown, false)
+            .unwrap_err();
+        assert!(e.message.contains("replace"), "{}", e.message);
+        assert_eq!(local_on_disk(&rig)["mine"], old);
+        assert!(!rig.state.sched.widgets().contains_key("mine"));
+
         rig.state
-            .install_local(&path_str(&new), &network(&["a.example.com"]))
+            .install_local(&path_str(&new), &shown, true)
             .unwrap();
         assert_eq!(
             local_on_disk(&rig)["mine"],
@@ -2019,7 +2089,7 @@ mod tests {
         let rig = Rig::start();
         let old = local_folder(&rig, "mine", &[]);
         rig.state
-            .install_local(&path_str(&old), &network(&[]))
+            .install_local(&path_str(&old), &network(&[]), false)
             .unwrap();
         let inst = rig.state.add_instance("mine").unwrap();
         std::fs::remove_dir_all(&old).unwrap();
@@ -2036,7 +2106,7 @@ mod tests {
         let rig = Rig::start();
         let dir = local_folder(&rig, "mine", &[]);
         rig.state
-            .install_local(&path_str(&dir), &network(&[]))
+            .install_local(&path_str(&dir), &network(&[]), false)
             .unwrap();
         let inst = rig.state.add_instance("mine").unwrap();
         // The temporary file cannot be written: a folder is in the way.
@@ -2057,7 +2127,9 @@ mod tests {
             std::fs::create_dir(rig.dir.path().join(blocked)).unwrap();
             let shown = network(&["a.example.com"]);
             assert!(
-                rig.state.install_local(&path_str(&dir), &shown).is_err(),
+                rig.state
+                    .install_local(&path_str(&dir), &shown, false)
+                    .is_err(),
                 "{blocked}"
             );
             assert_eq!(approved_on_disk(&rig, "mine"), None, "{blocked}");
@@ -2065,7 +2137,9 @@ mod tests {
             assert!(!rig.state.sched.widgets().contains_key("mine"), "{blocked}");
             // In memory too: the id is free.
             std::fs::remove_dir(rig.dir.path().join(blocked)).unwrap();
-            rig.state.install_local(&path_str(&dir), &shown).unwrap();
+            rig.state
+                .install_local(&path_str(&dir), &shown, false)
+                .unwrap();
         }
     }
 
@@ -2078,7 +2152,7 @@ mod tests {
         let dir = local_folder(&rig, "mine", &[]);
         let e = rig
             .state
-            .install_local(&path_str(&dir), &network(&[]))
+            .install_local(&path_str(&dir), &network(&[]), false)
             .unwrap_err();
         assert!(e.message.contains("approvals.json"), "{}", e.message);
         assert!(rig.dir.path().join("approvals.json").join("keep").is_file());

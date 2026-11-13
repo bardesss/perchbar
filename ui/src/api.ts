@@ -56,8 +56,18 @@ export interface FolderReport {
   author: string;
   description: string;
   permissions: Permissions;
+  /** Set when installing would replace a local widget whose folder is missing. */
+  replaces: ReplacedView | null;
   /** Why the folder cannot be installed; empty when it can. */
   errors: string[];
+}
+
+/** The missing local widget an install would replace. */
+export interface ReplacedView {
+  folder: string;
+  instances: number;
+  /** Whether any of its instances has a saved secret. */
+  secrets: boolean;
 }
 
 export interface StatusView {
@@ -164,9 +174,12 @@ export const getLogs = (id: string) => call<LogLine[]>("get_logs", { id });
 export const setAutostart = (on: boolean) => call<void>("set_autostart", { on });
 export const openLogFolder = () => call<void>("open_log_folder");
 export const inspectFolder = (path: string) => call<FolderReport>("inspect_folder", { path });
-/** `permissions` is what the user reviewed; anything more is refused. */
-export const installLocal = (path: string, permissions: Permissions) =>
-  call<string>("install_local", { path, permissions });
+/**
+ * `permissions` is what the user reviewed; anything more is refused.
+ * `replace` confirms taking over a missing local widget with the same id.
+ */
+export const installLocal = (path: string, permissions: Permissions, replace: boolean) =>
+  call<string>("install_local", { path, permissions, replace });
 export const reloadWidget = (id: string) => call<void>("reload_widget", { id });
 /** `permissions` is what the user reviewed; anything more is refused. */
 export const approvePermissions = (id: string, permissions: Permissions) =>

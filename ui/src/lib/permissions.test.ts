@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import { permissionLines, reviewIntro } from "./permissions";
+import { permissionLines, replaceNotice, reviewIntro } from "./permissions";
 
 const none = { network: [], files: [], sources: [] };
 
@@ -21,4 +21,16 @@ test("kinds with nothing are left out", () =>
 test("a first review has no 'more than you allowed' intro", () => {
   expect(reviewIntro("My Clock", true)).toBeUndefined();
   expect(reviewIntro("My Clock", false)).toMatch(/^My Clock now asks for more than you allowed/);
+});
+
+test("replacing a missing widget says what carries over", () => {
+  expect(replaceNotice("my-clock", { folder: "C:/old", instances: 2, secrets: true })).toBe(
+    "This replaces my-clock, whose folder is missing (C:/old). Its 2 widgets on your taskbar keep their settings and saved keys.",
+  );
+  expect(replaceNotice("my-clock", { folder: "C:/old", instances: 1, secrets: false })).toBe(
+    "This replaces my-clock, whose folder is missing (C:/old). Its 1 widget on your taskbar keeps its settings.",
+  );
+  expect(replaceNotice("my-clock", { folder: "C:/old", instances: 0, secrets: false })).toBe(
+    "This replaces my-clock, whose folder is missing (C:/old).",
+  );
 });

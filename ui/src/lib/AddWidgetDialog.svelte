@@ -15,7 +15,7 @@
     type MissingLocalView,
     type WidgetView,
   } from "../api";
-  import { reviewIntro } from "./permissions";
+  import { replaceNotice, reviewIntro } from "./permissions";
   import PermissionReview from "./PermissionReview.svelte";
 
   interface Props {
@@ -82,7 +82,7 @@
     busy = true;
     error = null;
     try {
-      await installLocal(report.folder, report.permissions);
+      await installLocal(report.folder, report.permissions, report.replaces !== null);
       report = null;
       await onchanged();
     } catch (e) {
@@ -158,7 +158,8 @@
       {:else}
         <PermissionReview
           permissions={report.permissions}
-          confirmLabel="Install"
+          notice={report.replaces ? replaceNotice(report.id, report.replaces) : undefined}
+          confirmLabel={report.replaces ? "Replace and install" : "Install"}
           {busy}
           {error}
           onconfirm={install}
