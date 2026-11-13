@@ -24,12 +24,19 @@ fn resolve_data_dir(
     }
 }
 
+/// Folder name of the installed widgets, in the data folder.
+pub const WIDGETS_DIR: &str = "widgets";
+/// File name of the instance data, in the data folder.
+pub const INSTANCES_FILE: &str = "instances.json";
+/// Folder name of the encrypted secrets, in the data folder.
+pub const SECRETS_DIR: &str = "secrets";
+
 pub fn widgets_dir() -> PathBuf {
-    data_dir().join("widgets")
+    data_dir().join(WIDGETS_DIR)
 }
 
 pub fn instances_file() -> PathBuf {
-    data_dir().join("instances.json")
+    data_dir().join(INSTANCES_FILE)
 }
 
 pub fn storage_file(instance_id: &str) -> PathBuf {
@@ -40,7 +47,7 @@ pub fn storage_file(instance_id: &str) -> PathBuf {
 
 /// The folder of the DPAPI-encrypted secret files.
 pub fn secrets_dir() -> PathBuf {
-    data_dir().join("secrets")
+    data_dir().join(SECRETS_DIR)
 }
 
 /// The DPAPI-encrypted secrets of one instance.

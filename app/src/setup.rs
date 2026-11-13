@@ -1,14 +1,16 @@
 //! First-run setup: the bundled widget templates and the default instances.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::approvals::{self, Approvals, LocalFolders};
-use crate::instances::Instances;
+use crate::instances::{self, Instances};
 use crate::manifest::{self, Manifest};
+use crate::paths;
 use crate::scheduler::WidgetEntry;
+use crate::secrets::{self, SecretStore};
 
 /// A widget folder compiled into the binary.
 pub struct Template {
@@ -223,6 +225,108 @@ pub fn seed_first_run(
         }
     }
     added
+}
+
+/// What Perchbar starts with: the scheduler entries, the instance data and
+/// the secret store.
+pub struct Boot {
+    pub widgets: HashMap<String, WidgetEntry>,
+    pub data: Instances,
+    pub secrets: SecretStore,
+}
+
+/// Prepares a start over `data_dir`: installs missing templates (approving
+/// their permissions), loads the installed and local widgets, loads the
+/// instances (seeding a first run) and moves any secret out of
+/// `instances.json`. Problems are logged; a start always gets a `Boot`.
+pub fn boot(data_dir: &Path) -> Boot {
+    let widgets_dir = data_dir.join(paths::WIDGETS_DIR);
+    let approvals_path = data_dir.join(paths::APPROVALS_FILE);
+    let local_path = data_dir.join(paths::LOCAL_FILE);
+    let instances_path = data_dir.join(paths::INSTANCES_FILE);
+    let save_approvals = |approvals: &Approvals| {
+        if let Err(e) = approvals.save(&approvals_path) {
+            log::warn!("cannot save {}: {e}", approvals_path.display());
+        }
+    };
+    let save_instances = |data: &Instances| {
+        if let Err(e) = instances::save(&instances_path, data) {
+            log::warn!("cannot save {}: {e}", instances_path.display());
+        }
+    };
+
+    let copied = match install_bundled(&widgets_dir) {
+        Ok(copied) => {
+            if !copied.is_empty() {
+                log::info!("installed templates: {copied:?}");
+            }
+            copied
+        }
+        Err(e) => {
+            log::warn!("cannot install bundled templates: {e}");
+            Vec::new()
+        }
+    };
+    let mut approvals = Approvals::load(&approvals_path);
+    if approve_bundled(&mut approvals, &copied) {
+        save_approvals(&approvals);
+    }
+
+    // Installed widgets first; a local one with a taken id is skipped and
+    // dropped from local.json, so it is never mistaken for the installed one.
+    let mut widgets = load_widgets(&widgets_dir);
+    match approvals::load_local(&local_path) {
+        Ok(mut local) => {
+            let shadowed = add_local(&mut widgets, &local);
+            if !shadowed.is_empty() {
+                if drop_shadowed(&mut local, &mut approvals, &shadowed) {
+                    save_approvals(&approvals);
+                }
+                if let Err(e) = approvals::save_local(&local_path, &local) {
+                    log::warn!("cannot save {}: {e}", local_path.display());
+                }
+            }
+        }
+        Err(e) => log::warn!(
+            "cannot read {}: {e}; local widgets are left out",
+            local_path.display()
+        ),
+    }
+    let known: HashSet<String> = widgets.keys().cloned().collect();
+    let mut data = instances::load(&instances_path);
+    // No file after loading: a first run, or a corrupt file that `load` moved
+    // aside. A saved empty strip (the user removed everything) stays empty.
+    let first_run = !instances_path.exists();
+    data.normalize(&known);
+    if first_run && seed_first_run(&mut data, &widgets) {
+        log::info!("first run: added the default widgets");
+        save_instances(&data);
+    }
+    log::info!(
+        "{} widget(s), {} instance(s)",
+        widgets.len(),
+        data.instances.len()
+    );
+
+    // Secret settings never stay in instances.json: move any found there
+    // (hand edits, older builds) into the encrypted store.
+    let secrets = SecretStore::new(data_dir.join(paths::SECRETS_DIR));
+    let manifests: HashMap<String, Arc<Manifest>> = widgets
+        .iter()
+        .map(|(id, (m, _))| (id.clone(), m.clone()))
+        .collect();
+    if secrets::migrate(&mut data, &manifests, &secrets) {
+        log::info!("moved secret settings out of instances.json");
+        save_instances(&data);
+    }
+
+    // Each widget runs with the permissions the user approved; one that
+    // asks for more waits for review in the settings window.
+    Boot {
+        widgets: entries(widgets, &approvals),
+        data,
+        secrets,
+    }
 }
 
 #[cfg(test)]

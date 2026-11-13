@@ -2,20 +2,17 @@
 // Explorer or at sign-in. Debug builds keep the console for log output.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::collections::{HashMap, HashSet};
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use perchbar::approvals::{self, Approvals};
 use perchbar::commands::AppState;
 use perchbar::prefs::{self, Autostart, NoAutostart, RegistryAutostart};
 use perchbar::sandbox::ReqwestClient;
-use perchbar::scheduler::{Scheduler, WidgetEntry};
-use perchbar::secrets::{self, SecretStore};
+use perchbar::scheduler::Scheduler;
 use perchbar::settings_window::{self, ExitDecision, StateBridge};
 use perchbar::strip::{self, StripEvent};
-use perchbar::{instances, logger, paths, setup};
+use perchbar::{logger, paths, setup};
 
 /// Takes the session-wide `Local\Perchbar` mutex. Returns false when another
 /// Perchbar already holds it. The handle is never closed: the mutex lives
@@ -83,83 +80,11 @@ fn main() {
         Err(e) => log::warn!("cannot find own exe, Start with Windows unchanged: {e}"),
     }
 
-    let widgets_dir = paths::widgets_dir();
-    let copied = match setup::install_bundled(&widgets_dir) {
-        Ok(copied) => {
-            if !copied.is_empty() {
-                log::info!("installed templates: {copied:?}");
-            }
-            copied
-        }
-        Err(e) => {
-            log::warn!("cannot install bundled templates: {e}");
-            Vec::new()
-        }
-    };
-    let mut approvals = Approvals::load(&paths::approvals_file());
-    if setup::approve_bundled(&mut approvals, &copied) {
-        if let Err(e) = approvals.save(&paths::approvals_file()) {
-            log::warn!("cannot save {}: {e}", paths::approvals_file().display());
-        }
-    }
-
-    // Installed widgets first; a local one with a taken id is skipped and
-    // dropped from local.json, so it is never mistaken for the installed one.
-    let mut widgets = setup::load_widgets(&widgets_dir);
-    match approvals::load_local(&paths::local_file()) {
-        Ok(mut local) => {
-            let shadowed = setup::add_local(&mut widgets, &local);
-            if !shadowed.is_empty() {
-                if setup::drop_shadowed(&mut local, &mut approvals, &shadowed) {
-                    if let Err(e) = approvals.save(&paths::approvals_file()) {
-                        log::warn!("cannot save {}: {e}", paths::approvals_file().display());
-                    }
-                }
-                if let Err(e) = approvals::save_local(&paths::local_file(), &local) {
-                    log::warn!("cannot save {}: {e}", paths::local_file().display());
-                }
-            }
-        }
-        Err(e) => log::warn!(
-            "cannot read {}: {e}; local widgets are left out",
-            paths::local_file().display()
-        ),
-    }
-    let known: HashSet<String> = widgets.keys().cloned().collect();
-    let mut data = instances::load(&paths::instances_file());
-    // No file after loading: a first run, or a corrupt file that `load` moved
-    // aside. A saved empty strip (the user removed everything) stays empty.
-    let first_run = !paths::instances_file().exists();
-    data.normalize(&known);
-    if first_run && setup::seed_first_run(&mut data, &widgets) {
-        log::info!("first run: added the default widgets");
-        if let Err(e) = instances::save(&paths::instances_file(), &data) {
-            log::warn!("cannot save {}: {e}", paths::instances_file().display());
-        }
-    }
-    log::info!(
-        "{} widget(s), {} instance(s)",
-        widgets.len(),
-        data.instances.len()
-    );
-
-    // Secret settings never stay in instances.json: move any found there
-    // (hand edits, older builds) into the encrypted store.
-    let secret_store = SecretStore::new(paths::secrets_dir());
-    let manifests: HashMap<String, Arc<_>> = widgets
-        .iter()
-        .map(|(id, (m, _))| (id.clone(), m.clone()))
-        .collect();
-    if secrets::migrate(&mut data, &manifests, &secret_store) {
-        log::info!("moved secret settings out of instances.json");
-        if let Err(e) = instances::save(&paths::instances_file(), &data) {
-            log::warn!("cannot save {}: {e}", paths::instances_file().display());
-        }
-    }
-
-    // Each widget runs with the permissions the user approved; one that
-    // asks for more waits for review in the settings window.
-    let widgets: HashMap<String, WidgetEntry> = setup::entries(widgets, &approvals);
+    let setup::Boot {
+        widgets,
+        data,
+        secrets: secret_store,
+    } = setup::boot(&paths::data_dir());
 
     let (tx, rx) = mpsc::channel();
     let publish_tx = tx.clone();
