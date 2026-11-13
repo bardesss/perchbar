@@ -14,7 +14,7 @@
 //! order), so handle methods are safe to call from other threads while it
 //! runs. It must still not call back into the `SchedulerHandle` itself.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -26,9 +26,12 @@ use tokio::task::JoinHandle;
 
 use crate::display::Output;
 use crate::instances::{self, Instances};
-use crate::manifest::Manifest;
+use crate::logbook::{LogBook, LogLevel};
+use crate::manifest::SettingKind;
+use crate::manifest::{Manifest, Permissions};
 use crate::paths;
 use crate::sandbox::{self, HttpClient, Limits, RunContext, RunError};
+use crate::secrets::{Redactor, SecretLoad, SecretStore};
 use crate::strip::model::{Member, Slot, SlotKind, SlotState, StripModel};
 
 const MAX_CONCURRENT_RUNS: usize = 4;
@@ -187,26 +190,107 @@ pub fn next_delay(refresh: u32, consecutive_failures: u32) -> Duration {
     Duration::from_secs((u64::from(refresh) * factor).min(MAX_BACKOFF_SECS))
 }
 
+/// One installed widget as the scheduler sees it.
+#[derive(Debug, Clone)]
+pub struct WidgetEntry {
+    pub manifest: Arc<Manifest>,
+    pub dir: PathBuf,
+    /// The permissions the user approved; runs use these, not the manifest's.
+    pub approved: Permissions,
+    /// Why the widget may not run (shown as the instances' error), if so.
+    pub blocked: Option<String>,
+}
+
+impl WidgetEntry {
+    /// A widget that runs with exactly what its manifest declares (the
+    /// bundled templates).
+    pub fn bundled(manifest: Arc<Manifest>, dir: PathBuf) -> WidgetEntry {
+        WidgetEntry {
+            approved: manifest.permissions.clone(),
+            manifest,
+            dir,
+            blocked: None,
+        }
+    }
+}
+
+/// A `WidgetEntry` with its folder shared, so slots can point at it cheaply.
+struct Widget {
+    manifest: Arc<Manifest>,
+    dir: Arc<PathBuf>,
+    approved: Permissions,
+    blocked: Option<String>,
+}
+
+impl From<WidgetEntry> for Widget {
+    fn from(e: WidgetEntry) -> Widget {
+        Widget {
+            manifest: e.manifest,
+            dir: Arc::new(e.dir),
+            approved: e.approved,
+            blocked: e.blocked,
+        }
+    }
+}
+
 struct Running {
     notify: Arc<Notify>,
     task: JoinHandle<()>,
 }
 
 struct Inner {
+    /// Installed widgets. Can change at runtime (`upsert_widget`, `remove_widget`).
+    widgets: HashMap<String, Widget>,
     data: Instances,
     states: HashMap<String, SlotState>,
     model: StripModel,
     tasks: HashMap<String, Running>,
     /// Per-instance run guards. They outlive the loop task, so a run that is
-    /// still executing after hide/show blocks the next loop from starting another.
+    /// still executing after a stop blocks the next loop from starting another.
     guards: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// Per-instance run epochs, bumped whenever the instance's loop is
+    /// stopped. A run records the epoch it started in; if the epoch has moved
+    /// on by the time it ends, its result is discarded.
+    epochs: HashMap<String, u64>,
+}
+
+impl Inner {
+    fn is_visible(&self, inst: &instances::Instance) -> bool {
+        !inst.hidden && self.widgets.contains_key(&inst.widget)
+    }
+
+    /// Stops the instance's loop (if any) and moves its epoch on, so a run
+    /// still in flight cannot store its result.
+    fn stop(&mut self, id: &str) {
+        if let Some(running) = self.tasks.remove(id) {
+            running.task.abort();
+        }
+        *self.epochs.entry(id.to_string()).or_default() += 1;
+    }
+
+    fn epoch(&self, id: &str) -> u64 {
+        self.epochs.get(id).copied().unwrap_or(0)
+    }
+
+    /// Whether `new` must restart: its widget or effective settings changed.
+    fn settings_changed(&self, old: &instances::Instance, new: &instances::Instance) -> bool {
+        if old.widget != new.widget {
+            return true;
+        }
+        match self.widgets.get(&new.widget) {
+            Some(w) => {
+                self.data.effective_settings(old, &w.manifest)
+                    != self.data.effective_settings(new, &w.manifest)
+            }
+            None => old.settings != new.settings,
+        }
+    }
 }
 
 struct Shared {
     /// The runtime the scheduler started in. Loops are spawned through it,
     /// so handle methods work from threads outside the runtime (the strip).
     runtime: tokio::runtime::Handle,
-    widgets: HashMap<String, (Arc<Manifest>, Arc<PathBuf>)>,
     http: Arc<dyn HttpClient>,
     runner: Runner,
     semaphore: Arc<Semaphore>,
@@ -215,6 +299,9 @@ struct Shared {
     publish_lock: Mutex<()>,
     /// Writes instances.json in the background.
     saver: Saver,
+    logbook: LogBook,
+    /// Secret settings, overlaid on each run's settings.
+    secrets: SecretStore,
     inner: Mutex<Inner>,
 }
 
@@ -243,17 +330,13 @@ impl Shared {
         result
     }
 
-    fn is_visible(&self, inst: &instances::Instance) -> bool {
-        !inst.hidden && self.widgets.contains_key(&inst.widget)
-    }
-
     fn build_slots(&self, inner: &Inner) -> Vec<Slot> {
         let find = |id: &str| inner.data.instances.iter().find(|i| i.id == id);
         let state_of = |id: &str| inner.states.get(id).cloned().unwrap_or(SlotState::Loading);
-        let dir_of = |inst: &instances::Instance| self.widgets[&inst.widget].1.clone();
+        let dir_of = |inst: &instances::Instance| inner.widgets[&inst.widget].dir.clone();
         let mut slots = Vec::new();
         for id in &inner.data.order {
-            if let Some(inst) = find(id).filter(|i| self.is_visible(i)) {
+            if let Some(inst) = find(id).filter(|i| inner.is_visible(i)) {
                 slots.push(Slot {
                     id: id.clone(),
                     kind: SlotKind::Single {
@@ -267,7 +350,7 @@ impl Shared {
                 let members: Vec<Member> = group
                     .members
                     .iter()
-                    .filter_map(|m| find(m).filter(|i| self.is_visible(i)))
+                    .filter_map(|m| find(m).filter(|i| inner.is_visible(i)))
                     .map(|inst| Member {
                         instance_id: inst.id.clone(),
                         widget_dir: dir_of(inst),
@@ -289,19 +372,87 @@ impl Shared {
     }
 }
 
+/// Brings the running loops and states in line with the data and widgets:
+/// hidden instances and those of unknown widgets are stopped and have no
+/// state; those of blocked widgets are stopped and show the reason; the rest
+/// run (a missing loop is started as Loading; a running one is left alone).
+fn reconcile(shared: &Arc<Shared>, inner: &mut Inner) {
+    enum Want {
+        Off,
+        Blocked(String),
+        Run,
+    }
+    let plan: Vec<(String, Want)> = inner
+        .data
+        .instances
+        .iter()
+        .map(|inst| {
+            let want = match inner.widgets.get(&inst.widget) {
+                _ if inst.hidden => Want::Off,
+                None => Want::Off,
+                Some(w) => match &w.blocked {
+                    Some(reason) => Want::Blocked(reason.clone()),
+                    None => Want::Run,
+                },
+            };
+            (inst.id.clone(), want)
+        })
+        .collect();
+    let present: HashSet<&str> = plan.iter().map(|(id, _)| id.as_str()).collect();
+    let gone: Vec<String> = inner
+        .tasks
+        .keys()
+        .filter(|id| !present.contains(id.as_str()))
+        .cloned()
+        .collect();
+    inner.states.retain(|id, _| present.contains(id.as_str()));
+    for id in gone {
+        inner.stop(&id);
+    }
+    for (id, want) in plan {
+        match want {
+            Want::Off => {
+                if inner.tasks.contains_key(&id) {
+                    inner.stop(&id);
+                }
+                inner.states.remove(&id);
+            }
+            Want::Blocked(message) => {
+                if inner.tasks.contains_key(&id) {
+                    inner.stop(&id);
+                }
+                inner.states.insert(
+                    id,
+                    SlotState::Error {
+                        message,
+                        last: None,
+                    },
+                );
+            }
+            Want::Run => {
+                if !inner.tasks.contains_key(&id) {
+                    spawn_instance(shared, inner, id);
+                }
+            }
+        }
+    }
+}
+
 pub struct Scheduler;
 
 impl Scheduler {
     pub fn start(
-        widgets: HashMap<String, (Arc<Manifest>, PathBuf)>,
+        widgets: HashMap<String, WidgetEntry>,
         instances: Instances,
         http: Arc<dyn HttpClient>,
+        secrets: SecretStore,
         publish: impl Fn(StripModel) + Send + Sync + 'static,
     ) -> SchedulerHandle {
         Self::start_with_runner(
             widgets,
             instances,
             http,
+            secrets,
             sandbox_runner(),
             paths::instances_file(),
             publish,
@@ -309,9 +460,10 @@ impl Scheduler {
     }
 
     pub fn start_with_runner(
-        widgets: HashMap<String, (Arc<Manifest>, PathBuf)>,
+        widgets: HashMap<String, WidgetEntry>,
         instances: Instances,
         http: Arc<dyn HttpClient>,
+        secrets: SecretStore,
         runner: Runner,
         instances_path: PathBuf,
         publish: impl Fn(StripModel) + Send + Sync + 'static,
@@ -320,6 +472,7 @@ impl Scheduler {
             widgets,
             instances,
             http,
+            secrets,
             runner,
             instances_path,
             Arc::new(|p: &Path, d: &Instances| instances::save(p, d)),
@@ -327,10 +480,12 @@ impl Scheduler {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn start_with_writer(
-        widgets: HashMap<String, (Arc<Manifest>, PathBuf)>,
+        widgets: HashMap<String, WidgetEntry>,
         instances: Instances,
         http: Arc<dyn HttpClient>,
+        secrets: SecretStore,
         runner: Runner,
         instances_path: PathBuf,
         writer: Writer,
@@ -338,35 +493,29 @@ impl Scheduler {
     ) -> SchedulerHandle {
         let shared = Arc::new(Shared {
             runtime: tokio::runtime::Handle::current(),
-            widgets: widgets
-                .into_iter()
-                .map(|(id, (m, dir))| (id, (m, Arc::new(dir))))
-                .collect(),
             http,
             runner,
             semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_RUNS)),
             publish: Box::new(publish),
             publish_lock: Mutex::new(()),
             saver: Saver::start(instances_path, writer),
+            logbook: LogBook::default(),
+            secrets,
             inner: Mutex::new(Inner {
+                widgets: widgets
+                    .into_iter()
+                    .map(|(id, e)| (id, Widget::from(e)))
+                    .collect(),
                 data: instances,
                 states: HashMap::new(),
                 model: StripModel::default(),
                 tasks: HashMap::new(),
                 guards: HashMap::new(),
+                epochs: HashMap::new(),
             }),
         });
         let mut inner = shared.lock();
-        let visible: Vec<String> = inner
-            .data
-            .instances
-            .iter()
-            .filter(|i| shared.is_visible(i))
-            .map(|i| i.id.clone())
-            .collect();
-        for id in visible {
-            spawn_instance(&shared, &mut inner, id);
-        }
+        reconcile(&shared, &mut inner);
         // The first model (everything Loading) always goes out.
         inner.model.slots = shared.build_slots(&inner);
         inner.model.generation = 1;
@@ -409,19 +558,31 @@ async fn instance_loop(
             _ = tokio::time::sleep(wait) => {}
             _ = notify.notified() => {}
         }
-        // A run left over from before a hide/show may still be executing; its
+        // A run left over from before a stop may still be executing; its
         // task holds the guard, so wait for it before starting another.
         let run_guard = guard.clone().lock_owned().await;
-        let Some((ctx, refresh)) = make_context(&shared, &id) else {
+        let Some((mut ctx, refresh, epoch)) = make_context(&shared, &id) else {
             return;
         };
+        // Decrypting reads the disk and calls DPAPI: done on the blocking
+        // pool, never on an async worker.
+        let store = shared.secrets.clone();
+        let owner = id.clone();
+        let secrets = tokio::task::spawn_blocking(move || store.load(&owner))
+            .await
+            .unwrap_or(SecretLoad {
+                values: Default::default(),
+                unreadable: true,
+            });
+        add_secrets(&mut ctx, secrets);
         let Ok(permit) = shared.semaphore.clone().acquire_owned().await else {
             return;
         };
         // The run lives in its own task that owns the guard and the permit.
-        // Aborting this loop (hide, shutdown) only drops the join handle, so
+        // Aborting this loop (stop, shutdown) only drops the join handle, so
         // the permit and guard are released when the run itself ends, never
         // earlier. The real runner's blocking work is covered by this too.
+        let redactor = ctx.redactor.clone();
         let fut = (shared.runner)(ctx);
         let result = tokio::spawn(async move {
             let _held = (run_guard, permit);
@@ -429,6 +590,12 @@ async fn instance_loop(
         })
         .await
         .unwrap_or_else(|e| Err(RunError::Script(format!("run aborted: {e}"))));
+        // A widget can put a secret into its error message; hide it before
+        // the message reaches the log, the log book or the tooltip.
+        let failure = result
+            .as_ref()
+            .err()
+            .map(|e| redactor.apply(&e.to_string()));
         let state = match result {
             Ok(output) => {
                 log::debug!("widget run ok for {id}");
@@ -436,20 +603,28 @@ async fn instance_loop(
                 last_good = Some(output.clone());
                 SlotState::Ok(output)
             }
-            Err(e) => {
+            Err(_) => {
                 failures = failures.saturating_add(1);
-                log::warn!("widget run failed for {id}: {e}");
+                let message = failure.clone().unwrap_or_default();
+                log::warn!("widget run failed for {id}: {message}");
                 match &last_good {
                     Some(prev) => SlotState::Stale(prev.clone()),
                     None => SlotState::Error {
-                        message: e.to_string(),
+                        message,
                         last: None,
                     },
                 }
             }
         };
         shared.update(|inner| {
-            // Skip if the instance was hidden or removed while the run was in flight.
+            // The instance was stopped (removed, hidden, restarted) while the
+            // run was in flight: drop the result.
+            if inner.epoch(&id) != epoch {
+                return;
+            }
+            if let Some(message) = failure {
+                shared.logbook.push(&id, LogLevel::Error, message);
+            }
             if let Some(slot) = inner.states.get_mut(&id) {
                 *slot = state;
             }
@@ -458,68 +633,261 @@ async fn instance_loop(
     }
 }
 
-/// Reads the instance's current settings so edits apply on the next run.
-fn make_context(shared: &Shared, id: &str) -> Option<(RunContext, u32)> {
+/// Reads the instance's current settings and its widget's approved
+/// permissions. Secrets are added later by `add_secrets`. `None` when the
+/// instance or its widget is gone or blocked.
+fn make_context(shared: &Shared, id: &str) -> Option<(RunContext, u32, u64)> {
     let inner = shared.lock();
     let inst = inner.data.instances.iter().find(|i| i.id == id)?;
-    let (manifest, dir) = shared.widgets.get(&inst.widget)?;
+    let widget = inner
+        .widgets
+        .get(&inst.widget)
+        .filter(|w| w.blocked.is_none())?;
+    let manifest = &widget.manifest;
     let ctx = RunContext {
         manifest: manifest.clone(),
-        widget_dir: dir.as_ref().clone(),
+        widget_dir: widget.dir.as_ref().clone(),
         instance_id: id.to_string(),
         settings: inner.data.effective_settings(inst, manifest),
         http: shared.http.clone(),
         storage_path: paths::storage_file(id),
         limits: Limits::default(),
+        permissions: widget.approved.clone(),
+        logbook: shared.logbook.clone(),
+        redactor: Arc::default(),
     };
-    Some((ctx, manifest.refresh))
+    Some((ctx, manifest.refresh, inner.epoch(id)))
 }
 
+/// Overlays the stored secrets on the run settings and builds the run's
+/// redactor from every stored secret and every `secret`-kind value in the
+/// final settings (one that could not be moved out of `instances.json` is
+/// still hidden).
+fn add_secrets(ctx: &mut RunContext, secrets: SecretLoad) {
+    if secrets.unreadable {
+        log::debug!(
+            "secrets of {} cannot be read; they need to be entered again",
+            ctx.instance_id
+        );
+    }
+    let text = |v: &serde_json::Value| match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    };
+    let mut hidden: Vec<String> = secrets.values.values().filter_map(text).collect();
+    ctx.settings.extend(secrets.values);
+    hidden.extend(
+        ctx.manifest
+            .settings
+            .iter()
+            .filter(|f| f.kind == SettingKind::Secret)
+            .filter_map(|f| ctx.settings.get(&f.key))
+            .filter_map(text),
+    );
+    ctx.redactor = Arc::new(Redactor::new(hidden));
+}
+
+/// Cheap to clone; clones drive the same scheduler.
+#[derive(Clone)]
 pub struct SchedulerHandle {
     shared: Arc<Shared>,
 }
 
 impl SchedulerHandle {
     /// Runs the instance now. If a run is already in flight, exactly one more
-    /// run follows it. Hidden or unknown instances are ignored.
+    /// run follows it. Hidden, blocked or unknown instances are ignored.
     pub fn refresh_now(&self, instance_id: &str) {
         if let Some(running) = self.shared.lock().tasks.get(instance_id) {
             running.notify.notify_one();
         }
     }
 
-    /// Hides or shows an instance, saves `instances.json` and republishes.
-    /// Hidden instances are not run; showing one starts it as Loading. A run
-    /// still executing from before a hide finishes first (its result is
-    /// discarded); the restarted loop waits for it, so runs never overlap.
-    pub fn set_hidden(&self, instance_id: &str, hidden: bool) {
+    /// The installed widgets, by manifest id.
+    pub fn widgets(&self) -> HashMap<String, WidgetEntry> {
+        self.shared
+            .lock()
+            .widgets
+            .iter()
+            .map(|(id, w)| {
+                let entry = WidgetEntry {
+                    manifest: w.manifest.clone(),
+                    dir: w.dir.as_ref().clone(),
+                    approved: w.approved.clone(),
+                    blocked: w.blocked.clone(),
+                };
+                (id.clone(), entry)
+            })
+            .collect()
+    }
+
+    /// A copy of the current instance data.
+    pub fn snapshot(&self) -> Instances {
+        self.shared.lock().data.clone()
+    }
+
+    /// The state of every visible instance (hidden ones and those of unknown
+    /// widgets are absent).
+    pub fn statuses(&self) -> HashMap<String, SlotState> {
+        let inner = self.shared.lock();
+        inner
+            .data
+            .instances
+            .iter()
+            .filter(|i| inner.is_visible(i))
+            .map(|i| {
+                let state = inner.states.get(&i.id).cloned();
+                (i.id.clone(), state.unwrap_or(SlotState::Loading))
+            })
+            .collect()
+    }
+
+    /// The per-instance log book (widget log lines and run failures).
+    pub fn logbook(&self) -> LogBook {
+        self.shared.logbook.clone()
+    }
+
+    /// Replaces the instance data with `next` (normalized first). Removed or
+    /// newly hidden instances stop, new or newly shown ones start as Loading,
+    /// and instances whose effective settings changed restart. Order, group
+    /// and width changes only republish. Saves in the background.
+    ///
+    /// A run still in flight for a stopped or restarted instance finishes on
+    /// its own and its result is discarded; a restarted loop waits for it, so
+    /// runs never overlap.
+    pub fn apply(&self, next: Instances) {
+        self.edit(|data| *data = next);
+    }
+
+    /// Edits a copy of the data under the state lock, then applies it.
+    fn edit(&self, f: impl FnOnce(&mut Instances)) -> bool {
+        let edited: Result<((), bool), std::convert::Infallible> = self.edit_with(|data| {
+            f(data);
+            Ok(())
+        });
+        edited.is_ok_and(|(_, changed)| changed)
+    }
+
+    /// Edits a copy of the current data under the state lock and applies it
+    /// as `apply` does. When `f` fails nothing changes. Every edit of the
+    /// instance data goes through this lock, so edits from the settings
+    /// window and the strip never overwrite each other.
+    ///
+    /// `f` runs under the state lock: it must not call back into the handle.
+    pub fn try_edit<T, E>(&self, f: impl FnOnce(&mut Instances) -> Result<T, E>) -> Result<T, E> {
+        self.edit_with(f).map(|(out, _)| out)
+    }
+
+    /// Runs `f` once no run of the instance is executing: right away when
+    /// none is, otherwise on the runtime after the run ends. For cleanup of
+    /// a removed instance's files, which a run in flight could write again.
+    pub fn when_idle(&self, instance_id: &str, f: impl FnOnce() + Send + 'static) {
+        let guard = self.shared.lock().guards.get(instance_id).cloned();
+        let Some(guard) = guard else {
+            f();
+            return;
+        };
+        match guard.clone().try_lock_owned() {
+            Ok(_held) => f(),
+            Err(_) => {
+                self.shared.runtime.spawn(async move {
+                    // `f` is a quick file removal: fine on a worker.
+                    let _held = guard.lock_owned().await;
+                    f();
+                });
+            }
+        }
+    }
+
+    /// The edit itself. Returns `f`'s value and whether the data changed.
+    fn edit_with<T, E>(
+        &self,
+        f: impl FnOnce(&mut Instances) -> Result<T, E>,
+    ) -> Result<(T, bool), E> {
         let shared = &self.shared;
-        let changed = shared.update(|inner| {
-            let Some(inst) = inner
-                .data
-                .instances
-                .iter_mut()
-                .find(|i| i.id == instance_id)
-            else {
-                return false;
-            };
-            if inst.hidden == hidden {
-                return false;
+        shared.update(|inner| {
+            let mut next = inner.data.clone();
+            let out = f(&mut next)?;
+            let known: HashSet<String> = inner.widgets.keys().cloned().collect();
+            next.normalize(&known);
+            if next == inner.data {
+                return Ok((out, false));
             }
-            inst.hidden = hidden;
-            let widget_known = shared.widgets.contains_key(&inst.widget);
-            if hidden {
-                inner.states.remove(instance_id);
-                if let Some(running) = inner.tasks.remove(instance_id) {
-                    running.task.abort();
+            let mut removed = Vec::new();
+            let mut restart = Vec::new();
+            for old in &inner.data.instances {
+                match next.instances.iter().find(|i| i.id == old.id) {
+                    None => removed.push(old.id.clone()),
+                    Some(new) if inner.settings_changed(old, new) => restart.push(old.id.clone()),
+                    Some(_) => {}
                 }
-            } else if widget_known && !inner.tasks.contains_key(instance_id) {
-                spawn_instance(shared, inner, instance_id.to_string());
             }
+            inner.data = next;
+            for id in &removed {
+                inner.stop(id);
+                inner.states.remove(id);
+                shared.logbook.remove(id);
+                // Keep the guard while a run still holds it, so a run can
+                // never overlap one from before; drop it otherwise.
+                if inner
+                    .guards
+                    .get(id)
+                    .is_some_and(|g| Arc::strong_count(g) == 1)
+                {
+                    inner.guards.remove(id);
+                }
+            }
+            for id in &restart {
+                if inner.tasks.contains_key(id) {
+                    inner.stop(id);
+                }
+            }
+            reconcile(shared, inner);
             // Submitted under the state lock, so snapshots reach the saver in
             // the order the changes happened. The saver writes off-thread.
             shared.saver.submit(inner.data.clone());
-            true
+            Ok((out, true))
+        })
+    }
+
+    /// Adds or replaces a widget. Its instances restart with the new
+    /// manifest, folder and permissions (or show the block reason).
+    pub fn upsert_widget(&self, id: &str, entry: WidgetEntry) {
+        let shared = &self.shared;
+        shared.update(|inner| {
+            inner.widgets.insert(id.to_string(), Widget::from(entry));
+            let ids: Vec<String> = inner
+                .data
+                .instances
+                .iter()
+                .filter(|i| i.widget == id)
+                .map(|i| i.id.clone())
+                .collect();
+            for i in &ids {
+                if inner.tasks.contains_key(i) {
+                    inner.stop(i);
+                }
+            }
+            reconcile(shared, inner);
+        });
+    }
+
+    /// Forgets a widget. Its instances stop and leave the strip but stay in
+    /// the data, as for any widget that is not installed.
+    pub fn remove_widget(&self, id: &str) {
+        let shared = &self.shared;
+        shared.update(|inner| {
+            inner.widgets.remove(id);
+            reconcile(shared, inner);
+        });
+    }
+
+    /// Hides or shows an instance (see `apply`).
+    pub fn set_hidden(&self, instance_id: &str, hidden: bool) {
+        let changed = self.edit(|data| {
+            if let Some(inst) = data.instances.iter_mut().find(|i| i.id == instance_id) {
+                inst.hidden = hidden;
+            }
         });
         if changed {
             log::debug!("{instance_id} hidden: {hidden}; saving in the background");
@@ -538,8 +906,9 @@ impl SchedulerHandle {
     pub fn shutdown(self) {
         {
             let mut inner = self.shared.lock();
-            for (_, running) in inner.tasks.drain() {
-                running.task.abort();
+            let ids: Vec<String> = inner.tasks.keys().cloned().collect();
+            for id in ids {
+                inner.stop(&id);
             }
         }
         if !self.flush_saves(SHUTDOWN_SAVE_WAIT) {
@@ -553,7 +922,10 @@ mod tests {
     use super::*;
     use crate::display::{Block, Color, Frame, TextSize};
     use crate::instances::{Group, Instance};
+    use crate::logbook::LogLevel;
+    use crate::manifest::Permissions;
     use crate::sandbox::{HttpFuture, HttpRequest};
+    use crate::secrets::SecretStore;
     use crate::strip::model::{Member, SlotKind, SlotState};
     use serde_json::{json, Map};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -604,12 +976,22 @@ mod tests {
         format!("inst-{n:08x}")
     }
 
+    fn entry(dir: &str) -> WidgetEntry {
+        WidgetEntry::bundled(manifest(), PathBuf::from(dir))
+    }
+
+    fn widgets() -> HashMap<String, WidgetEntry> {
+        HashMap::from([("w".to_string(), entry("wdir"))])
+    }
+
     type Published = Arc<Mutex<Vec<StripModel>>>;
 
     struct Rig {
         handle: SchedulerHandle,
         published: Published,
+        written: Arc<Mutex<Vec<Instances>>>,
         path: PathBuf,
+        secrets: SecretStore,
         _dir: tempfile::TempDir,
     }
 
@@ -618,27 +1000,52 @@ mod tests {
             data: Instances,
             f: impl Fn(&str) -> Result<Output, RunError> + Send + Sync + 'static,
         ) -> Rig {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("instances.json");
-            let widgets = HashMap::from([("w".to_string(), (manifest(), PathBuf::from("wdir")))]);
-            let runner: Runner = Arc::new(move |ctx: RunContext| {
+            Self::start_ctx(data, move |ctx| {
                 let r = f(&ctx.instance_id);
                 Box::pin(async move { r })
+            })
+        }
+
+        /// Like `start`, but the runner sees the whole `RunContext`.
+        fn start_ctx(
+            data: Instances,
+            f: impl Fn(RunContext) -> RunFuture + Send + Sync + 'static,
+        ) -> Rig {
+            Self::start_full(widgets(), data, Arc::new(f))
+        }
+
+        fn start_full(
+            widgets: HashMap<String, WidgetEntry>,
+            data: Instances,
+            runner: Runner,
+        ) -> Rig {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("instances.json");
+            let written: Arc<Mutex<Vec<Instances>>> = Arc::default();
+            let w = written.clone();
+            let writer: Writer = Arc::new(move |p: &Path, d: &Instances| {
+                w.lock().unwrap().push(d.clone());
+                instances::save(p, d)
             });
             let published: Published = Arc::default();
             let sink = published.clone();
-            let handle = Scheduler::start_with_runner(
+            let secrets = test_store(&dir);
+            let handle = Scheduler::start_with_writer(
                 widgets,
                 data,
                 Arc::new(NoHttp),
+                secrets.clone(),
                 runner,
                 path.clone(),
+                writer,
                 move |m| sink.lock().unwrap().push(m),
             );
             Rig {
                 handle,
                 published,
+                written,
                 path,
+                secrets,
                 _dir: dir,
             }
         }
@@ -650,6 +1057,10 @@ mod tests {
         fn count(&self) -> usize {
             self.published.lock().unwrap().len()
         }
+    }
+
+    fn test_store(dir: &tempfile::TempDir) -> SecretStore {
+        SecretStore::new(dir.path().join("secrets"))
     }
 
     async fn advance(secs: u64) {
@@ -820,9 +1231,10 @@ mod tests {
         let sink = published.clone();
         let handle = rt.block_on(async {
             Scheduler::start_with_runner(
-                HashMap::from([("w".to_string(), (manifest(), PathBuf::from("wdir")))]),
+                widgets(),
                 data(vec![inst(1, true)]),
                 Arc::new(NoHttp),
+                test_store(&dir),
                 Arc::new(|_| Box::pin(async { Ok(out("x")) })),
                 dir.path().join("i.json"),
                 move |m| sink.lock().unwrap().push(m),
@@ -890,9 +1302,10 @@ mod tests {
         let sink = published.clone();
         let handle = rt.block_on(async {
             Scheduler::start_with_writer(
-                HashMap::from([("w".to_string(), (manifest(), PathBuf::from("wdir")))]),
+                widgets(),
                 data(vec![inst(1, false), inst(2, false)]),
                 Arc::new(NoHttp),
+                test_store(&dir),
                 Arc::new(|_| Box::pin(std::future::pending())),
                 path.clone(),
                 writer,
@@ -1003,7 +1416,7 @@ mod tests {
         let max_seen = Arc::new(AtomicUsize::new(0));
         let (a, mx) = (active.clone(), max_seen.clone());
         let dir = tempfile::tempdir().unwrap();
-        let widgets = HashMap::from([("w".to_string(), (manifest(), PathBuf::from("wdir")))]);
+        let widgets = widgets();
         let runner: Runner = Arc::new(move |_ctx| {
             let (a, mx) = (a.clone(), mx.clone());
             Box::pin(async move {
@@ -1018,6 +1431,7 @@ mod tests {
             widgets,
             data(vec![inst(1, false)]),
             Arc::new(NoHttp),
+            test_store(&dir),
             runner,
             dir.path().join("i.json"),
             |_| {},
@@ -1068,11 +1482,12 @@ mod tests {
 
     fn start_slow(count: u32, c: Arc<Concurrency>) -> (SchedulerHandle, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let widgets = HashMap::from([("w".to_string(), (manifest(), PathBuf::from("wdir")))]);
+        let widgets = widgets();
         let handle = Scheduler::start_with_runner(
             widgets,
             data((1..=count).map(|n| inst(n, false)).collect()),
             Arc::new(NoHttp),
+            test_store(&dir),
             slow_runner(c),
             dir.path().join("i.json"),
             |_| {},
@@ -1109,5 +1524,545 @@ mod tests {
         advance(120).await;
         assert_eq!(c.max_per_instance.load(Ordering::SeqCst), 1);
         assert_eq!(c.max_total.load(Ordering::SeqCst), MAX_CONCURRENT_RUNS);
+    }
+
+    type Calls = Arc<Mutex<HashMap<String, usize>>>;
+
+    /// A runner body that counts calls per instance id and outputs the id.
+    fn counting(calls: Calls) -> impl Fn(&str) -> Result<Output, RunError> + Send + Sync {
+        move |who: &str| {
+            *calls.lock().unwrap().entry(who.to_string()).or_default() += 1;
+            Ok(out(who))
+        }
+    }
+
+    fn calls_of(calls: &Calls, n: u32) -> usize {
+        calls.lock().unwrap().get(&id(n)).copied().unwrap_or(0)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn apply_starts_added_instance() {
+        let calls: Calls = Arc::default();
+        let rig = Rig::start(data(vec![inst(1, false)]), counting(calls.clone()));
+        advance(3).await;
+        let mut next = rig.handle.snapshot();
+        next.instances.push(inst(2, false));
+        rig.handle.apply(next);
+        let m = rig.last();
+        assert_eq!(m.slots.len(), 2);
+        assert_eq!(m.slots[1].id, id(2));
+        assert_eq!(single_state(&m, 1), SlotState::Loading);
+        advance(3).await;
+        assert_eq!(calls_of(&calls, 2), 1);
+        assert_eq!(single_state(&rig.last(), 1), SlotState::Ok(out(&id(2))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn apply_stops_removed_instance() {
+        let calls: Calls = Arc::default();
+        let rig = Rig::start(
+            data(vec![inst(1, false), inst(2, false)]),
+            counting(calls.clone()),
+        );
+        advance(3).await;
+        assert_eq!(calls_of(&calls, 2), 1);
+        let mut next = rig.handle.snapshot();
+        next.instances.retain(|i| i.id != id(2));
+        next.order.retain(|o| *o != id(2));
+        rig.handle.apply(next);
+        assert_eq!(rig.last().slots.len(), 1);
+        assert!(!rig.handle.statuses().contains_key(&id(2)));
+        advance(600).await;
+        assert_eq!(calls_of(&calls, 2), 1);
+        assert!(calls_of(&calls, 1) > 1);
+        assert!(rig
+            .handle
+            .snapshot()
+            .instances
+            .iter()
+            .all(|i| i.id != id(2)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn apply_restarts_changed_instance_and_drops_stale_result() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let (g, sn, a, mx) = (
+            gate.clone(),
+            seen.clone(),
+            active.clone(),
+            max_active.clone(),
+        );
+        let mut first = inst(1, false);
+        first.settings.insert("coin".into(), json!("BTC"));
+        let rig = Rig::start_ctx(data(vec![first]), move |ctx| {
+            let coin = ctx.settings["coin"].as_str().unwrap().to_string();
+            let call = {
+                let mut s = sn.lock().unwrap();
+                s.push(coin.clone());
+                s.len()
+            };
+            let (g, a, mx) = (g.clone(), a.clone(), mx.clone());
+            Box::pin(async move {
+                let now = a.fetch_add(1, Ordering::SeqCst) + 1;
+                mx.fetch_max(now, Ordering::SeqCst);
+                if call == 1 {
+                    g.acquire().await.unwrap().forget();
+                }
+                a.fetch_sub(1, Ordering::SeqCst);
+                Ok(out(&coin))
+            })
+        });
+        advance(3).await; // run #1 is blocked on the gate
+        assert_eq!(active.load(Ordering::SeqCst), 1);
+        let mut next = rig.handle.snapshot();
+        next.instances[0]
+            .settings
+            .insert("coin".into(), json!("ETH"));
+        rig.handle.apply(next);
+        advance(3).await; // the restarted loop waits for run #1
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        gate.add_permits(1);
+        advance(3).await;
+        assert_eq!(single_state(&rig.last(), 0), SlotState::Ok(out("ETH")));
+        let all = rig.published.lock().unwrap().clone();
+        assert!(all
+            .iter()
+            .all(|m| single_state(m, 0) != SlotState::Ok(out("BTC"))));
+        assert_eq!(*seen.lock().unwrap(), vec!["BTC", "ETH"]);
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn apply_reorder_and_group_only_republishes() {
+        let calls: Calls = Arc::default();
+        let rig = Rig::start(
+            data(vec![inst(1, false), inst(2, false)]),
+            counting(calls.clone()),
+        );
+        advance(3).await;
+        let before = (calls_of(&calls, 1), calls_of(&calls, 2));
+
+        let mut next = rig.handle.snapshot();
+        next.order.reverse();
+        next.instances[0].max_width = Some(80);
+        rig.handle.apply(next);
+        let m = rig.last();
+        assert_eq!(m.slots[0].id, id(2));
+        assert_eq!(m.slots[1].id, id(1));
+        assert_eq!(single_state(&m, 0), SlotState::Ok(out(&id(2))));
+        match &m.slots[1].kind {
+            SlotKind::Single { max_width, .. } => assert_eq!(*max_width, Some(80)),
+            other => panic!("not single: {other:?}"),
+        }
+
+        let mut next = rig.handle.snapshot();
+        next.groups = vec![Group {
+            id: "grp-00000001".into(),
+            members: vec![id(1), id(2)],
+            interval: 8,
+        }];
+        next.order = vec!["grp-00000001".into()];
+        rig.handle.apply(next);
+        let m = rig.last();
+        assert_eq!(m.slots.len(), 1);
+        match &m.slots[0].kind {
+            SlotKind::Group { members, .. } => {
+                assert_eq!(members.len(), 2);
+                assert!(members
+                    .iter()
+                    .all(|mb| mb.state == SlotState::Ok(out(&mb.instance_id))));
+            }
+            other => panic!("not a group: {other:?}"),
+        }
+        advance(3).await;
+        assert_eq!((calls_of(&calls, 1), calls_of(&calls, 2)), before);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn apply_saves_in_background() {
+        let rig = Rig::start(data(vec![inst(1, false)]), |_| Ok(out("x")));
+        let mut next = rig.handle.snapshot();
+        next.instances.push(inst(2, true));
+        next.instances[0]
+            .settings
+            .insert("coin".into(), json!("ETH"));
+        rig.handle.apply(next);
+        assert!(rig.handle.flush_saves(Duration::from_secs(5)));
+        let last = rig.written.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(last, rig.handle.snapshot());
+        assert_eq!(last.instances.len(), 2);
+        assert_eq!(last.instances[0].settings["coin"], json!("ETH"));
+        // The normalised data is saved: the new instance joined the order.
+        assert_eq!(last.order, vec![id(1), id(2)]);
+        assert_eq!(crate::instances::load(&rig.path), last);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_widget_shows_reason_and_does_not_run() {
+        let calls: Calls = Arc::default();
+        let rig = Rig::start(data(vec![inst(1, false)]), counting(calls.clone()));
+        advance(3).await;
+        assert_eq!(calls_of(&calls, 1), 1);
+        let mut blocked = entry("wdir");
+        blocked.blocked = Some("Waiting for permission review".into());
+        rig.handle.upsert_widget("w", blocked);
+        let want = SlotState::Error {
+            message: "Waiting for permission review".into(),
+            last: None,
+        };
+        assert_eq!(single_state(&rig.last(), 0), want);
+        assert_eq!(rig.handle.statuses()[&id(1)], want);
+        advance(600).await;
+        assert_eq!(calls_of(&calls, 1), 1);
+        assert_eq!(single_state(&rig.last(), 0), want);
+
+        // Added while blocked: still not run, still the reason.
+        let mut next = rig.handle.snapshot();
+        next.instances.push(inst(2, false));
+        rig.handle.apply(next);
+        advance(600).await;
+        assert_eq!(calls_of(&calls, 2), 0);
+        assert_eq!(rig.handle.statuses()[&id(2)], want);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upsert_widget_restarts_its_instances() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let rig = Rig::start_ctx(data(vec![inst(1, false)]), move |ctx| {
+            c.fetch_add(1, Ordering::SeqCst);
+            let dir = ctx.widget_dir.display().to_string();
+            Box::pin(async move { Ok(out(&dir)) })
+        });
+        advance(3).await;
+        assert_eq!(single_state(&rig.last(), 0), SlotState::Ok(out("wdir")));
+        rig.handle.upsert_widget("w", entry("wdir2"));
+        let m = rig.last();
+        assert_eq!(single_state(&m, 0), SlotState::Loading);
+        match &m.slots[0].kind {
+            SlotKind::Single { widget_dir, .. } => {
+                assert_eq!(**widget_dir, PathBuf::from("wdir2"))
+            }
+            other => panic!("not single: {other:?}"),
+        }
+        advance(3).await;
+        assert_eq!(single_state(&rig.last(), 0), SlotState::Ok(out("wdir2")));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remove_widget_stops_its_instances_and_keeps_them() {
+        let calls: Calls = Arc::default();
+        let rig = Rig::start(data(vec![inst(1, false)]), counting(calls.clone()));
+        advance(3).await;
+        rig.handle.remove_widget("w");
+        assert!(rig.last().slots.is_empty());
+        assert!(rig.handle.statuses().is_empty());
+        advance(600).await;
+        assert_eq!(calls_of(&calls, 1), 1);
+        assert_eq!(rig.handle.snapshot().instances.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_uses_approved_permissions() {
+        let declared: Manifest = serde_json::from_value(json!({
+            "id": "w", "name": "W", "formatVersion": 1, "refresh": 60,
+            "permissions": {"network": ["declared.example.com"]}
+        }))
+        .unwrap();
+        let approved = Permissions {
+            network: vec!["approved.example.com".into()],
+            ..Permissions::default()
+        };
+        let widgets = HashMap::from([(
+            "w".to_string(),
+            WidgetEntry {
+                manifest: Arc::new(declared),
+                dir: PathBuf::from("wdir"),
+                approved: approved.clone(),
+                blocked: None,
+            },
+        )]);
+        let got = Arc::new(Mutex::new(None));
+        let g = got.clone();
+        let _rig = Rig::start_full(
+            widgets,
+            data(vec![inst(1, false)]),
+            Arc::new(move |ctx: RunContext| {
+                *g.lock().unwrap() = Some(ctx.permissions.clone());
+                Box::pin(async { Ok(out("x")) })
+            }),
+        );
+        advance(3).await;
+        assert_eq!(got.lock().unwrap().clone(), Some(approved));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn statuses_reports_every_visible_instance() {
+        let d = Instances {
+            instances: vec![inst(1, false), inst(2, true), inst(3, false)],
+            groups: vec![Group {
+                id: "grp-00000001".into(),
+                members: vec![id(3)],
+                interval: 8,
+            }],
+            order: vec![id(1), id(2), "grp-00000001".into()],
+        };
+        let rig = Rig::start(d, |who| Ok(out(who)));
+        let s = rig.handle.statuses();
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[&id(1)], SlotState::Loading);
+        advance(3).await;
+        let s = rig.handle.statuses();
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[&id(1)], SlotState::Ok(out(&id(1))));
+        assert_eq!(s[&id(3)], SlotState::Ok(out(&id(3))));
+        assert!(!s.contains_key(&id(2)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_settings_include_secrets() {
+        let mut first = inst(1, false);
+        first.settings.insert("city".into(), json!("Oslo"));
+        let got: Arc<Mutex<Option<Map<String, serde_json::Value>>>> = Arc::default();
+        let g = got.clone();
+        let rig = Rig::start_ctx(data(vec![first]), move |ctx| {
+            *g.lock().unwrap() = Some(ctx.settings.clone());
+            Box::pin(async { Ok(out("x")) })
+        });
+        // The first run waits for its start jitter, so this lands before it.
+        rig.secrets.set(&id(1), "apiKey", "sk-12345").unwrap();
+        advance(3).await;
+        let settings = got.lock().unwrap().clone().expect("a run");
+        assert_eq!(settings["apiKey"], json!("sk-12345"));
+        assert_eq!(settings["city"], json!("Oslo"));
+        // Nothing secret went into the instance data.
+        assert!(!rig.handle.snapshot().instances[0]
+            .settings
+            .contains_key("apiKey"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn widget_log_redacts_secret_values() {
+        let wdir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            wdir.path().join("widget.js"),
+            "export default async function update({ settings, log }) {\n\
+             log(\"key is \" + settings.apiKey);\n\
+             console.error(\"bad \" + settings.apiKey);\n\
+             throw new Error(\"failed with \" + settings.apiKey);\n}",
+        )
+        .unwrap();
+        let widgets = HashMap::from([(
+            "w".to_string(),
+            WidgetEntry::bundled(manifest(), wdir.path().to_path_buf()),
+        )]);
+        let rig = Rig::start_full(
+            widgets,
+            data(vec![inst(1, false)]),
+            Arc::new(|ctx| Box::pin(sandbox::run(ctx))),
+        );
+        rig.secrets.set(&id(1), "apiKey", "sk-12345").unwrap();
+        advance(3).await;
+        let lines = rig.handle.logbook().lines(&id(1));
+        let texts: Vec<(LogLevel, &str)> =
+            lines.iter().map(|l| (l.level, l.text.as_str())).collect();
+        assert_eq!(texts.len(), 3, "{texts:?}");
+        assert_eq!(texts[0], (LogLevel::Info, "key is [secret]"));
+        assert_eq!(texts[1], (LogLevel::Error, "bad [secret]"));
+        assert_eq!(texts[2].0, LogLevel::Error);
+        assert!(
+            texts[2].1.contains("failed with [secret]"),
+            "{}",
+            texts[2].1
+        );
+        assert!(lines.iter().all(|l| !l.text.contains("sk-12345")));
+        match single_state(&rig.last(), 0) {
+            SlotState::Error { message, .. } => {
+                assert!(!message.contains("sk-12345"), "{message}");
+                assert!(message.contains("[secret]"), "{message}");
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_error_across_the_clip_shows_no_part_of_the_secret() {
+        const SECRET: &str = "sk-1234567890";
+        let wdir = tempfile::tempdir().unwrap();
+        // "Error: " (7 chars) + 286 pad puts the secret at char 293, across
+        // the 300-char cut.
+        std::fs::write(
+            wdir.path().join("widget.js"),
+            "export default async function update({ settings }) {\n\
+             throw new Error(\"x\".repeat(286) + settings.apiKey);\n}",
+        )
+        .unwrap();
+        let widgets = HashMap::from([(
+            "w".to_string(),
+            WidgetEntry::bundled(manifest(), wdir.path().to_path_buf()),
+        )]);
+        let rig = Rig::start_full(
+            widgets,
+            data(vec![inst(1, false)]),
+            Arc::new(|ctx| Box::pin(sandbox::run(ctx))),
+        );
+        rig.secrets.set(&id(1), "apiKey", SECRET).unwrap();
+        advance(3).await;
+        let lines = rig.handle.logbook().lines(&id(1));
+        let last = lines.last().expect("a logbook line");
+        assert_eq!(last.level, LogLevel::Error);
+        assert!(last.text.contains("xxxx"), "{}", last.text);
+        assert!(!last.text.contains(&SECRET[..4]), "{}", last.text);
+        match single_state(&rig.last(), 0) {
+            SlotState::Error { message, .. } => {
+                assert!(!message.contains(&SECRET[..4]), "{message}")
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unmigrated_secret_in_settings_is_still_redacted() {
+        let declared: Manifest = serde_json::from_value(json!({
+            "id": "w", "name": "W", "formatVersion": 1, "refresh": 60,
+            "settings": [{"key": "apiKey", "label": "API key", "kind": "secret"}]
+        }))
+        .unwrap();
+        let wdir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            wdir.path().join("widget.js"),
+            "export default async function update({ settings, log }) {\n\
+             log(\"key is \" + settings.apiKey);\n\
+             return { blocks: [] };\n}",
+        )
+        .unwrap();
+        let widgets = HashMap::from([(
+            "w".to_string(),
+            WidgetEntry::bundled(Arc::new(declared), wdir.path().to_path_buf()),
+        )]);
+        // Left in instances.json: `migrate` could not move it.
+        let mut first = inst(1, false);
+        first
+            .settings
+            .insert("apiKey".into(), json!("sk-unmoved-1"));
+        let rig = Rig::start_full(
+            widgets,
+            data(vec![first]),
+            Arc::new(|ctx| Box::pin(sandbox::run(ctx))),
+        );
+        advance(3).await;
+        let lines = rig.handle.logbook().lines(&id(1));
+        let texts: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["key is [secret]"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_failure_goes_to_logbook() {
+        let rig = Rig::start(data(vec![inst(1, false)]), |_| {
+            Err(RunError::Script("boom".into()))
+        });
+        advance(3).await;
+        let lines = rig.handle.logbook().lines(&id(1));
+        let last = lines.last().expect("a logbook line");
+        assert_eq!(last.level, LogLevel::Error);
+        assert!(last.text.contains("boom"), "{}", last.text);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn try_edit_error_changes_nothing() {
+        let rig = Rig::start(data(vec![inst(1, false)]), |_| Ok(out("x")));
+        let before = rig.handle.snapshot();
+        let r: Result<(), &str> = rig.handle.try_edit(|d| {
+            d.instances.clear();
+            Err("no")
+        });
+        assert_eq!(r, Err("no"));
+        assert_eq!(rig.handle.snapshot(), before);
+        let n = rig.handle.try_edit(|d| {
+            d.instances[0].max_width = Some(99);
+            Ok::<_, ()>(7)
+        });
+        assert_eq!(n, Ok(7));
+        assert_eq!(rig.handle.snapshot().instances[0].max_width, Some(99));
+    }
+
+    /// The strip's `set_hidden` arrives while a settings edit is in the
+    /// middle of its closure: it waits for the lock and lands on top, so
+    /// neither change is lost.
+    #[test]
+    fn set_hidden_during_try_edit_is_not_lost() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let handle = rt.block_on(async {
+            Scheduler::start_with_runner(
+                widgets(),
+                data(vec![inst(1, false), inst(2, false)]),
+                Arc::new(NoHttp),
+                test_store(&dir),
+                Arc::new(|_| Box::pin(std::future::pending())),
+                dir.path().join("i.json"),
+                |_| {},
+            )
+        });
+        let _rt = rt.enter();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let strip = handle.clone();
+        let strip_thread = std::thread::spawn(move || {
+            go_rx.recv().unwrap();
+            strip.set_hidden(&id(1), true);
+        });
+        handle
+            .try_edit(|d| {
+                // Let the strip call in now; it must wait for this edit.
+                go_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+                d.instances[1].max_width = Some(120);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        strip_thread.join().unwrap();
+        let snap = handle.snapshot();
+        assert!(snap.instances[0].hidden, "the strip's hide was lost");
+        assert_eq!(snap.instances[1].max_width, Some(120));
+        handle.shutdown();
+        rt.shutdown_background();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn when_idle_waits_for_the_run_in_flight() {
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let r = ran.clone();
+        let rig = Rig::start_ctx(data(vec![inst(1, false)]), move |_ctx| {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(out("x"))
+            })
+        });
+        advance(3).await; // the run is in flight
+        rig.handle
+            .try_edit(|d| {
+                d.instances.clear();
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        rig.handle
+            .when_idle(&id(1), move || r.store(true, Ordering::SeqCst));
+        assert!(!ran.load(Ordering::SeqCst), "ran while the run was going");
+        advance(10).await;
+        assert!(ran.load(Ordering::SeqCst));
+
+        // Nothing in flight: runs at once.
+        let now = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let n = now.clone();
+        rig.handle
+            .when_idle(&id(2), move || n.store(true, Ordering::SeqCst));
+        assert!(now.load(Ordering::SeqCst));
     }
 }

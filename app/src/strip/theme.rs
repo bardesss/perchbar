@@ -14,6 +14,10 @@ pub struct Palette {
     pub accent: [u8; 4],
     pub bar_track: [u8; 4],
     pub hover_bg: [u8; 4],
+    /// Background of the "+N" flyout (opaque: it floats over anything).
+    pub flyout_bg: [u8; 4],
+    /// The flyout's 1 px border.
+    pub flyout_border: [u8; 4],
 }
 
 /// 60% alpha.
@@ -34,6 +38,9 @@ pub fn palette(dark: bool, accent: [u8; 4]) -> Palette {
             bar_track: [0xFF, 0xFF, 0xFF, 64],
             // White at 8%.
             hover_bg: [0xFF, 0xFF, 0xFF, 20],
+            flyout_bg: [0x2C, 0x2C, 0x2C, 0xFF],
+            // White at 16%.
+            flyout_border: [0xFF, 0xFF, 0xFF, 41],
         }
     } else {
         Palette {
@@ -47,6 +54,9 @@ pub fn palette(dark: bool, accent: [u8; 4]) -> Palette {
             bar_track: [0, 0, 0, 51],
             // Black at 6%.
             hover_bg: [0, 0, 0, 15],
+            flyout_bg: [0xF9, 0xF9, 0xF9, 0xFF],
+            // Black at 16%.
+            flyout_border: [0, 0, 0, 41],
         }
     }
 }
