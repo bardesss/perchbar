@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -73,9 +73,6 @@ pub struct AppState {
     /// Local widget folders by widget id. Filled by the local widget
     /// loading (with approvals) later; empty until then.
     pub local_folders: Mutex<HashMap<String, PathBuf>>,
-    /// Serializes snapshot, edit, apply, so two commands cannot lose each
-    /// other's change.
-    edits: Mutex<()>,
 }
 
 /// One installed widget, as the page lists it.
@@ -278,24 +275,14 @@ impl AppState {
             autostart,
             data_dir,
             local_folders: Mutex::default(),
-            edits: Mutex::default(),
         }
     }
 
-    fn lock_edits(&self) -> MutexGuard<'_, ()> {
-        self.edits.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
-    /// Edits a copy of the instance data under the edit lock, then
-    /// normalizes and applies it. Nothing changes when `f` fails.
+    /// Edits the instance data under the scheduler's state lock, the one
+    /// lock every edit (the strip's too) goes through. Nothing changes when
+    /// `f` fails. `f` must not call into the scheduler.
     fn edit<T>(&self, f: impl FnOnce(&mut Instances) -> CommandResult<T>) -> CommandResult<T> {
-        let _g = self.lock_edits();
-        let mut next = self.sched.snapshot();
-        let out = f(&mut next)?;
-        let known: HashSet<String> = self.sched.widgets().into_keys().collect();
-        next.normalize(&known);
-        self.sched.apply(next);
-        Ok(out)
+        self.sched.try_edit(f)
     }
 
     /// The manifest of an installed widget.
@@ -374,12 +361,18 @@ impl AppState {
                             .collect()
                     })
                     .unwrap_or_default();
-                let settings: Map<String, Value> = inst
-                    .settings
-                    .iter()
-                    .filter(|(k, _)| !secret_keys.contains(k.as_str()))
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
+                // Without its manifest nothing tells which settings are
+                // secret (an unmigrated one may sit in instances.json), so
+                // an instance of a widget that is not installed shows none.
+                let settings: Map<String, Value> = match entry {
+                    Some(_) => inst
+                        .settings
+                        .iter()
+                        .filter(|(k, _)| !secret_keys.contains(k.as_str()))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                    None => Map::new(),
+                };
                 // Only the key names leave this block; the values are dropped.
                 let (secrets_set, secrets_unreadable) = {
                     let load = self.secrets.load(&inst.id);
@@ -433,13 +426,20 @@ impl AppState {
             Ok(())
         })?;
         self.secrets.remove_instance(id);
-        let storage = self.storage_file(id);
-        if let Err(e) = std::fs::remove_file(&storage) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                log::warn!("cannot remove {}: {e}", storage.display());
-            }
-        }
         self.logbook.remove(id);
+        // A run still in flight saves its storage (and may log) when it
+        // ends, so the rest waits until no run of the instance is going.
+        let storage = self.storage_file(id);
+        let logbook = self.logbook.clone();
+        let owner = id.to_string();
+        self.sched.when_idle(id, move || {
+            if let Err(e) = std::fs::remove_file(&storage) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    log::warn!("cannot remove {}: {e}", storage.display());
+                }
+            }
+            logbook.remove(&owner);
+        });
         Ok(())
     }
 
@@ -457,6 +457,14 @@ impl AppState {
     /// Stores a secret and runs the instance again so it is used.
     pub fn set_secret(&self, id: &str, key: &str, value: &str) -> CommandResult<()> {
         self.secret_field(id, key)?;
+        if value.is_empty() {
+            let message = "Enter a value, or remove the secret".to_string();
+            let field = FieldError {
+                key: key.to_string(),
+                message: message.clone(),
+            };
+            return Err(CommandError::fields(message, vec![field]));
+        }
         if value.chars().count() > SECRET_MAX_CHARS {
             let message = format!("Secrets are at most {SECRET_MAX_CHARS} characters");
             let field = FieldError {
@@ -676,22 +684,22 @@ pub mod ipc {
     use super::*;
     use tauri::State;
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn get_state(state: State<'_, AppState>) -> CommandResult<StateView> {
         state.get_state()
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn add_instance(state: State<'_, AppState>, widget: String) -> CommandResult<String> {
         state.add_instance(&widget)
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn remove_instance(state: State<'_, AppState>, id: String) -> CommandResult<()> {
         state.remove_instance(&id)
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn update_settings(
         state: State<'_, AppState>,
         id: String,
@@ -700,7 +708,7 @@ pub mod ipc {
         state.update_settings(&id, &settings)
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn set_secret(
         state: State<'_, AppState>,
         id: String,
@@ -710,17 +718,17 @@ pub mod ipc {
         state.set_secret(&id, &key, &value)
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn clear_secret(state: State<'_, AppState>, id: String, key: String) -> CommandResult<()> {
         state.clear_secret(&id, &key)
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn set_hidden(state: State<'_, AppState>, id: String, hidden: bool) -> CommandResult<()> {
         state.set_hidden(&id, hidden)
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn set_max_width(
         state: State<'_, AppState>,
         id: String,
@@ -729,12 +737,12 @@ pub mod ipc {
         state.set_max_width(&id, max_width)
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn set_order(state: State<'_, AppState>, order: Vec<String>) -> CommandResult<()> {
         state.set_order(&order)
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn create_group(
         state: State<'_, AppState>,
         members: Vec<String>,
@@ -743,7 +751,7 @@ pub mod ipc {
         state.create_group(&members, interval)
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn update_group(
         state: State<'_, AppState>,
         id: String,
@@ -753,27 +761,27 @@ pub mod ipc {
         state.update_group(&id, &members, interval)
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn ungroup(state: State<'_, AppState>, id: String) -> CommandResult<()> {
         state.ungroup(&id)
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn refresh_now(state: State<'_, AppState>, id: String) -> CommandResult<()> {
         state.refresh_now(&id)
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn get_logs(state: State<'_, AppState>, id: String) -> CommandResult<Vec<LogLineView>> {
         state.get_logs(&id)
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn set_autostart(state: State<'_, AppState>, on: bool) -> CommandResult<()> {
         state.set_autostart(on)
     }
 
-    #[tauri::command]
+    #[tauri::command(async)]
     pub fn open_log_folder() -> CommandResult<()> {
         super::open_log_folder()
     }
@@ -784,7 +792,7 @@ mod tests {
     use super::*;
     use crate::display::{Color, Frame, TextSize};
     use crate::sandbox::{HttpClient, HttpFuture, HttpRequest, RunError};
-    use crate::scheduler::Scheduler;
+    use crate::scheduler::{Runner, Scheduler};
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -845,6 +853,13 @@ mod tests {
 
     impl Rig {
         fn start() -> Rig {
+            Rig::start_with(Instances::default(), |_| {
+                Arc::new(|_| Box::pin(async { Ok::<_, RunError>(out("x")) }))
+            })
+        }
+
+        /// `runner` gets the data folder.
+        fn start_with(data: Instances, runner: impl FnOnce(PathBuf) -> Runner) -> Rig {
             let dir = tempfile::tempdir().unwrap();
             let widgets = HashMap::from([(
                 "w".to_string(),
@@ -853,10 +868,10 @@ mod tests {
             let secrets = SecretStore::new(dir.path().join("secrets"));
             let sched = Scheduler::start_with_runner(
                 widgets,
-                Instances::default(),
+                data,
                 Arc::new(NoHttp),
                 secrets.clone(),
-                Arc::new(|_| Box::pin(async { Ok::<_, RunError>(out("x")) })),
+                runner(dir.path().to_path_buf()),
                 dir.path().join("instances.json"),
                 |_| {},
             );
@@ -1011,12 +1026,102 @@ mod tests {
             .unwrap();
         let view = rig.state.get_state().unwrap();
         assert_eq!(view.instances[0].settings["title"], json!("Yo"));
-        let wire = serde_json::to_value(e_sample()).unwrap();
-        assert_eq!(wire, json!({"message": "m"}));
     }
 
-    fn e_sample() -> CommandError {
-        CommandError::new("m")
+    #[test]
+    fn command_error_wire_shape() {
+        let plain = serde_json::to_value(CommandError::new("m")).unwrap();
+        assert_eq!(plain, json!({"message": "m"}));
+        let with_fields = CommandError::fields(
+            "Some settings need fixing",
+            vec![FieldError {
+                key: "title".into(),
+                message: "Must be text".into(),
+            }],
+        );
+        assert_eq!(
+            serde_json::to_value(with_fields).unwrap(),
+            json!({
+                "message": "Some settings need fixing",
+                "fields": [{"key": "title", "message": "Must be text"}]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_widget_instance_sends_no_settings() {
+        let orphan = Instance {
+            id: "inst-0000000a".into(),
+            widget: "uninstalled".into(),
+            settings: json!({"apiKey": "sk-plain-leftover", "city": "Oslo"})
+                .as_object()
+                .unwrap()
+                .clone(),
+            hidden: false,
+            max_width: None,
+        };
+        let data = Instances {
+            order: vec![orphan.id.clone()],
+            instances: vec![orphan],
+            groups: vec![],
+        };
+        let rig = Rig::start_with(data, |_| {
+            Arc::new(|_| Box::pin(async { Ok::<_, RunError>(out("x")) }))
+        });
+        let view = rig.state.get_state().unwrap();
+        assert_eq!(view.instances.len(), 1);
+        assert!(view.instances[0].settings.is_empty());
+        assert_eq!(view.instances[0].status.state, "error");
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("sk-plain-leftover"));
+    }
+
+    #[tokio::test]
+    async fn set_secret_rejects_empty_value() {
+        let rig = Rig::start();
+        let id = rig.state.add_instance("w").unwrap();
+        let e = rig.state.set_secret(&id, "apiKey", "").unwrap_err();
+        assert_eq!(e.fields.unwrap()[0].key, "apiKey");
+        assert!(rig.state.get_state().unwrap().instances[0]
+            .secrets_set
+            .is_empty());
+    }
+
+    /// The sandbox saves storage when a run ends, even after a stop. A run
+    /// in flight when its instance is removed must not leave the file.
+    #[tokio::test(start_paused = true)]
+    async fn run_in_flight_cannot_bring_back_removed_storage() {
+        let id = "inst-0000000b".to_string();
+        let inst = Instance {
+            id: id.clone(),
+            widget: "w".into(),
+            settings: Map::new(),
+            hidden: false,
+            max_width: None,
+        };
+        let data = Instances {
+            order: vec![id.clone()],
+            instances: vec![inst],
+            groups: vec![],
+        };
+        let rig = Rig::start_with(data, |dir| {
+            Arc::new(move |ctx: crate::sandbox::RunContext| {
+                let file = dir
+                    .join("storage")
+                    .join(format!("{}.json", ctx.instance_id));
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                    std::fs::write(&file, "{}").unwrap();
+                    Ok(out("x"))
+                })
+            })
+        });
+        let storage = rig.dir.path().join("storage").join(format!("{id}.json"));
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await; // run in flight
+        rig.state.remove_instance(&id).unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        assert!(!storage.exists(), "the run wrote storage after removal");
     }
 
     #[tokio::test]

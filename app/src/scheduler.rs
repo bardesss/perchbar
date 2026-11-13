@@ -761,14 +761,57 @@ impl SchedulerHandle {
 
     /// Edits a copy of the data under the state lock, then applies it.
     fn edit(&self, f: impl FnOnce(&mut Instances)) -> bool {
+        let edited: Result<((), bool), std::convert::Infallible> = self.edit_with(|data| {
+            f(data);
+            Ok(())
+        });
+        edited.is_ok_and(|(_, changed)| changed)
+    }
+
+    /// Edits a copy of the current data under the state lock and applies it
+    /// as `apply` does. When `f` fails nothing changes. Every edit of the
+    /// instance data goes through this lock, so edits from the settings
+    /// window and the strip never overwrite each other.
+    ///
+    /// `f` runs under the state lock: it must not call back into the handle.
+    pub fn try_edit<T, E>(&self, f: impl FnOnce(&mut Instances) -> Result<T, E>) -> Result<T, E> {
+        self.edit_with(f).map(|(out, _)| out)
+    }
+
+    /// Runs `f` once no run of the instance is executing: right away when
+    /// none is, otherwise on the runtime after the run ends. For cleanup of
+    /// a removed instance's files, which a run in flight could write again.
+    pub fn when_idle(&self, instance_id: &str, f: impl FnOnce() + Send + 'static) {
+        let guard = self.shared.lock().guards.get(instance_id).cloned();
+        let Some(guard) = guard else {
+            f();
+            return;
+        };
+        match guard.clone().try_lock_owned() {
+            Ok(_held) => f(),
+            Err(_) => {
+                self.shared.runtime.spawn(async move {
+                    // `f` is a quick file removal: fine on a worker.
+                    let _held = guard.lock_owned().await;
+                    f();
+                });
+            }
+        }
+    }
+
+    /// The edit itself. Returns `f`'s value and whether the data changed.
+    fn edit_with<T, E>(
+        &self,
+        f: impl FnOnce(&mut Instances) -> Result<T, E>,
+    ) -> Result<(T, bool), E> {
         let shared = &self.shared;
         shared.update(|inner| {
             let mut next = inner.data.clone();
-            f(&mut next);
+            let out = f(&mut next)?;
             let known: HashSet<String> = inner.widgets.keys().cloned().collect();
             next.normalize(&known);
             if next == inner.data {
-                return false;
+                return Ok((out, false));
             }
             let mut removed = Vec::new();
             let mut restart = Vec::new();
@@ -803,7 +846,7 @@ impl SchedulerHandle {
             // Submitted under the state lock, so snapshots reach the saver in
             // the order the changes happened. The saver writes off-thread.
             shared.saver.submit(inner.data.clone());
-            true
+            Ok((out, true))
         })
     }
 
@@ -1927,5 +1970,99 @@ mod tests {
         let last = lines.last().expect("a logbook line");
         assert_eq!(last.level, LogLevel::Error);
         assert!(last.text.contains("boom"), "{}", last.text);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn try_edit_error_changes_nothing() {
+        let rig = Rig::start(data(vec![inst(1, false)]), |_| Ok(out("x")));
+        let before = rig.handle.snapshot();
+        let r: Result<(), &str> = rig.handle.try_edit(|d| {
+            d.instances.clear();
+            Err("no")
+        });
+        assert_eq!(r, Err("no"));
+        assert_eq!(rig.handle.snapshot(), before);
+        let n = rig.handle.try_edit(|d| {
+            d.instances[0].max_width = Some(99);
+            Ok::<_, ()>(7)
+        });
+        assert_eq!(n, Ok(7));
+        assert_eq!(rig.handle.snapshot().instances[0].max_width, Some(99));
+    }
+
+    /// The strip's `set_hidden` arrives while a settings edit is in the
+    /// middle of its closure: it waits for the lock and lands on top, so
+    /// neither change is lost.
+    #[test]
+    fn set_hidden_during_try_edit_is_not_lost() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let handle = rt.block_on(async {
+            Scheduler::start_with_runner(
+                widgets(),
+                data(vec![inst(1, false), inst(2, false)]),
+                Arc::new(NoHttp),
+                test_store(&dir),
+                Arc::new(|_| Box::pin(std::future::pending())),
+                dir.path().join("i.json"),
+                |_| {},
+            )
+        });
+        let _rt = rt.enter();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let strip = handle.clone();
+        let strip_thread = std::thread::spawn(move || {
+            go_rx.recv().unwrap();
+            strip.set_hidden(&id(1), true);
+        });
+        handle
+            .try_edit(|d| {
+                // Let the strip call in now; it must wait for this edit.
+                go_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+                d.instances[1].max_width = Some(120);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        strip_thread.join().unwrap();
+        let snap = handle.snapshot();
+        assert!(snap.instances[0].hidden, "the strip's hide was lost");
+        assert_eq!(snap.instances[1].max_width, Some(120));
+        handle.shutdown();
+        rt.shutdown_background();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn when_idle_waits_for_the_run_in_flight() {
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let r = ran.clone();
+        let rig = Rig::start_ctx(data(vec![inst(1, false)]), move |_ctx| {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(out("x"))
+            })
+        });
+        advance(3).await; // the run is in flight
+        rig.handle
+            .try_edit(|d| {
+                d.instances.clear();
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        rig.handle
+            .when_idle(&id(1), move || r.store(true, Ordering::SeqCst));
+        assert!(!ran.load(Ordering::SeqCst), "ran while the run was going");
+        advance(10).await;
+        assert!(ran.load(Ordering::SeqCst));
+
+        // Nothing in flight: runs at once.
+        let now = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let n = now.clone();
+        rig.handle
+            .when_idle(&id(2), move || n.store(true, Ordering::SeqCst));
+        assert!(now.load(Ordering::SeqCst));
     }
 }

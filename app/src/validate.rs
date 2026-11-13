@@ -15,6 +15,8 @@ pub const TEXT_MAX_CHARS: usize = 2000;
 pub const SHORT_MAX_CHARS: usize = 200;
 /// Most entries in a `list` value.
 pub const LIST_MAX_ENTRIES: usize = 50;
+/// Most entries a `list` value may arrive with, empty ones included.
+pub const LIST_MAX_RAW_ENTRIES: usize = 200;
 /// Largest serialized settings object, in bytes.
 pub const SETTINGS_MAX_BYTES: usize = 16 * 1024;
 /// Allowed `maxWidth` range, in pixels.
@@ -135,6 +137,10 @@ fn check(kind: SettingKind, options: &[String], value: &Value) -> Result<Value, 
             let Value::Array(items) = value else {
                 return Err("Must be a list".to_string());
             };
+            // Bounds the work before empty entries are dropped.
+            if items.len() > LIST_MAX_RAW_ENTRIES {
+                return Err(format!("At most {LIST_MAX_ENTRIES} entries"));
+            }
             let mut kept = Vec::new();
             for item in items {
                 let Value::String(s) = item else {
@@ -284,6 +290,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ok["tickers"], json!(["a", "b"]));
+        // Mostly empty entries: fine up to the raw cap, refused past it.
+        let mut padded = vec![""; LIST_MAX_RAW_ENTRIES - 1];
+        padded.push("x");
+        assert!(settings(
+            &manifest(),
+            &input(json!({ "tickers": padded })),
+            &has_key()
+        )
+        .is_ok());
+        padded.push("");
+        assert_eq!(keys(&errors_for(json!({ "tickers": padded }))), ["tickers"]);
     }
 
     #[test]
