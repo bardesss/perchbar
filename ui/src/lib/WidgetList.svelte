@@ -1,10 +1,10 @@
 <script lang="ts">
   // "On your taskbar": instances and groups in strip order. Top-level rows
-  // reorder by drag (onto the gap above a row, or after the last row) or
-  // with Move up / Move down. A single row dropped onto another single row
-  // makes a group of the two, onto a group row joins that group; "Group
-  // with..." does the same from the keyboard. A group row opens the group
-  // editor and shows its members under it.
+  // reorder by drag (onto the top or bottom third of a row, or after the
+  // last row) or with Move up / Move down. A single row dropped onto the
+  // middle of another single row makes a group of the two, onto a group row
+  // joins that group; "Group with..." does the same from the keyboard. A
+  // group row opens the group editor and shows its members under it.
   import { tick } from "svelte";
   import {
     createGroup,
@@ -15,7 +15,8 @@
     type StateView,
   } from "../api";
   import { NEW_GROUP_INTERVAL, statusLine } from "./form";
-  import { dropAction, moveBy } from "./order";
+  import { dropAction, dropZone, moveBy, type DropZone } from "./order";
+  import type { Saver } from "./saving";
 
   interface Props {
     view: StateView;
@@ -25,9 +26,11 @@
     onselect: (id: string) => void;
     onchanged: () => Promise<void>;
     onerror: (message: string) => void;
+    /** The queue every change to one group goes through. */
+    forGroup: (id: string) => Saver;
   }
 
-  let { view, labels, selectedId, onselect, onchanged, onerror }: Props = $props();
+  let { view, labels, selectedId, onselect, onchanged, onerror, forGroup }: Props = $props();
 
   /** The drop zone after the last row. Ids are never empty. */
   const END = "";
@@ -35,8 +38,8 @@
   /** Order shown until the refetch after a move lands. */
   let pendingOrder: string[] | null = $state(null);
   let dragging: string | null = $state(null);
-  /** Where a drop would land: before the row, or into it (grouping). */
-  let drop: { id: string; into: boolean } | null = $state(null);
+  /** Where a drop would land on a row. */
+  let drop: { id: string; zone: DropZone } | null = $state(null);
   /** The row whose "Group with..." choices are open. */
   let menuFor: string | null = $state(null);
 
@@ -56,7 +59,7 @@
   }
 
   /** Focuses `part` of a top-level row once the page shows the change. */
-  async function focusRow(id: string, part = ".select") {
+  export async function focusRow(id: string, part = ".select") {
     await tick();
     document.querySelector<HTMLElement>(`li[data-id="${CSS.escape(id)}"] ${part}`)?.focus();
   }
@@ -86,18 +89,23 @@
     }
   }
 
-  /** Adds a single row to the end of a group, which opens in the main pane. */
-  async function joinGroup(id: string, groupId: string) {
-    const group = groups.get(groupId);
-    if (!group) return;
-    try {
-      await updateGroup(groupId, [...group.members, id], group.interval);
-      await onchanged();
-      onselect(groupId);
-      await focusRow(groupId);
-    } catch (e) {
-      onerror((e as CommandError).message);
-    }
+  /**
+   * Adds a single row to the end of a group, which opens in the main pane.
+   * Waits its turn in the group's queue and reads the group only then.
+   */
+  function joinGroup(id: string, groupId: string): Promise<void> {
+    return forGroup(groupId).run(async () => {
+      const group = groups.get(groupId);
+      if (!group || group.members.includes(id)) return;
+      try {
+        await updateGroup(groupId, [...group.members, id], group.interval);
+        await onchanged();
+        onselect(groupId);
+        await focusRow(groupId);
+      } catch (e) {
+        onerror((e as CommandError).message);
+      }
+    });
   }
 
   async function step(id: string, delta: -1 | 1, button: HTMLElement) {
@@ -147,21 +155,22 @@
     dragging = id;
     menuFor = null;
     e.dataTransfer?.setData("text/plain", id);
-    if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+    // "link" shows a different cursor while a drop would group.
+    if (e.dataTransfer) e.dataTransfer.effectAllowed = "linkMove";
   }
 
-  /** A drop into the row (grouping) rather than onto the gap above it. */
-  function dropsInto(e: DragEvent, from: string, target: string): boolean {
-    if (target === END || from === target || isGroup(from)) return false;
+  function zoneAt(e: DragEvent, from: string, target: string): DropZone {
+    if (target === END) return "before";
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    return e.clientY - rect.top >= Math.min(12, rect.height / 3);
+    return dropZone(e.clientY - rect.top, rect.height, from !== target && !isGroup(from));
   }
 
   function ondragover(e: DragEvent, id: string) {
     if (!dragging) return;
     e.preventDefault();
-    if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
-    drop = { id, into: dropsInto(e, dragging, id) };
+    const zone = zoneAt(e, dragging, id);
+    if (e.dataTransfer) e.dataTransfer.dropEffect = zone === "into" ? "link" : "move";
+    drop = { id, zone };
   }
 
   function ondragleave(id: string) {
@@ -172,10 +181,10 @@
     if (!dragging) return;
     e.preventDefault();
     const from = dragging;
-    const into = dropsInto(e, from, id);
+    const zone = zoneAt(e, from, id);
     dragging = null;
     drop = null;
-    const action = dropAction(order, isGroup, from, id === END ? null : id, into);
+    const action = dropAction(order, isGroup, from, id === END ? null : id, zone);
     if (!action) return;
     if (action.kind === "order") void apply(action.order);
     else if (action.kind === "create") void makeGroup(action.members);
@@ -204,7 +213,7 @@
         <span
           class="status"
           class:error={inst.status.state === "error" || inst.status.state === "blocked"}
-        >{status || " "}</span>
+        >{status || "\u00a0"}</span>
       </button>
       <input
         class="switch"
@@ -314,8 +323,9 @@
         data-id={id}
         draggable="true"
         class:dragging={dragging === id}
-        class:drop={drop?.id === id && !drop.into && dragging !== id}
-        class:into={drop?.id === id && drop.into}
+        class:drop={drop?.id === id && drop.zone === "before" && dragging !== id}
+        class:after={drop?.id === id && drop.zone === "after" && dragging !== id}
+        class:into={drop?.id === id && drop.zone === "into"}
         ondragstart={(e) => ondragstart(e, id)}
         ondragover={(e) => ondragover(e, id)}
         ondragleave={() => ondragleave(id)}
@@ -371,10 +381,15 @@
   .list > li {
     border-radius: var(--radius);
     border-top: 2px solid transparent;
+    border-bottom: 2px solid transparent;
   }
 
   .list > li.drop {
     border-top-color: var(--accent);
+  }
+
+  .list > li.after {
+    border-bottom-color: var(--accent);
   }
 
   .list > li.into {

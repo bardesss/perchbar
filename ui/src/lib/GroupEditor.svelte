@@ -1,24 +1,31 @@
 <script lang="ts">
   // One rotation group: how often it turns, the order its widgets take
-  // turns in, and taking widgets out. Every change waits for the one before
-  // it, so each builds on the state the last one left. The parent re-creates
-  // this per group.
+  // turns in, and taking widgets out. Every change goes through the group's
+  // queue, which the list's "add to group" shares, and reads the stored
+  // group only when its turn comes. The parent re-creates this per group.
   import { tick } from "svelte";
   import { ungroup, updateGroup, type CommandError, type Group } from "../api";
   import { checkInterval, GROUP_INTERVAL_MAX, GROUP_INTERVAL_MIN } from "./form";
   import { moveBefore, moveBy } from "./order";
-  import { createSaver, type Slot } from "./saving";
+  import type { Saver, Slot } from "./saving";
 
   interface Props {
+    /** The group as shown. */
     group: Group;
+    /** The group as stored now, or undefined once it is gone. */
+    current: () => Group | undefined;
+    /** This group's queue. */
+    saver: Saver;
     labels: Record<string, string>;
     /** Shows an instance in the main pane. */
     onselect: (id: string) => void;
+    /** Puts focus on a top-level row of the list. */
+    focusRow: (id: string) => Promise<void>;
     /** Refetches the state; resolves once the new state is in. */
     onchanged: () => Promise<void>;
   }
 
-  let { group, labels, onselect, onchanged }: Props = $props();
+  let { group, current, saver, labels, onselect, focusRow, onchanged }: Props = $props();
 
   /** The drop zone after the last member. Instance ids are never empty. */
   const END = "";
@@ -37,7 +44,6 @@
   let root: HTMLElement | undefined = $state();
 
   const members = $derived(pendingMembers ?? group.members);
-  const { run, save } = createSaver(() => onchanged());
 
   const intervalSlot: Slot = {
     draft: () => interval.draft ?? undefined,
@@ -45,6 +51,8 @@
     setError: (m) => (interval.error = m),
     setSaved: (on) => (interval.saved = on),
   };
+
+  const gone: CommandError = { message: "This group is gone" };
 
   function name(id: string): string {
     return labels[id] ?? id;
@@ -64,11 +72,15 @@
       interval.error = problem;
       return;
     }
-    void save(
+    void saver.save(
       "interval",
       intervalSlot,
       raw,
-      () => updateGroup(group.id, group.members, Number(raw.trim())),
+      async () => {
+        const stored = current();
+        if (!stored) throw gone;
+        await updateGroup(stored.id, stored.members, Number(raw.trim()));
+      },
       (err) => (interval.error = err.message),
     );
   }
@@ -83,11 +95,12 @@
     const mine = ++moves;
     pendingMembers = preview;
     notice = null;
-    return run(async () => {
+    return saver.run(async () => {
       try {
-        const next = compute(group.members);
-        if (next) {
-          await updateGroup(group.id, next, group.interval);
+        const stored = current();
+        const next = stored && compute(stored.members);
+        if (stored && next) {
+          await updateGroup(stored.id, next, stored.interval);
           await onchanged();
         }
       } catch (e) {
@@ -114,27 +127,25 @@
   /** The group is gone: show `id` and put focus on its row in the list. */
   async function leave(id: string) {
     onselect(id);
-    await tick();
-    document.querySelector<HTMLButtonElement>(`li[data-id="${CSS.escape(id)}"] .select`)?.focus();
+    await focusRow(id);
   }
 
   function removeMember(id: string) {
     notice = null;
-    void run(async () => {
-      const { id: groupId, members: stored, interval: seconds } = group;
-      const index = stored.indexOf(id);
-      const rest = stored.filter((m) => m !== id);
+    void saver.run(async () => {
+      const stored = current();
+      if (!stored || !stored.members.includes(id)) return;
+      const index = stored.members.indexOf(id);
+      const rest = stored.members.filter((m) => m !== id);
       try {
+        // With one widget left the core dissolves the group: that widget
+        // takes its place and the removed one follows it.
+        await updateGroup(stored.id, rest, stored.interval);
+        await onchanged();
         if (rest.length < 2) {
-          // One widget does not rotate: the group goes, its widgets return
-          // to the list.
-          await ungroup(groupId);
-          await onchanged();
           await leave(id);
           return;
         }
-        await updateGroup(groupId, rest, seconds);
-        await onchanged();
         await tick();
         const next = rest[Math.min(index, rest.length - 1)];
         root
@@ -148,12 +159,13 @@
 
   function dissolve() {
     notice = null;
-    void run(async () => {
-      const { id: groupId, members: stored } = group;
+    void saver.run(async () => {
+      const stored = current();
+      if (!stored) return;
       try {
-        await ungroup(groupId);
+        await ungroup(stored.id);
         await onchanged();
-        if (stored[0]) await leave(stored[0]);
+        if (stored.members[0]) await leave(stored.members[0]);
       } catch (e) {
         notice = (e as CommandError).message;
       }

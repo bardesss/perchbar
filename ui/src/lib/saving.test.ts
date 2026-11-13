@@ -1,5 +1,5 @@
 import { expect, test, vi } from "vitest";
-import { createSaver, type Slot } from "./saving";
+import { createSaver, keyedSavers, type Slot } from "./saving";
 
 function slot(draft: unknown) {
   const s = {
@@ -89,4 +89,34 @@ test("a refused save reports the error and keeps the draft", async () => {
   }, (e) => (message = e.message));
   expect(message).toBe("Rotation interval is 3 to 3600 seconds");
   expect(s.value).toBe("8");
+});
+
+test("one group's changes share a queue, each reading what the last one stored", async () => {
+  // An interval save from the editor, then a join from the list.
+  let stored = { members: ["a", "b"], interval: 8 };
+  const forGroup = keyedSavers(async () => {});
+  expect(forGroup("g")).toBe(forGroup("g"));
+  const interval = forGroup("g").run(async () => {
+    const next = { ...stored, interval: 4 };
+    await new Promise((r) => setTimeout(r, 5));
+    stored = next;
+  });
+  const join = forGroup("g").run(async () => {
+    stored = { ...stored, members: [...stored.members, "c"] };
+  });
+  await Promise.all([interval, join]);
+  expect(stored).toEqual({ members: ["a", "b", "c"], interval: 4 });
+});
+
+test("different groups do not wait for each other", async () => {
+  const forGroup = keyedSavers(async () => {});
+  let release!: () => void;
+  const slow = forGroup("g1").run(() => new Promise<void>((r) => (release = r)));
+  let other = false;
+  await forGroup("g2").run(async () => {
+    other = true;
+  });
+  expect(other).toBe(true);
+  release();
+  await slow;
 });

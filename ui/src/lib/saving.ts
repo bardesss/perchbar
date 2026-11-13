@@ -1,5 +1,6 @@
-// One editor's saves, run one at a time so each sends the state the last
-// one left. Shared by the widget editor and the group editor.
+// Saves that run one at a time, so each sends the state the last one
+// left. The widget editor has one; each group has one, shared by the list
+// and the group editor.
 
 import type { CommandError } from "../api";
 
@@ -62,4 +63,22 @@ export function createSaver(onchanged: () => Promise<void>) {
   }
 
   return { run, save };
+}
+
+export type Saver = ReturnType<typeof createSaver>;
+
+/**
+ * One saver per key, made on first use. Every change to one group goes
+ * through that group's saver, from the list and the group editor alike.
+ */
+export function keyedSavers(onchanged: () => Promise<void>): (key: string) => Saver {
+  const savers = new Map<string, Saver>();
+  return (key) => {
+    let saver = savers.get(key);
+    if (!saver) {
+      saver = createSaver(onchanged);
+      savers.set(key, saver);
+    }
+    return saver;
+  };
 }

@@ -6,6 +6,7 @@
   import GroupEditor from "./lib/GroupEditor.svelte";
   import { instanceLabels } from "./lib/form";
   import { latestRefresher } from "./lib/latest";
+  import { keyedSavers } from "./lib/saving";
   import WidgetEditor from "./lib/WidgetEditor.svelte";
   import WidgetList from "./lib/WidgetList.svelte";
 
@@ -48,6 +49,10 @@
     },
     (e) => (loadError = (e as CommandError).message),
   );
+
+  /** Every change to one group waits for the one before it. */
+  const forGroup = keyedSavers(() => refresh());
+  let list: WidgetList | undefined = $state();
 
   function reconcileSelection() {
     if (!view) return;
@@ -108,7 +113,9 @@
     <div class="list">
       {#if view}
         <WidgetList
+          bind:this={list}
           {view}
+          {forGroup}
           {labels}
           {selectedId}
           onselect={select}
@@ -136,10 +143,14 @@
       <p class="muted">Loading</p>
     {:else if selectedGroup}
       {#key selectedGroup.id}
+        {@const groupId = selectedGroup.id}
         <GroupEditor
           group={selectedGroup}
+          current={() => view?.groups.find((g) => g.id === groupId)}
+          saver={forGroup(groupId)}
           {labels}
           onselect={select}
+          focusRow={(id) => list?.focusRow(id) ?? Promise.resolve()}
           onchanged={refresh}
         />
       {/key}
