@@ -36,13 +36,14 @@ use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GdiFlush, SelectObject,
     BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
 };
-use windows_numerics::Vector2;
+use windows_numerics::{Matrix3x2, Vector2};
 
 use crate::display::{Block, Color, Output, TextSize};
 use crate::strip::icons;
 use crate::strip::layout::{
     block_width, px, Measure, Metrics, PlacedSlot, StripLayout, BAR_HEIGHT_DIP, BLOCK_GAP_DIP,
-    ICON_DIP, NORMAL_TEXT_DIP, RING_DIP, SLOT_PAD_DIP, SMALL_TEXT_DIP, SPARK_HEIGHT_DIP,
+    FLYOUT_ROW_DIP, ICON_DIP, NORMAL_TEXT_DIP, RING_DIP, SLOT_PAD_DIP, SMALL_TEXT_DIP,
+    SPARK_HEIGHT_DIP,
 };
 use crate::strip::model::{SlotKind, SlotState, StripModel};
 use crate::strip::theme::{resolve, Palette};
@@ -76,6 +77,8 @@ const SPARK_STROKE_DIP: f32 = 1.5;
 const ICON_GLYPH_DIP: f32 = 16.0;
 /// Size of the warning badge over a slot that has an error and old output.
 const BADGE_DIP: f32 = 10.0;
+/// Corner radius of the "+N" flyout.
+const FLYOUT_RADIUS_DIP: f32 = 8.0;
 /// Slack added to a text box so rounding never triggers the ellipsis.
 const TEXT_SLACK_DIP: f32 = 0.5;
 
@@ -232,6 +235,14 @@ pub struct Renderer {
     round: ID2D1StrokeStyle,
     target: Option<ID2D1DCRenderTarget>,
     images: ImageCache,
+}
+
+/// What a whole bitmap is drawn with: palette, row (strip) height in DIPs
+/// and scale.
+struct Paint<'a> {
+    pal: &'a Palette,
+    height: f32,
+    scale: f32,
 }
 
 /// Per-draw state: target, palette, strip height and current opacity.
@@ -417,6 +428,86 @@ impl Renderer {
     ) -> windows::core::Result<Bitmap> {
         let w = px(layout.width_dip, metrics.scale);
         let h = px(metrics.height_dip, metrics.scale);
+        let paint = Paint {
+            pal: palette,
+            height: metrics.height_dip,
+            scale: metrics.scale,
+        };
+        self.draw_bitmap_with(w, h, &paint, |r, ctx| {
+            r.draw_strip(ctx, layout, model, hover)
+        })
+    }
+
+    /// Draws the "+N" flyout, `size` pixels: a rounded panel with a 1 px
+    /// border, and each row (a slot placed in DIPs, the top of its row in
+    /// DIPs) drawn like a strip slot [`FLYOUT_ROW_DIP`] tall.
+    pub fn render_flyout(
+        &mut self,
+        size: (i32, i32),
+        scale: f32,
+        rows: &[(PlacedSlot, f32)],
+        model: &StripModel,
+        palette: &Palette,
+        hover: Option<&str>,
+    ) -> windows::core::Result<Bitmap> {
+        let paint = Paint {
+            pal: palette,
+            height: FLYOUT_ROW_DIP,
+            scale,
+        };
+        self.draw_bitmap_with(size.0, size.1, &paint, |r, ctx| {
+            let (w, h) = (size.0 as f32 / scale, size.1 as f32 / scale);
+            r.draw_panel(ctx, w, h)?;
+            for (slot, top) in rows {
+                // SAFETY: inside BeginDraw; reset below on every path.
+                unsafe { ctx.rt.SetTransform(&Matrix3x2::translation(0.0, *top)) };
+                let clip = rect(slot.x_dip, 0.0, slot.x_dip + slot.width_dip, ctx.height);
+                // SAFETY: inside BeginDraw; popped below on every path.
+                unsafe {
+                    ctx.rt
+                        .PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED)
+                };
+                let drawn = r.draw_slot(ctx, slot, model, hover == Some(slot.slot_id.as_str()));
+                // SAFETY: matches the push and the transform above.
+                unsafe {
+                    ctx.rt.PopAxisAlignedClip();
+                    ctx.rt.SetTransform(&Matrix3x2::identity());
+                }
+                drawn?;
+            }
+            Ok(())
+        })
+    }
+
+    /// The flyout's background: rounded, filled, with a 1 px border inside
+    /// the `w` x `h` DIP bitmap.
+    fn draw_panel(&self, ctx: &Ctx, w: f32, h: f32) -> windows::core::Result<()> {
+        let stroke = 1.0 / ctx.scale;
+        let inset = stroke / 2.0;
+        let rr = D2D1_ROUNDED_RECT {
+            rect: rect(inset, inset, w - inset, h - inset),
+            radiusX: FLYOUT_RADIUS_DIP,
+            radiusY: FLYOUT_RADIUS_DIP,
+        };
+        let bg = ctx.brush(ctx.pal.flyout_bg)?;
+        let border = ctx.brush(ctx.pal.flyout_border)?;
+        // SAFETY: inside BeginDraw.
+        unsafe {
+            ctx.rt.FillRoundedRectangle(&rr, &bg);
+            ctx.rt.DrawRoundedRectangle(&rr, &border, stroke, None);
+        }
+        Ok(())
+    }
+
+    /// Draws `w` x `h` pixels with `draw` into a cleared, premultiplied
+    /// bitmap at the paint's scale. An empty size gives an empty bitmap.
+    fn draw_bitmap_with(
+        &mut self,
+        w: i32,
+        h: i32,
+        paint: &Paint,
+        draw: impl FnOnce(&mut Self, &Ctx) -> windows::core::Result<()>,
+    ) -> windows::core::Result<Bitmap> {
         if w <= 0 || h <= 0 {
             return Ok(Bitmap {
                 width: w.max(0),
@@ -426,7 +517,7 @@ impl Renderer {
         }
         let dib = Dib::new(w, h)?;
         let target = self.dc_target()?;
-        let dpi = 96.0 * metrics.scale;
+        let dpi = 96.0 * paint.scale;
         // SAFETY: the DIB outlives the draw; BeginDraw is always paired with
         // EndDraw below.
         let drawn = unsafe {
@@ -441,16 +532,17 @@ impl Renderer {
             )?;
             target.SetDpi(dpi, dpi);
             target.BeginDraw();
+            target.SetTransform(&Matrix3x2::identity());
             target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
             target.Clear(Some(&color_f([0, 0, 0, 0], 1.0)));
             let ctx = Ctx {
                 rt: &target,
-                pal: palette,
-                height: metrics.height_dip,
-                scale: metrics.scale,
+                pal: paint.pal,
+                height: paint.height,
+                scale: paint.scale,
                 opacity: 1.0,
             };
-            let drawn = self.draw_strip(&ctx, layout, model, hover);
+            let drawn = draw(self, &ctx);
             let ended = target.EndDraw(None, None);
             if ended.is_err() {
                 // Recreate the target next time (D2DERR_RECREATE_TARGET).
@@ -953,6 +1045,39 @@ mod tests {
                 .pixels
                 .chunks(4)
                 .all(|p| p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3]));
+        }
+    }
+
+    #[test]
+    fn flyout_renders_rounded_panel_and_rows() {
+        let mut r = Renderer::new().expect("renderer");
+        let model = text_model("BTC $67,120");
+        let mut row = crate::strip::layout::flyout_rows(
+            &model,
+            &RotationState::default(),
+            &["s1".into()],
+            &r,
+        )
+        .remove(0);
+        row.x_dip = 8.0;
+        row.width_dip = 144.0;
+        for dark in [true, false] {
+            let pal = theme::palette(dark, [0, 120, 212, 255]);
+            let size = (px(160.0, 1.5), px(56.0, 1.5));
+            let b = r
+                .render_flyout(size, 1.5, &[(row.clone(), 8.0)], &model, &pal, Some("s1"))
+                .expect("render");
+            assert_eq!((b.width, b.height), size);
+            let at = |x: i32, y: i32| &b.pixels[((y * b.width + x) * 4) as usize..][..4];
+            // Opaque inside, see-through in the rounded corner.
+            assert_eq!(at(b.width / 2, 2)[3], 255);
+            assert_eq!(at(0, 0)[3], 0);
+            // The row's text differs from the plain background.
+            let bg = at(b.width - 3, b.height / 2).to_vec();
+            assert!(b
+                .pixels
+                .chunks(4)
+                .any(|p| p != bg.as_slice() && p[3] == 255));
         }
     }
 

@@ -3,7 +3,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -127,10 +126,6 @@ fn main() {
         ),
     }
     let known: HashSet<String> = widgets.keys().cloned().collect();
-    let names: HashMap<PathBuf, String> = widgets
-        .values()
-        .map(|(m, dir)| (dir.clone(), m.name.clone()))
-        .collect();
     let mut data = instances::load(&paths::instances_file());
     // No file after loading: a first run, or a corrupt file that `load` moved
     // aside. A saved empty strip (the user removed everything) stays empty.
@@ -208,7 +203,6 @@ fn main() {
     let mut strip_thread = Some(strip::spawn(
         rx,
         sched,
-        names,
         move || quit_handle.exit(0),
         // Queued for the main thread; the strip never waits.
         move |focus| {

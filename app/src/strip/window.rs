@@ -6,6 +6,10 @@
 //! State lives in a thread-local and is only touched from window procedures
 //! dispatched by the loop; nested messages (sent while the state is in use)
 //! never touch it, and any that would are reposted or dropped.
+//!
+//! The "+N" flyout (`strip::flyout`) is another window of this thread,
+//! owned by the control window; its procedure and drawing are here, next
+//! to the state they share with the strip.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -19,8 +23,9 @@ use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetMonitorInfoW,
-    MonitorFromPoint, ScreenToClient, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    MonitorFromPoint, MonitorFromRect, ScreenToClient, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER,
+    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
@@ -32,17 +37,19 @@ use windows::Win32::UI::Controls::{
 use windows::Win32::UI::HiDpi::{
     SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE,
+};
 use windows::Win32::UI::Input::Touch::{CloseGestureInfoHandle, HGESTUREINFO};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetCursorPos, GetMessageW, GetWindow, GetWindowRect,
+    DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindow, GetWindowRect,
     GetWindowThreadProcessId, IsChild, IsWindow, IsWindowVisible, KillTimer, LoadCursorW,
     PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SendMessageW, SetCursor,
     SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TrackPopupMenuEx, TranslateMessage,
     CW_USEDEFAULT, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE,
     GW_CHILD, HWND_TOP, IDC_ARROW, MA_NOACTIVATE, MF_SEPARATOR, MF_STRING, MSG, OBJID_CLIENT,
-    OBJID_WINDOW, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+    OBJID_WINDOW, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
     TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA, WINDOW_STYLE, WINEVENT_OUTOFCONTEXT,
     WINEVENT_SKIPOWNPROCESS, WM_APP, WM_APPCOMMAND, WM_CHANGEUISTATE, WM_CHAR, WM_COMMAND,
     WM_CONTEXTMENU, WM_DPICHANGED, WM_DPICHANGED_AFTERPARENT, WM_GESTURE, WM_HELP, WM_KEYDOWN,
@@ -53,10 +60,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_NOACTIVATE, WS_EX_NOPARENTNOTIFY, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{PA_NOACTIVATE, WM_POINTERACTIVATE};
+use windows::Win32::UI::WindowsAndMessaging::{WA_INACTIVE, WM_ACTIVATE, WM_CLOSE};
 
-use crate::display::Block;
 use crate::scheduler::SchedulerHandle;
-use crate::strip::layout::{self, Hit, Metrics, PlacedSlot, RotationState, StripLayout};
+use crate::strip::flyout::{ButtonLatch, Flyout, FlyoutKey, FLYOUT_CLASS};
+use crate::strip::layout::{
+    self, Hit, Metrics, PlacedSlot, RotationState, StripLayout, FLYOUT_PAD_DIP, FLYOUT_ROW_DIP,
+    FLYOUT_SPACING_DIP,
+};
 use crate::strip::model::{SlotKind, SlotState, StripModel};
 use crate::strip::placement::{self, TaskbarInfo};
 use crate::strip::render::{Bitmap, Renderer};
@@ -72,6 +83,8 @@ const WM_APP_TICK: u32 = WM_APP + 1;
 const WM_APP_BUTTONS: u32 = WM_APP + 2;
 /// The icon worker finished a custom icon.
 const WM_APP_ICONS: u32 = WM_APP + 3;
+/// The flyout lost the activation: close it unless it got it back.
+const WM_APP_FLYOUT_FOCUS: u32 = WM_APP + 4;
 /// The strip-creation warning is logged at most this often.
 const CREATE_WARN_INTERVAL: Duration = Duration::from_secs(60);
 /// Not exported by the `windows` features in use.
@@ -95,15 +108,13 @@ const TOOLTIP_GAP_DIP: f32 = 4.0;
 /// One wheel notch.
 const WHEEL_DELTA: i32 = 120;
 
-/// Menu command ids. Hidden-widget entries of the "+N" menu start at
-/// `ID_OVERFLOW_BASE`. `ID_QUIT` and `ID_OPEN_SETTINGS` are also accepted
-/// as a `WM_COMMAND` posted to the control window.
+/// Menu command ids. `ID_QUIT` and `ID_OPEN_SETTINGS` are also accepted as
+/// a `WM_COMMAND` posted to the control window.
 const ID_REFRESH: u32 = 1;
 const ID_HIDE: u32 = 2;
 const ID_QUIT: u32 = 3;
 const ID_WIDGET_SETTINGS: u32 = 4;
 const ID_OPEN_SETTINGS: u32 = 5;
-const ID_OVERFLOW_BASE: u32 = 100;
 /// A WM_TIMER can fire a little early; this keeps such a tick from missing
 /// a rotation that is due.
 const ROTATE_SLACK: Duration = Duration::from_millis(100);
@@ -157,8 +168,6 @@ struct State {
     /// first one arrives (the placement fallback guess applies meanwhile).
     buttons_right: Option<i32>,
     last_create_warn: Option<Instant>,
-    /// Widget folder to manifest name, for the "+N" menu.
-    names: HashMap<PathBuf, String>,
     /// Ends the whole app; taken when "Quit Perchbar" runs.
     on_quit: Option<Box<dyn FnOnce() + Send>>,
     /// Opens the settings window, focused on an instance or not. Returns
@@ -174,26 +183,8 @@ struct State {
     tooltip: Option<HWND>,
     /// Text and position of the tooltip on screen; `None` while hidden.
     tooltip_shown: Option<(String, i32, i32)>,
-}
-
-/// Remembers that a mouse button went down on the strip, so its button-up
-/// acts only then (not for a press that started elsewhere).
-#[derive(Debug, Default, Clone, Copy)]
-struct ButtonLatch(bool);
-
-impl ButtonLatch {
-    fn down(&mut self) {
-        self.0 = true;
-    }
-
-    /// True when this release ends a press that began on the strip.
-    fn up(&mut self) -> bool {
-        std::mem::take(&mut self.0)
-    }
-
-    fn clear(&mut self) {
-        self.0 = false;
-    }
+    /// The "+N" flyout.
+    flyout: Flyout,
 }
 
 /// Opens the settings window (see [`crate::strip::spawn`]).
@@ -215,15 +206,6 @@ struct MenuSpec {
     /// The instance "Refresh now", "Widget settings" and "Hide this widget"
     /// act on.
     target: Option<String>,
-    /// Instance ids of the "+N" entries, by index from `ID_OVERFLOW_BASE`.
-    overflow: Vec<String>,
-}
-
-/// A hidden widget as listed in the "+N" menu.
-#[derive(Debug, Clone, PartialEq)]
-struct OverflowEntry {
-    instance_id: String,
-    label: String,
 }
 
 /// How much of the UI Automation search a tick asks for.
@@ -251,7 +233,6 @@ fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
 pub(super) fn run(
     rx: Receiver<StripEvent>,
     sched: SchedulerHandle,
-    names: HashMap<PathBuf, String>,
     on_quit: Box<dyn FnOnce() + Send>,
     on_open_settings: OpenSettings,
 ) {
@@ -262,7 +243,7 @@ pub(super) fn run(
     if previous.0.is_null() {
         log::warn!("cannot make the strip thread per-monitor DPI aware");
     }
-    match setup(rx, sched, names, on_quit, on_open_settings) {
+    match setup(rx, sched, on_quit, on_open_settings) {
         Ok(()) => message_loop(),
         Err(e) => log::error!("cannot start the taskbar strip: {e}"),
     }
@@ -274,7 +255,6 @@ pub(super) fn run(
 fn setup(
     rx: Receiver<StripEvent>,
     sched: SchedulerHandle,
-    names: HashMap<PathBuf, String>,
     on_quit: Box<dyn FnOnce() + Send>,
     on_open_settings: OpenSettings,
 ) -> windows::core::Result<()> {
@@ -295,6 +275,7 @@ fn setup(
                 ctl_proc as unsafe extern "system" fn(_, _, _, _) -> _,
             ),
             (STRIP_CLASS, strip_proc),
+            (FLYOUT_CLASS, flyout_proc),
         ] {
             let wc = WNDCLASSW {
                 lpfnWndProc: Some(proc_),
@@ -352,7 +333,6 @@ fn setup(
             uia: UiaWorker::start(|| post_to_ctl(WM_APP_BUTTONS)),
             buttons_right: None,
             last_create_warn: None,
-            names,
             on_quit: Some(on_quit),
             on_open_settings,
             quitting: false,
@@ -362,6 +342,7 @@ fn setup(
             right: ButtonLatch::default(),
             tooltip: None,
             tooltip_shown: None,
+            flyout: Flyout::default(),
         });
     });
     CTL.store(ctl.0 as isize, Ordering::Release);
@@ -473,6 +454,7 @@ impl State {
         let Some(taskbar) = placement::taskbar_hwnd() else {
             self.info = None;
             TASKBAR.store(0, Ordering::Release);
+            self.close_flyout(false);
             return;
         };
         let mut search = search;
@@ -510,6 +492,7 @@ impl State {
     fn on_icons(&mut self) {
         if self.renderer.poll_icons() {
             self.key = None;
+            self.flyout.key = None;
             self.refresh();
         }
     }
@@ -593,6 +576,9 @@ impl State {
         self.right.clear();
         self.rot.paused_slot = None;
         self.hide_tooltip();
+        // The flyout is our own top-level window, so it outlives Explorer;
+        // its anchor on the old taskbar is gone.
+        self.close_flyout(false);
     }
 
     fn unhook(&mut self) {
@@ -630,24 +616,10 @@ impl State {
     }
 
     fn render_key(&self, info: &TaskbarInfo) -> RenderKey {
-        let mut groups: Vec<(String, usize)> = self
-            .rot
-            .group_index
-            .iter()
-            .map(|(k, v)| (k.clone(), *v))
-            .collect();
-        groups.sort();
-        let mut frames: Vec<(String, usize)> = self
-            .rot
-            .frame_index
-            .iter()
-            .map(|(k, v)| (k.clone(), *v))
-            .collect();
-        frames.sort();
         RenderKey {
             generation: self.model.generation,
-            groups,
-            frames,
+            groups: sorted(&self.rot.group_index),
+            frames: sorted(&self.rot.frame_index),
             hover: self.hover.clone(),
             dark: self.dark,
             dpi: info.dpi,
@@ -656,8 +628,14 @@ impl State {
         }
     }
 
-    /// Redraws when the key changed, then moves, shows or hides the strip.
+    /// Redraws when the key changed, then moves, shows or hides the strip,
+    /// then does the same for an open flyout.
     fn refresh(&mut self) {
+        self.refresh_strip();
+        self.refresh_flyout();
+    }
+
+    fn refresh_strip(&mut self) {
         let (Some(strip), Some(info), Some(taskbar)) = (self.strip, self.info, self.taskbar) else {
             return;
         };
@@ -719,8 +697,289 @@ impl State {
             }
         }
         if let Some(bmp) = fresh.filter(|b| b.width > 0 && b.height > 0) {
-            if let Err(e) = present(strip, &bmp) {
+            if let Err(e) = present(strip, &bmp, None) {
                 log::warn!("cannot update the strip: {e}");
+            }
+        }
+    }
+
+    /// Where an open flyout goes: the "+N" item and the work area of its
+    /// monitor in screen pixels, and the taskbar's edge. `None` when the
+    /// strip or its "+N" is not on screen. Local queries only.
+    fn flyout_anchor(&self) -> Option<(RECT, RECT, layout::Edge)> {
+        let info = self.info.filter(|i| !i.hidden)?;
+        let strip = self.strip?;
+        self.pos?;
+        let item = self.layout.overflow_item.as_ref()?;
+        let scale = info.scale();
+        let mut r = RECT::default();
+        // SAFETY: our own window; valid out pointer.
+        unsafe { GetWindowRect(strip, &mut r) }.ok()?;
+        let anchor = RECT {
+            left: r.left + layout::px(item.x_dip, scale),
+            top: r.top,
+            right: r.left + layout::px(item.x_dip + item.width_dip, scale),
+            bottom: r.bottom,
+        };
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: valid rect and out struct.
+        unsafe {
+            let mon = MonitorFromRect(&anchor, MONITOR_DEFAULTTONEAREST);
+            GetMonitorInfoW(mon, &mut mi).as_bool().then_some(())?;
+        }
+        let edge = layout::taskbar_edge(info.taskbar, mi.rcMonitor);
+        Some((anchor, mi.rcWork, edge))
+    }
+
+    /// Redraws and places an open flyout when anything it shows changed,
+    /// and closes it when there is nothing left to show or nowhere to
+    /// show it.
+    fn refresh_flyout(&mut self) {
+        if !self.flyout.open {
+            return;
+        }
+        let anchor = self.flyout_anchor();
+        let (Some((anchor, work, edge)), Some(info), Some(hwnd)) =
+            (anchor, self.info, self.flyout.hwnd())
+        else {
+            self.close_flyout(false);
+            return;
+        };
+        if self.layout.overflow.is_empty() {
+            self.close_flyout(false);
+            return;
+        }
+        self.flyout.clamp_scroll(self.layout.overflow.len());
+        let key = FlyoutKey {
+            generation: self.model.generation,
+            groups: sorted(&self.rot.group_index),
+            frames: sorted(&self.rot.frame_index),
+            rows: self.layout.overflow.clone(),
+            hover: self.flyout.hover.clone(),
+            scroll: self.flyout.scroll,
+            palette: self.palette,
+            dpi: info.dpi,
+            anchor,
+            work,
+            edge,
+        };
+        if self.flyout.key.as_ref() == Some(&key) {
+            return;
+        }
+        let scale = info.scale();
+        let rows = layout::flyout_rows(&self.model, &self.rot, &key.rows, &self.renderer);
+        let widths: Vec<f32> = rows.iter().map(|r| r.width_dip).collect();
+        let geo = layout::flyout_geometry(&widths, FLYOUT_ROW_DIP, scale, anchor, work, edge);
+        let inner = layout::flyout_width_dip(&widths) - 2.0 * FLYOUT_PAD_DIP;
+        let shown: Vec<(PlacedSlot, f32)> = rows
+            .into_iter()
+            .skip(key.scroll)
+            .take(geo.rows.len())
+            .enumerate()
+            .map(|(i, mut p)| {
+                p.x_dip = FLYOUT_PAD_DIP;
+                p.width_dip = inner;
+                let top = FLYOUT_PAD_DIP + i as f32 * (FLYOUT_ROW_DIP + FLYOUT_SPACING_DIP);
+                (p, top)
+            })
+            .collect();
+        let size = (
+            geo.rect.right - geo.rect.left,
+            geo.rect.bottom - geo.rect.top,
+        );
+        let bmp = match self.renderer.render_flyout(
+            size,
+            scale,
+            &shown,
+            &self.model,
+            &self.palette,
+            key.hover.as_deref(),
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                // Keep showing the previous frame.
+                log::warn!("flyout render failed: {e}");
+                return;
+            }
+        };
+        let at = POINT {
+            x: geo.rect.left,
+            y: geo.rect.top,
+        };
+        if let Err(e) = present(hwnd, &bmp, Some(at)) {
+            log::warn!("cannot update the flyout: {e}");
+            return;
+        }
+        self.flyout.drawn(key, geo);
+    }
+
+    /// A click on "+N": opens or closes the flyout.
+    fn toggle_flyout(&mut self) {
+        let recently = self.flyout.recently_deactivated(Instant::now());
+        if plus_n_toggle(self.flyout.open, recently) {
+            self.open_flyout();
+        } else {
+            self.close_flyout(false);
+        }
+    }
+
+    /// Shows the flyout and gives it the focus, so it closes when the
+    /// focus goes elsewhere. This thread just handled the click, so it may
+    /// take the foreground.
+    fn open_flyout(&mut self) {
+        if self.layout.overflow.is_empty() {
+            return;
+        }
+        let Some(hwnd) = self.flyout.window(self.ctl) else {
+            return;
+        };
+        self.hide_tooltip();
+        self.flyout.open = true;
+        self.flyout.key = None;
+        self.refresh_flyout();
+        if !self.flyout.open {
+            return;
+        }
+        log::debug!("flyout opened");
+        // SAFETY: our own window.
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            if !SetForegroundWindow(hwnd).as_bool() {
+                log::debug!("the flyout could not take the foreground");
+            }
+        }
+    }
+
+    /// Closes the flyout; `deactivated` when it lost the focus.
+    fn close_flyout(&mut self, deactivated: bool) {
+        if !self.flyout.open {
+            self.flyout.close(deactivated);
+            return;
+        }
+        log::debug!("flyout closed");
+        if self.flyout.hover.is_some() {
+            self.hide_tooltip();
+        }
+        self.flyout.close(deactivated);
+        self.update_pause();
+    }
+
+    /// The flyout lost the activation; it closes unless it is the
+    /// foreground window again by now.
+    fn on_flyout_focus_lost(&mut self) {
+        let hwnd = self.flyout.hwnd();
+        // SAFETY: a local query.
+        let foreground = unsafe { GetForegroundWindow() };
+        if self.flyout.open && hwnd != Some(foreground) {
+            self.close_flyout(true);
+        }
+    }
+
+    fn on_flyout_mouse_move(&mut self, x: i32, y: i32) {
+        if !self.flyout.tracking_mouse {
+            if let Some(hwnd) = self.flyout.hwnd() {
+                let mut tme = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                // SAFETY: valid struct for our own window.
+                self.flyout.tracking_mouse = unsafe { TrackMouseEvent(&mut tme) }.is_ok();
+            }
+        }
+        let hover = self.flyout.row_at(x, y);
+        self.set_flyout_hover(hover);
+    }
+
+    fn set_flyout_hover(&mut self, hover: Option<String>) {
+        if hover != self.flyout.hover {
+            log::debug!("flyout hover {hover:?}");
+            self.flyout.hover = hover;
+            self.flyout.wheel_acc = 0;
+            self.update_pause();
+            self.hide_tooltip();
+            self.arm_tooltip(self.flyout.hover.is_some());
+            self.refresh_flyout();
+        }
+    }
+
+    /// Left click on a flyout row: the same as on the strip; a single
+    /// widget's settings open and the flyout closes, a group steps on.
+    fn on_flyout_left_click(&mut self, x: i32, y: i32) {
+        let Some(id) = self.flyout.row_at(x, y) else {
+            return;
+        };
+        log::debug!("left click on flyout row {id}");
+        match left_click_action(
+            &self.model,
+            &self.rot,
+            Hit::Slot(id),
+            &self.on_open_settings,
+        ) {
+            LeftClick::Done => self.close_flyout(false),
+            LeftClick::Advance(id) => {
+                if self.rot.advance(&id, 1, &self.model) {
+                    self.refresh();
+                    self.sync_tooltip();
+                }
+            }
+            LeftClick::Overflow => {}
+        }
+    }
+
+    /// Right click on the flyout: the strip's menu for the row's widget.
+    fn flyout_context_menu(&mut self, x: i32, y: i32) -> MenuSpec {
+        self.hide_tooltip();
+        let target = self
+            .flyout
+            .row_at(x, y)
+            .and_then(|id| shown_instance(&self.model, &self.rot, &id));
+        context_menu_spec(target)
+    }
+
+    /// The wheel scrolls a flyout with more rows than fit; otherwise it
+    /// steps the row under the pointer, as on the strip.
+    fn on_flyout_wheel(&mut self, x: i32, y: i32, delta: i16) {
+        let rows = self.layout.overflow.len();
+        let steps = wheel_steps(&mut self.flyout.wheel_acc, delta);
+        if steps == 0 {
+            return;
+        }
+        if self.flyout.scrolls(rows) {
+            if self.flyout.scroll_by(steps, rows) {
+                self.flyout.key = None;
+                // The row under the pointer is now another one; the drawn
+                // rows move first so the hit test sees them.
+                self.set_flyout_hover(None);
+                self.refresh_flyout();
+                let hover = self.flyout.row_at(x, y);
+                self.set_flyout_hover(hover);
+            }
+        } else if let Some(id) = self.flyout.row_at(x, y) {
+            if self.rot.advance(&id, steps, &self.model) {
+                self.refresh();
+                self.sync_tooltip();
+            }
+        }
+    }
+
+    /// The hovered slot, on the strip or in the flyout, does not rotate.
+    fn update_pause(&mut self) {
+        self.rot.paused_slot = self.flyout.hover.clone().or_else(|| self.hover.clone());
+    }
+
+    /// Starts (or stops) the hover delay before the tooltip shows.
+    fn arm_tooltip(&self, on: bool) {
+        // SAFETY: timers on our own window.
+        unsafe {
+            if on {
+                SetTimer(Some(self.ctl), T_TOOLTIP, TOOLTIP_MS, None);
+            } else {
+                let _ = KillTimer(Some(self.ctl), T_TOOLTIP);
             }
         }
     }
@@ -754,50 +1013,31 @@ impl State {
     fn set_hover(&mut self, hover: Option<String>) {
         if hover != self.hover {
             log::debug!("hover {hover:?}");
-            self.rot.paused_slot.clone_from(&hover);
             self.hover = hover;
+            self.update_pause();
             self.wheel_acc = 0;
             self.hide_tooltip();
-            // SAFETY: timers on our own window.
-            unsafe {
-                if self.hover.is_some() {
-                    SetTimer(Some(self.ctl), T_TOOLTIP, TOOLTIP_MS, None);
-                } else {
-                    let _ = KillTimer(Some(self.ctl), T_TOOLTIP);
-                }
-            }
+            self.arm_tooltip(self.hover.is_some());
             self.refresh();
         }
     }
 
     /// Left click: a group steps to its next member, a single slot opens
-    /// its settings, "+N" returns the hidden-widget menu to show.
-    fn on_left_click(&mut self, x_px: i32) -> Option<MenuSpec> {
-        let hit = self.hit(x_px);
+    /// its settings, "+N" opens or closes the flyout.
+    fn on_left_click(&mut self, x_px: i32) {
+        let Some(hit) = self.hit(x_px) else {
+            return;
+        };
         log::debug!("left click on {hit:?}");
-        match left_click_action(&self.model, &self.rot, hit?, &self.on_open_settings) {
-            LeftClick::Done => None,
+        match left_click_action(&self.model, &self.rot, hit, &self.on_open_settings) {
+            LeftClick::Done => {}
             LeftClick::Advance(id) => {
                 if self.rot.advance(&id, 1, &self.model) {
                     self.refresh();
                     self.sync_tooltip();
                 }
-                None
             }
-            LeftClick::Overflow => {
-                let entries = overflow_entries(&self.layout, &self.model, &self.names);
-                if entries.is_empty() {
-                    return None;
-                }
-                self.hide_tooltip();
-                let mut spec = MenuSpec::default();
-                for (i, e) in entries.into_iter().enumerate() {
-                    spec.items
-                        .push(MenuItem::Command(ID_OVERFLOW_BASE + i as u32, e.label));
-                    spec.overflow.push(e.instance_id);
-                }
-                Some(spec)
-            }
+            LeftClick::Overflow => self.toggle_flyout(),
         }
     }
 
@@ -834,12 +1074,6 @@ impl State {
             }
             ID_OPEN_SETTINGS => (self.on_open_settings)(None),
             ID_QUIT => self.quit_app(),
-            n if n >= ID_OVERFLOW_BASE => {
-                let picked = spec.overflow.get((n - ID_OVERFLOW_BASE) as usize);
-                if let (Some(s), Some(id)) = (&self.sched, picked) {
-                    s.refresh_now(id);
-                }
-            }
             _ => {}
         }
     }
@@ -856,9 +1090,15 @@ impl State {
         }
     }
 
-    /// The tooltip text, the slot's center x on screen and the strip's
-    /// screen rect, for the hovered slot.
+    /// The tooltip text, the slot's center x on screen and the screen rect
+    /// it sits next to (the strip, or the flyout row), for the hovered slot.
     fn tooltip_target(&self) -> Option<(String, i32, RECT)> {
+        if let Some(id) = self.flyout.hover.as_deref() {
+            let rows = layout::flyout_rows(&self.model, &self.rot, &[id.into()], &self.renderer);
+            let text = tooltip_text(rows.first()?, &self.model, &self.updated)?;
+            let r = self.flyout.row_screen_rect(id)?;
+            return Some((text, r.left + (r.right - r.left) / 2, r));
+        }
         let id = self.hover.as_deref()?;
         let slot = self.layout.items.iter().find(|p| p.slot_id == id)?;
         let text = tooltip_text(slot, &self.model, &self.updated)?;
@@ -1018,6 +1258,7 @@ impl State {
         self.quitting = true;
         log::info!("strip shutting down");
         self.hide_tooltip();
+        self.flyout.destroy();
         // SAFETY: our own timers, hooks and windows.
         unsafe {
             for t in [T_FALLBACK, T_DEBOUNCE, T_ROTATE, T_TOOLTIP] {
@@ -1046,8 +1287,16 @@ impl State {
     }
 }
 
-/// Copies the premultiplied bitmap into a DIB and hands it to the window.
-fn present(strip: HWND, bmp: &Bitmap) -> windows::core::Result<()> {
+/// The entries of a rotation index, sorted, for a render key.
+fn sorted(index: &HashMap<String, usize>) -> Vec<(String, usize)> {
+    let mut v: Vec<(String, usize)> = index.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    v.sort();
+    v
+}
+
+/// Copies the premultiplied bitmap into a DIB and hands it to the layered
+/// window, moving it to `at` (screen pixels) when given.
+fn present(hwnd: HWND, bmp: &Bitmap, at: Option<POINT>) -> windows::core::Result<()> {
     let len = (bmp.width as usize) * (bmp.height as usize) * 4;
     if bmp.pixels.len() != len {
         return Err(windows::core::Error::empty());
@@ -1097,9 +1346,9 @@ fn present(strip: HWND, bmp: &Bitmap) -> windows::core::Result<()> {
             AlphaFormat: AC_SRC_ALPHA as u8,
         };
         let r = windows::Win32::UI::WindowsAndMessaging::UpdateLayeredWindow(
-            strip,
+            hwnd,
             None,
-            None,
+            at.as_ref().map(std::ptr::from_ref),
             Some(&size),
             Some(dc),
             Some(&src),
@@ -1260,57 +1509,6 @@ fn note_updates(
     updated.retain(|k, _| present.contains(&k.as_str()));
 }
 
-/// The first text in a block, looking inside stacks top first.
-fn first_text(b: &Block) -> Option<&str> {
-    match b {
-        Block::Text { value, .. } => Some(value),
-        Block::Stack { top, bottom } => first_text(top).or_else(|| first_text(bottom)),
-        _ => None,
-    }
-}
-
-/// The hidden widgets as "+N" menu entries: manifest name (instance id when
-/// unknown), plus ": text" when its first frame has text.
-fn overflow_entries(
-    layout: &StripLayout,
-    model: &StripModel,
-    names: &HashMap<PathBuf, String>,
-) -> Vec<OverflowEntry> {
-    let hidden: Vec<&str> = layout.overflow.iter().map(String::as_str).collect();
-    let mut out = Vec::new();
-    for slot in model
-        .slots
-        .iter()
-        .filter(|s| hidden.contains(&s.id.as_str()))
-    {
-        let single = StripModel {
-            slots: vec![slot.clone()],
-            generation: 0,
-        };
-        for (id, dir, state) in instances(&single) {
-            let name = names.get(dir).cloned().unwrap_or_else(|| id.clone());
-            let output = match state {
-                SlotState::Ok(o) | SlotState::Stale(o) => Some(o),
-                SlotState::Error { last, .. } => last.as_ref(),
-                SlotState::Loading => None,
-            };
-            let text = output
-                .and_then(|o| o.frames.first())
-                .and_then(|f| f.blocks.iter().find_map(first_text))
-                .filter(|t| !t.is_empty());
-            let label = match text {
-                Some(t) => format!("{name}: {t}"),
-                None => name,
-            };
-            out.push(OverflowEntry {
-                instance_id: id.clone(),
-                label,
-            });
-        }
-    }
-    out
-}
-
 /// What is left to do after [`left_click_action`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LeftClick {
@@ -1318,12 +1516,12 @@ enum LeftClick {
     Done,
     /// Step this group to its next member.
     Advance(String),
-    /// Show the "+N" menu.
+    /// Open or close the "+N" flyout.
     Overflow,
 }
 
 /// A left click on `hit`: a group with several members advances, any other
-/// slot opens settings on the instance it shows, "+N" shows its menu.
+/// slot opens settings on the instance it shows, "+N" toggles the flyout.
 fn left_click_action(
     model: &StripModel,
     rot: &RotationState,
@@ -1361,6 +1559,13 @@ fn context_menu_spec(target: Option<String>) -> MenuSpec {
     ]);
     spec.target = target;
     spec
+}
+
+/// The flyout's state after a click on "+N": it opens when closed, closes
+/// when open, and stays closed when the click itself just closed it by
+/// taking the focus away (`recently_deactivated`).
+fn plus_n_toggle(open: bool, recently_deactivated: bool) -> bool {
+    !open && !recently_deactivated
 }
 
 /// Menu text with `&` doubled, so it is not read as a mnemonic marker.
@@ -1417,8 +1622,9 @@ fn lparam_x(lparam: LPARAM) -> i32 {
 }
 
 /// Shows a menu built under the state, then applies the pick under it again.
-/// The state is free while the menu's modal loop runs.
-fn run_menu(spec: Option<MenuSpec>) {
+/// The state is free while the menu's modal loop runs. The menu belongs to
+/// `owner`, or to the control window.
+fn run_menu(spec: Option<MenuSpec>, owner: Option<HWND>) {
     let Some(spec) = spec.filter(|s| !s.items.is_empty()) else {
         return;
     };
@@ -1426,7 +1632,7 @@ fn run_menu(spec: Option<MenuSpec>) {
     if ctl == 0 {
         return;
     }
-    let cmd = track_menu(HWND(ctl as _), &spec.items);
+    let cmd = track_menu(owner.unwrap_or(HWND(ctl as _)), &spec.items);
     if cmd != 0 {
         with_state(|s| s.on_menu(cmd, &spec));
     }
@@ -1571,6 +1777,13 @@ unsafe extern "system" fn ctl_proc(
             }
             LRESULT(0)
         }
+        WM_APP_FLYOUT_FOCUS => {
+            if with_state(State::on_flyout_focus_lost).is_none() {
+                // Busy: try again from the loop.
+                post_to_ctl(WM_APP_FLYOUT_FOCUS);
+            }
+            LRESULT(0)
+        }
         // SAFETY: default handling.
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
@@ -1608,8 +1821,11 @@ unsafe extern "system" fn strip_proc(
         }
         WM_LBUTTONUP => {
             let x = lparam_x(lparam);
-            let menu = with_state(|s| s.left.up().then(|| s.on_left_click(x)).flatten());
-            run_menu(menu.flatten());
+            with_state(|s| {
+                if s.left.up() {
+                    s.on_left_click(x);
+                }
+            });
             LRESULT(0)
         }
         WM_RBUTTONDOWN => {
@@ -1621,7 +1837,7 @@ unsafe extern "system" fn strip_proc(
         WM_RBUTTONUP => {
             let x = lparam_x(lparam);
             let menu = with_state(|s| s.right.up().then(|| s.context_menu(x)));
-            run_menu(menu.flatten());
+            run_menu(menu.flatten(), None);
             LRESULT(0)
         }
         WM_MOUSEWHEEL => {
@@ -1664,6 +1880,101 @@ unsafe extern "system" fn strip_proc(
             LRESULT(1)
         }
         WM_DPICHANGED_AFTERPARENT => {
+            post_to_ctl(WM_APP_TICK);
+            LRESULT(0)
+        }
+        // SAFETY: default handling.
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+/// Signed client y from a mouse message's lParam.
+fn lparam_y(lparam: LPARAM) -> i32 {
+    i32::from((lparam.0 >> 16) as u16 as i16)
+}
+
+/// The flyout's window procedure. It is a top-level window of ours, so
+/// default handling never reaches Explorer.
+unsafe extern "system" fn flyout_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_ACTIVATE => {
+            if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
+                // Decided from the loop: this may arrive while the state is
+                // in use, for example while the flyout is being hidden.
+                post_to_ctl(WM_APP_FLYOUT_FOCUS);
+            }
+            // SAFETY: default handling (sets the keyboard focus).
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_KEYDOWN if wparam.0 == usize::from(VK_ESCAPE.0) => {
+            with_state(|s| s.close_flyout(false));
+            LRESULT(0)
+        }
+        // Alt+F4: close (hide) it; the window is reused.
+        WM_CLOSE => {
+            with_state(|s| s.close_flyout(false));
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            let (x, y) = (lparam_x(lparam), lparam_y(lparam));
+            with_state(|s| s.on_flyout_mouse_move(x, y));
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            with_state(|s| {
+                s.flyout.tracking_mouse = false;
+                s.flyout.left.clear();
+                s.flyout.right.clear();
+                s.set_flyout_hover(None);
+            });
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            with_state(|s| s.flyout.left.down());
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            let (x, y) = (lparam_x(lparam), lparam_y(lparam));
+            with_state(|s| {
+                if s.flyout.left.up() {
+                    s.on_flyout_left_click(x, y);
+                }
+            });
+            LRESULT(0)
+        }
+        WM_RBUTTONDOWN => {
+            with_state(|s| s.flyout.right.down());
+            LRESULT(0)
+        }
+        WM_RBUTTONUP => {
+            let (x, y) = (lparam_x(lparam), lparam_y(lparam));
+            let menu = with_state(|s| s.flyout.right.up().then(|| s.flyout_context_menu(x, y)));
+            // Owned by the flyout, which keeps the focus while it shows.
+            run_menu(menu.flatten(), Some(hwnd));
+            LRESULT(0)
+        }
+        WM_CONTEXTMENU => LRESULT(0),
+        WM_MOUSEWHEEL => {
+            // Screen coordinates; the high word of wParam is the delta.
+            let mut pt = POINT {
+                x: lparam_x(lparam),
+                y: lparam_y(lparam),
+            };
+            let delta = (wparam.0 >> 16) as u16 as i16;
+            // SAFETY: our own window; valid pointer.
+            if unsafe { ScreenToClient(hwnd, &mut pt) }.as_bool() {
+                with_state(|s| s.on_flyout_wheel(pt.x, pt.y, delta));
+            }
+            LRESULT(0)
+        }
+        // Moving to another monitor: keep our size; the next tick redraws
+        // at the taskbar's scale.
+        WM_DPICHANGED => {
             post_to_ctl(WM_APP_TICK);
             LRESULT(0)
         }
@@ -1862,53 +2173,6 @@ mod tests {
     }
 
     #[test]
-    fn overflow_entries_name_hidden_widgets_with_their_text() {
-        let m = model(vec![
-            single("s1", "clock", SlotState::Ok(out(&[("12:00", None)]))),
-            single(
-                "s2",
-                "btc",
-                SlotState::Ok(out(&[("$67,120", None), ("later", None)])),
-            ),
-            single("s3", "unnamed", SlotState::Loading),
-            group(
-                "g",
-                vec![
-                    ("m1", SlotState::Stale(out(&[("A & B", None)]))),
-                    ("m2", SlotState::Loading),
-                ],
-            ),
-        ]);
-        let lay = StripLayout {
-            overflow: vec!["s2".into(), "s3".into(), "g".into()],
-            ..StripLayout::default()
-        };
-        let names: HashMap<PathBuf, String> = [
-            ("btc", "Bitcoin price"),
-            ("clock", "World clock"),
-            ("m1", "Pairs"),
-            ("m2", "Weather"),
-        ]
-        .into_iter()
-        .map(|(d, n)| (PathBuf::from(d), n.to_string()))
-        .collect();
-        let entries = overflow_entries(&lay, &m, &names);
-        let got: Vec<(&str, &str)> = entries
-            .iter()
-            .map(|e| (e.instance_id.as_str(), e.label.as_str()))
-            .collect();
-        assert_eq!(
-            got,
-            [
-                ("s2", "Bitcoin price: $67,120"),
-                ("s3", "s3"),
-                ("m1", "Pairs: A & B"),
-                ("m2", "Weather"),
-            ]
-        );
-    }
-
-    #[test]
     fn menu_labels_escape_ampersands() {
         assert_eq!(menu_label("Pairs: A & B"), "Pairs: A && B");
         assert_eq!(menu_label("plain"), "plain");
@@ -2058,6 +2322,16 @@ mod tests {
             LeftClick::Overflow
         );
         assert_eq!(opened.borrow().len(), 1);
+    }
+
+    #[test]
+    fn plus_n_click_toggles_flyout() {
+        // Closed: a click opens it; open: a click closes it.
+        assert!(plus_n_toggle(false, false));
+        assert!(!plus_n_toggle(true, false));
+        // The click that just closed it by taking the focus away does not
+        // open it again.
+        assert!(!plus_n_toggle(false, true));
     }
 
     const TASKBAR_HWND: isize = 100;
