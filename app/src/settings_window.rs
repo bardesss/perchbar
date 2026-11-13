@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use tauri::webview::PageLoadEvent;
 use tauri::window::{Effect, EffectsBuilder};
 use tauri::{
     AppHandle, Emitter, Listener, Manager, PhysicalPosition, Runtime, WebviewUrl, WebviewWindow,
@@ -30,15 +31,51 @@ const MIN_SIZE: (f64, f64) = (720.0, 520.0);
 
 /// Whether the current page said it is ready, and the instance to focus
 /// once it does.
+#[derive(Debug)]
 struct Readiness {
     ready: bool,
     pending: Option<String>,
 }
 
-static READINESS: Mutex<Readiness> = Mutex::new(Readiness {
-    ready: false,
-    pending: None,
-});
+impl Readiness {
+    const fn new() -> Readiness {
+        Readiness {
+            ready: false,
+            pending: None,
+        }
+    }
+
+    /// A new window: nothing is ready, `focus` waits for the page.
+    fn opening(&mut self, focus: Option<String>) {
+        self.ready = false;
+        self.pending = focus;
+    }
+
+    /// A page (re)load started: the old page's listener is gone, so focus
+    /// requests wait for the new page. A request already waiting stays.
+    fn page_started(&mut self) {
+        self.ready = false;
+    }
+
+    /// The page listens now. Returns the instance to focus, if one waited.
+    fn mark_ready(&mut self) -> Option<String> {
+        self.ready = true;
+        self.pending.take()
+    }
+
+    /// Asks to focus `id`. Returns it when the page can hear it now;
+    /// otherwise it waits for [`Readiness::mark_ready`].
+    fn request(&mut self, id: String) -> Option<String> {
+        if self.ready {
+            Some(id)
+        } else {
+            self.pending = Some(id);
+            None
+        }
+    }
+}
+
+static READINESS: Mutex<Readiness> = Mutex::new(Readiness::new());
 /// The ready listener is registered once, on first open.
 static LISTENING: AtomicBool = AtomicBool::new(false);
 
@@ -53,11 +90,7 @@ pub fn open<R: Runtime>(app: &AppHandle<R>, focus: Option<String>) {
     if !LISTENING.swap(true, Ordering::AcqRel) {
         let handle = app.clone();
         app.listen_any(EVENT_READY, move |_| {
-            let pending = {
-                let mut r = readiness();
-                r.ready = true;
-                r.pending.take()
-            };
+            let pending = readiness().mark_ready();
             if let Some(id) = pending {
                 emit_focus(&handle, id);
             }
@@ -71,22 +104,15 @@ pub fn open<R: Runtime>(app: &AppHandle<R>, focus: Option<String>) {
         let _ = w.show();
         let _ = w.set_focus();
         if let Some(id) = focus {
-            let mut r = readiness();
-            if r.ready {
-                drop(r);
+            let now = readiness().request(id);
+            if let Some(id) = now {
                 emit_focus(app, id);
-            } else {
-                r.pending = Some(id);
             }
         }
         return;
     }
 
-    {
-        let mut r = readiness();
-        r.ready = false;
-        r.pending = focus;
-    }
+    readiness().opening(focus);
     match create(app) {
         Ok(w) => {
             center_on_primary(&w);
@@ -99,7 +125,18 @@ pub fn open<R: Runtime>(app: &AppHandle<R>, focus: Option<String>) {
 }
 
 fn create<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<WebviewWindow<R>> {
-    WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("index.html".into()))
+    let mut builder = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("index.html".into()));
+    if !mica_supported() {
+        // The page paints its own solid background instead (theme.css).
+        builder = builder.initialization_script(SOLID_BACKDROP_SCRIPT);
+    }
+    builder
+        // F5 or Ctrl+R reloads the page; the new page says ready again.
+        .on_page_load(|_, payload| {
+            if payload.event() == PageLoadEvent::Started {
+                readiness().page_started();
+            }
+        })
         .title(TITLE)
         .inner_size(SIZE.0, SIZE.1)
         .min_inner_size(MIN_SIZE.0, MIN_SIZE.1)
@@ -111,6 +148,55 @@ fn create<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<WebviewWindow<R>> {
         // Shown once centered, so it does not jump.
         .visible(false)
         .build()
+}
+
+/// Tells the page that no Mica backdrop shows through it.
+const SOLID_BACKDROP_SCRIPT: &str = "window.__PERCHBAR_SOLID_BACKDROP__ = true;";
+
+/// The first Windows build with Mica.
+const MICA_MIN_BUILD: u32 = 22000;
+
+/// Whether Windows can draw Mica behind the window. When transparency
+/// effects are off, Windows itself draws a solid color in its place.
+fn mica_supported() -> bool {
+    windows_build().is_some_and(|b| b >= MICA_MIN_BUILD)
+}
+
+/// `CurrentBuildNumber` from the registry (read only).
+fn windows_build() -> Option<u32> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+
+    let key: Vec<u16> = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let value: Vec<u16> = "CurrentBuildNumber".encode_utf16().chain(Some(0)).collect();
+    let mut buf = [0u16; 32];
+    let mut len = std::mem::size_of_val(&buf) as u32;
+    // SAFETY: the names are NUL-terminated and `len` is the size of `buf`
+    // in bytes.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(key.as_ptr()),
+            PCWSTR(value.as_ptr()),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut len),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return None;
+    }
+    let chars = (len as usize / 2).min(buf.len());
+    String::from_utf16_lossy(&buf[..chars])
+        .trim_end_matches('\0')
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Centers `w` on the primary monitor's work area, or on whatever monitor
@@ -231,6 +317,30 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn focus_waits_for_the_page() {
+        let mut r = Readiness::new();
+        r.opening(Some("inst-1".into()));
+        assert_eq!(r.request("inst-2".into()), None, "not ready yet");
+        assert_eq!(r.mark_ready(), Some("inst-2".into()));
+        assert_eq!(r.request("inst-3".into()), Some("inst-3".into()));
+    }
+
+    #[test]
+    fn reload_waits_for_the_new_page() {
+        let mut r = Readiness::new();
+        r.opening(None);
+        assert_eq!(r.mark_ready(), None);
+        r.page_started();
+        assert_eq!(r.request("inst-1".into()), None, "old page is gone");
+        assert_eq!(r.mark_ready(), Some("inst-1".into()));
+    }
+
+    #[test]
+    fn this_windows_has_a_build_number() {
+        assert!(windows_build().is_some_and(|b| b > 10000));
+    }
 
     #[test]
     fn closing_settings_does_not_exit() {
