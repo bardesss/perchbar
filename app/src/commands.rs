@@ -985,11 +985,45 @@ mod tests {
         let a = rig.state.add_instance("w").unwrap();
         let b = rig.state.add_instance("w").unwrap();
         let c = rig.state.add_instance("w").unwrap();
-        let g = rig.state.create_group(&[a.clone(), b.clone()], 8).unwrap();
-        rig.state
-            .update_group(&g, std::slice::from_ref(&a), 8)
+        let d = rig.state.add_instance("w").unwrap();
+        let g = rig
+            .state
+            .create_group(&[a.clone(), b.clone(), c.clone()], 8)
             .unwrap();
-        assert_eq!(rig.state.get_state().unwrap().order, [g, b, c]);
+        rig.state
+            .update_group(&g, &[a.clone(), c.clone()], 8)
+            .unwrap();
+        assert_eq!(rig.state.get_state().unwrap().order, [g, b, d]);
+    }
+
+    #[tokio::test]
+    async fn a_group_left_with_one_member_dissolves_in_place() {
+        let rig = Rig::start();
+        let a = rig.state.add_instance("w").unwrap();
+        let b = rig.state.add_instance("w").unwrap();
+        let c = rig.state.add_instance("w").unwrap();
+        let d = rig.state.add_instance("w").unwrap();
+
+        // Through update_group: the kept member takes the group's place and
+        // the dropped one follows it.
+        let g = rig.state.create_group(&[b.clone(), c.clone()], 8).unwrap();
+        rig.state
+            .update_group(&g, std::slice::from_ref(&c), 8)
+            .unwrap();
+        let view = rig.state.get_state().unwrap();
+        assert!(view.groups.is_empty());
+        assert_eq!(view.order, [a.clone(), c.clone(), b.clone(), d.clone()]);
+
+        // Through remove_instance: the last member stands where the group was.
+        let g = rig.state.create_group(&[a.clone(), d.clone()], 8).unwrap();
+        assert_eq!(
+            rig.state.get_state().unwrap().order,
+            [g, c.clone(), b.clone()]
+        );
+        rig.state.remove_instance(&a).unwrap();
+        let view = rig.state.get_state().unwrap();
+        assert!(view.groups.is_empty());
+        assert_eq!(view.order, [d, c, b]);
     }
 
     #[tokio::test]
