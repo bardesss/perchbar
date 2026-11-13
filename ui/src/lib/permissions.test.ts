@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import { permissionLines } from "./permissions";
+import { permissionLines, reviewIntro } from "./permissions";
 
 const none = { network: [], files: [], sources: [] };
 
@@ -17,3 +17,8 @@ test("each kind gets its own line, in order", () =>
 
 test("kinds with nothing are left out", () =>
   expect(permissionLines({ ...none, sources: ["cpu"] })).toEqual([{ lead: "It uses:", items: ["cpu"] }]));
+
+test("a first review has no 'more than you allowed' intro", () => {
+  expect(reviewIntro("My Clock", true)).toBeUndefined();
+  expect(reviewIntro("My Clock", false)).toMatch(/^My Clock now asks for more than you allowed/);
+});

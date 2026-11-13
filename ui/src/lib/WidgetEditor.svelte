@@ -12,6 +12,7 @@
     updateSettings,
     type CommandError,
     type InstanceView,
+    type MissingLocalView,
     type SettingField as Field,
     type WidgetView,
   } from "../api";
@@ -28,6 +29,7 @@
   } from "./form";
   import ListField from "./ListField.svelte";
   import LogView from "./LogView.svelte";
+  import { reviewIntro } from "./permissions";
   import PermissionReview from "./PermissionReview.svelte";
   import SecretField from "./SecretField.svelte";
   import SettingField from "./SettingField.svelte";
@@ -36,6 +38,8 @@
   interface Props {
     instance: InstanceView;
     widget: WidgetView | undefined;
+    /** Set when the widget is a local one whose folder is missing. */
+    missing?: MissingLocalView;
     label: string;
     /** Goes up on every state change. */
     changes: number;
@@ -44,7 +48,7 @@
     onremoved: () => void;
   }
 
-  let { instance, widget, label, changes, onchanged, onremoved }: Props = $props();
+  let { instance, widget, missing, label, changes, onchanged, onremoved }: Props = $props();
 
   const fields = $derived(widget?.settings ?? []);
   const model = $derived(toFormModel(fields, instance.settings));
@@ -200,11 +204,12 @@
 
   /** Removes a local widget and all its instances; the folder stays. */
   async function uninstall() {
-    if (!widget) return;
+    const id = widget?.id ?? missing?.id;
+    if (!id) return;
     busy = true;
     notice = null;
     try {
-      await removeWidget(widget.id);
+      await removeWidget(id);
       onremoved();
       await onchanged();
     } catch (e) {
@@ -242,7 +247,7 @@
     <section class="card" aria-label="Permission review">
       <PermissionReview
         permissions={widget.added}
-        intro={`${widget.name} now asks for more than you allowed. It stays off the taskbar until you allow:`}
+        intro={reviewIntro(widget.name, widget.firstReview)}
         confirmLabel="Allow"
         {busy}
         error={reviewError}
@@ -251,7 +256,13 @@
     </section>
   {/if}
 
-  {#if !widget}
+  {#if !widget && missing}
+    <p class="card muted">
+      This widget was loaded from a folder that is missing or cannot be loaded:
+      <span class="folder">{missing.folder}</span>
+      Load the folder again from its new place, or remove the widget.
+    </p>
+  {:else if !widget}
     <p class="card muted">This widget is not installed, so its settings cannot be shown.</p>
   {:else if fields.length > 0}
     <section class="card form" aria-label="Settings">
@@ -345,10 +356,10 @@
         Remove from taskbar
       </button>
     {/if}
-    {#if widget?.local}
+    {#if widget?.local || missing}
       {#if confirmRemoveWidget}
         <span class="confirm" role="group" aria-label="Confirm widget removal">
-          <span>Remove {widget.name} and all of its widgets from the taskbar? The folder stays.</span>
+          <span>Remove {widget?.name ?? missing?.id} and all of its widgets from the taskbar? The folder stays.</span>
           <button type="button" class="btn accent" disabled={busy} onclick={uninstall}>Remove widget</button>
           <button type="button" class="btn" disabled={busy} onclick={() => (confirmRemoveWidget = false)}>Cancel</button>
         </span>

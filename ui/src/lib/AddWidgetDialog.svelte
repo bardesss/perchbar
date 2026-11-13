@@ -5,37 +5,46 @@
   // goes through text bindings only.
   import {
     addInstance,
+    approvePermissions,
     inspectFolder,
     installLocal,
     pickFolder,
+    removeWidget,
     type CommandError,
     type FolderReport,
+    type MissingLocalView,
     type WidgetView,
   } from "../api";
+  import { reviewIntro } from "./permissions";
   import PermissionReview from "./PermissionReview.svelte";
 
   interface Props {
     open: boolean;
     widgets: WidgetView[];
+    /** Local widgets whose folder is missing. */
+    missing: MissingLocalView[];
     onadded: (id: string) => void;
     /** Refetches the state; resolves once the new state is in. */
     onchanged: () => Promise<void>;
     onclose: () => void;
   }
 
-  let { open, widgets, onadded, onchanged, onclose }: Props = $props();
+  let { open, widgets, missing, onadded, onchanged, onclose }: Props = $props();
 
   let dialog: HTMLDialogElement | undefined = $state();
   let error: string | null = $state(null);
   let busy = $state(false);
   /** The folder under review, if any. */
   let report: FolderReport | null = $state(null);
+  /** The missing local widget whose removal waits for a second click. */
+  let confirmRemove: string | null = $state(null);
 
   $effect(() => {
     if (!dialog) return;
     if (open && !dialog.open) {
       error = null;
       report = null;
+      confirmRemove = null;
       dialog.showModal();
     } else if (!open && dialog.open) {
       dialog.close();
@@ -75,6 +84,34 @@
     try {
       await installLocal(report.folder, report.permissions);
       report = null;
+      await onchanged();
+    } catch (e) {
+      error = (e as CommandError).message;
+    } finally {
+      busy = false;
+    }
+  }
+
+  /** Lets a blocked widget run with what it asks; then it can be added. */
+  async function allow(w: WidgetView) {
+    busy = true;
+    error = null;
+    try {
+      await approvePermissions(w.id, w.permissions);
+      await onchanged();
+    } catch (e) {
+      error = (e as CommandError).message;
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function forget(id: string) {
+    busy = true;
+    error = null;
+    try {
+      await removeWidget(id);
+      confirmRemove = null;
       await onchanged();
     } catch (e) {
       error = (e as CommandError).message;
@@ -132,19 +169,56 @@
         />
       {/if}
     </div>
-  {:else if widgets.length === 0}
+  {:else if widgets.length === 0 && missing.length === 0}
     <p class="muted">No widgets are installed.</p>
   {:else}
     <ul>
       {#each widgets as w (w.id)}
         <li>
-          <button type="button" class="pick" disabled={busy || w.blocked !== null} onclick={() => pick(w)}>
-            <span class="name">{w.name}</span>
-            {#if w.description}<span class="desc">{w.description}</span>{/if}
-            <span class="meta">{meta(w)}</span>
-            {#if w.local}<span class="badge">Local: not reviewed</span>{/if}
-            {#if w.blocked}<span class="field-error">{w.blocked}</span>{/if}
-          </button>
+          {#if w.blocked}
+            <div class="pick blocked">
+              <span class="name">{w.name}</span>
+              {#if w.description}<span class="desc">{w.description}</span>{/if}
+              <span class="meta">{meta(w)}</span>
+              {#if w.local}<span class="badge">Local: not reviewed</span>{/if}
+              <PermissionReview
+                permissions={w.added}
+                intro={reviewIntro(w.name, w.firstReview)}
+                confirmLabel="Allow"
+                {busy}
+                onconfirm={() => allow(w)}
+              />
+            </div>
+          {:else}
+            <button type="button" class="pick" disabled={busy} onclick={() => pick(w)}>
+              <span class="name">{w.name}</span>
+              {#if w.description}<span class="desc">{w.description}</span>{/if}
+              <span class="meta">{meta(w)}</span>
+              {#if w.local}<span class="badge">Local: not reviewed</span>{/if}
+            </button>
+          {/if}
+        </li>
+      {/each}
+      {#each missing as m (m.id)}
+        <li>
+          <div class="pick blocked">
+            <span class="name">{m.id}</span>
+            <span class="field-error">Its folder is missing or cannot be loaded:</span>
+            <span class="meta folder">{m.folder}</span>
+            <span class="meta">Load the folder again from its new place, or remove the widget.</span>
+            <span class="row">
+              {#if confirmRemove === m.id}
+                <button type="button" class="btn accent" disabled={busy} onclick={() => forget(m.id)}>
+                  Remove widget
+                </button>
+                <button type="button" class="btn" disabled={busy} onclick={() => (confirmRemove = null)}>Cancel</button>
+              {:else}
+                <button type="button" class="btn danger" disabled={busy} onclick={() => (confirmRemove = m.id)}>
+                  Remove widget
+                </button>
+              {/if}
+            </span>
+          </div>
         </li>
       {/each}
     </ul>
@@ -207,6 +281,16 @@
 
   .pick:disabled {
     color: var(--text-disabled);
+  }
+
+  .pick.blocked {
+    gap: 4px;
+  }
+
+  .row {
+    display: flex;
+    gap: 8px;
+    margin-top: 4px;
   }
 
   .name {

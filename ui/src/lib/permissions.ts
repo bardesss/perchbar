@@ -16,3 +16,12 @@ export function permissionLines(p: Permissions): PermissionLine[] {
   if (p.sources.length > 0) lines.push({ lead: "It uses:", items: p.sources });
   return lines.length > 0 ? lines : [{ lead: "No network, file or data access", items: [] }];
 }
+
+/**
+ * The line above a review of a blocked widget. A first review (nothing
+ * approved before) has none: the permission lines say it all (spec 5.4).
+ */
+export function reviewIntro(name: string, firstReview: boolean): string | undefined {
+  if (firstReview) return undefined;
+  return `${name} now asks for more than you allowed. It stays off the taskbar until you allow:`;
+}

@@ -159,6 +159,7 @@
         <WidgetEditor
           instance={selected}
           widget={selectedWidget}
+          missing={view.missingLocal.find((m) => m.id === selected.widget)}
           label={labels[selected.id] ?? selected.widget}
           {changes}
           onchanged={refresh}
@@ -178,6 +179,7 @@
   <AddWidgetDialog
     open={adding}
     widgets={view.widgets}
+    missing={view.missingLocal}
     onchanged={refresh}
     onclose={() => (adding = false)}
     onadded={(id) => {

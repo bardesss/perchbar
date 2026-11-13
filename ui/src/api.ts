@@ -40,6 +40,8 @@ export interface WidgetView {
   permissions: Permissions;
   /** What the manifest asks for beyond the approval, while blocked. */
   added: Permissions;
+  /** Blocked, and nothing was ever approved for it. */
+  firstReview: boolean;
   local: boolean;
   blocked: string | null;
   folder: string | null;
@@ -84,8 +86,15 @@ export interface Group {
   interval: number;
 }
 
+/** A local widget whose folder is missing or broken. */
+export interface MissingLocalView {
+  id: string;
+  folder: string;
+}
+
 export interface StateView {
   widgets: WidgetView[];
+  missingLocal: MissingLocalView[];
   instances: InstanceView[];
   groups: Group[];
   /** Top-level strip order: ungrouped instance ids and group ids. */
