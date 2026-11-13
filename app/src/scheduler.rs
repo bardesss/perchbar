@@ -1796,6 +1796,42 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn run_error_across_the_clip_shows_no_part_of_the_secret() {
+        const SECRET: &str = "sk-1234567890";
+        let wdir = tempfile::tempdir().unwrap();
+        // "Error: " (7 chars) + 286 pad puts the secret at char 293, across
+        // the 300-char cut.
+        std::fs::write(
+            wdir.path().join("widget.js"),
+            "export default async function update({ settings }) {\n\
+             throw new Error(\"x\".repeat(286) + settings.apiKey);\n}",
+        )
+        .unwrap();
+        let widgets = HashMap::from([(
+            "w".to_string(),
+            WidgetEntry::bundled(manifest(), wdir.path().to_path_buf()),
+        )]);
+        let rig = Rig::start_full(
+            widgets,
+            data(vec![inst(1, false)]),
+            Arc::new(|ctx| Box::pin(sandbox::run(ctx))),
+        );
+        rig.secrets.set(&id(1), "apiKey", SECRET).unwrap();
+        advance(3).await;
+        let lines = rig.handle.logbook().lines(&id(1));
+        let last = lines.last().expect("a logbook line");
+        assert_eq!(last.level, LogLevel::Error);
+        assert!(last.text.contains("xxxx"), "{}", last.text);
+        assert!(!last.text.contains(&SECRET[..4]), "{}", last.text);
+        match single_state(&rig.last(), 0) {
+            SlotState::Error { message, .. } => {
+                assert!(!message.contains(&SECRET[..4]), "{message}")
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn run_failure_goes_to_logbook() {
         let rig = Rig::start(data(vec![inst(1, false)]), |_| {
             Err(RunError::Script("boom".into()))

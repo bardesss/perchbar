@@ -291,6 +291,30 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// `v` as it appears inside a JSON string (no outer quotes).
+fn json_escaped(v: &str) -> String {
+    let quoted = serde_json::to_string(v).unwrap_or_default();
+    quoted
+        .strip_prefix('"')
+        .and_then(|q| q.strip_suffix('"'))
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// `v` as JavaScript's `encodeURIComponent` encodes it: everything except
+/// `A-Z a-z 0-9 - _ . ! ~ * ' ( )` becomes `%XX` per UTF-8 byte.
+fn encode_uri_component(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for b in v.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&b) {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 /// Replaces secret values in text with `[secret]`.
 #[derive(Default)]
 pub struct Redactor {
@@ -307,11 +331,24 @@ impl fmt::Debug for Redactor {
 }
 
 impl Redactor {
-    /// Values shorter than `REDACT_MIN_CHARS` characters are ignored.
+    /// Values shorter than `REDACT_MIN_CHARS` characters are ignored. Each
+    /// value is also matched in the encoded forms a widget is likely to log:
+    /// JSON-escaped (`JSON.stringify`), `encodeURIComponent` and form
+    /// encoding (`URLSearchParams`).
     pub fn new(values: impl IntoIterator<Item = String>) -> Redactor {
         let mut values: Vec<String> = values
             .into_iter()
             .filter(|v| v.chars().count() >= REDACT_MIN_CHARS)
+            .flat_map(|v| {
+                let mut forms = vec![
+                    json_escaped(&v),
+                    encode_uri_component(&v),
+                    url::form_urlencoded::byte_serialize(v.as_bytes()).collect(),
+                ];
+                forms.retain(|f| *f != v);
+                forms.push(v);
+                forms
+            })
             .collect();
         values.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
         values.dedup();
@@ -471,6 +508,26 @@ mod tests {
         let r = Redactor::new(["pass".to_string(), "password1".to_string()]);
         assert_eq!(r.apply("x password1 pass"), "x [secret] [secret]");
         assert_eq!(Redactor::default().apply("plain"), "plain");
+    }
+
+    #[test]
+    fn redactor_replaces_encoded_forms() {
+        let secret = "a\"b\\c%d e";
+        let r = Redactor::new([secret.to_string()]);
+        let json = serde_json::to_string(&json!({ "key": secret })).unwrap();
+        assert_eq!(json, r#"{"key":"a\"b\\c%d e"}"#);
+        assert_eq!(r.apply(&json), r#"{"key":"[secret]"}"#);
+        assert_eq!(r.apply(&format!("raw {secret}!")), "raw [secret]!");
+        // encodeURIComponent(secret)
+        assert_eq!(encode_uri_component(secret), "a%22b%5Cc%25d%20e");
+        assert_eq!(
+            r.apply("https://x.test/?k=a%22b%5Cc%25d%20e&z=1"),
+            "https://x.test/?k=[secret]&z=1"
+        );
+        // URLSearchParams / form encoding
+        assert_eq!(r.apply("k=a%22b%5Cc%25d+e"), "k=[secret]");
+        // Non-ASCII is encoded per UTF-8 byte, as in JavaScript.
+        assert_eq!(encode_uri_component("é~'"), "%C3%A9~'");
     }
 
     fn secret_manifest() -> Arc<Manifest> {

