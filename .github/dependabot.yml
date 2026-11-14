@@ -9,6 +9,12 @@ updates:
     commit-message:
       prefix: "deps"
     groups:
+      # windows-numerics must match the version the windows crate uses, so
+      # they only move together.
+      windows:
+        patterns:
+          - "windows"
+          - "windows-*"
       cargo-minor-patch:
         update-types:
           - "minor"
