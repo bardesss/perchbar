@@ -1019,6 +1019,12 @@ mod tests {
         assert_eq!(c.pending.len(), 1);
         gate_tx.send(()).unwrap();
         assert!(c.settle(Duration::from_secs(20)));
+        // The worker sends the result first and calls notify right after,
+        // so settle can return a moment before the notify lands.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while notified.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert_eq!(notified.load(Ordering::SeqCst), 1);
         assert!(c.get(&fixtures(), "logo.svg", 16, None).is_some());
     }
