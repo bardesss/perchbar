@@ -1,5 +1,6 @@
 //! Widget manifest (`widget.json`) parsing and validation.
 
+use std::io::Read;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,10 @@ use serde::{Deserialize, Serialize};
 pub const MIN_REFRESH_SECS: u32 = 10;
 const DEFAULT_REFRESH_SECS: u32 = 60;
 const SUPPORTED_FORMAT_VERSION: u32 = 1;
+/// Largest `widget.json` read.
+pub const MANIFEST_MAX_BYTES: u64 = 64 * 1024;
+/// Largest `widget.js` accepted when a widget is loaded.
+pub const SCRIPT_MAX_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
@@ -17,6 +22,10 @@ pub enum ManifestError {
     Json(String),
     #[error("widget.js is missing")]
     MissingWidgetJs,
+    #[error("{0} is larger than {1} bytes")]
+    TooLarge(&'static str, u64),
+    #[error("{0} must be a file in the widget folder, not a link")]
+    NotAFile(&'static str),
     #[error("invalid manifest: {0}")]
     Invalid(String),
 }
@@ -92,17 +101,72 @@ fn default_refresh() -> u32 {
 }
 
 /// Reads `dir/widget.json`, validates it and requires `dir/widget.js`.
+/// Both must be plain files (links are refused, so nothing outside the
+/// folder is read) within the size limits. Nothing is run.
 pub fn load(dir: &Path) -> Result<Manifest, ManifestError> {
-    let text = std::fs::read_to_string(dir.join("widget.json"))?;
+    let bytes = read_bounded(&dir.join("widget.json"), "widget.json", MANIFEST_MAX_BYTES)?;
+    let text = String::from_utf8(bytes)
+        .map_err(|_| ManifestError::Json("widget.json is not UTF-8 text".into()))?;
     // Some Windows editors save UTF-8 with a byte order mark.
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     let mut manifest: Manifest =
         serde_json::from_str(text).map_err(|e| ManifestError::Json(e.to_string()))?;
-    if !dir.join("widget.js").is_file() {
-        return Err(ManifestError::MissingWidgetJs);
+    match plain_file(&dir.join("widget.js"), "widget.js", SCRIPT_MAX_BYTES) {
+        Err(ManifestError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ManifestError::MissingWidgetJs)
+        }
+        other => other?,
     }
     validate(&mut manifest)?;
     Ok(manifest)
+}
+
+/// Reads `dir/widget.js` for a run, with the same checks as `load`: a
+/// plain file (no link) of at most `SCRIPT_MAX_BYTES`.
+pub fn read_script(dir: &Path) -> Result<String, ManifestError> {
+    let bytes = read_bounded(&dir.join("widget.js"), "widget.js", SCRIPT_MAX_BYTES)?;
+    String::from_utf8(bytes)
+        .map_err(|_| ManifestError::Invalid("widget.js is not UTF-8 text".into()))
+}
+
+/// Reads a plain file of at most `max` bytes. The read itself is bounded
+/// too, so a file that grows after the check is still refused.
+fn read_bounded(path: &Path, name: &'static str, max: u64) -> Result<Vec<u8>, ManifestError> {
+    plain_file(path, name, max)?;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(max + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Err(ManifestError::TooLarge(name, max));
+    }
+    Ok(bytes)
+}
+
+/// Windows reparse points (symlinks, junctions and the like).
+#[cfg(windows)]
+fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_meta: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// Checks that `path` is a regular file (not a link or other reparse
+/// point) of at most `max` bytes.
+fn plain_file(path: &Path, name: &'static str, max: u64) -> Result<(), ManifestError> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.is_file() || meta.file_type().is_symlink() || is_reparse_point(&meta) {
+        return Err(ManifestError::NotAFile(name));
+    }
+    if meta.len() > max {
+        return Err(ManifestError::TooLarge(name, max));
+    }
+    Ok(())
 }
 
 fn invalid<T>(msg: impl Into<String>) -> Result<T, ManifestError> {
@@ -134,6 +198,11 @@ fn validate(m: &mut Manifest) -> Result<(), ManifestError> {
         }
         if s.kind == SettingKind::Select && s.options.is_empty() {
             return invalid(format!("select setting {:?} needs options", s.key));
+        }
+        // A secret is the user's own: a default would be stored as if the
+        // user had saved it.
+        if s.kind == SettingKind::Secret && s.default.is_some() {
+            return invalid(format!("secret setting {:?} cannot have a default", s.key));
         }
     }
     Ok(())
@@ -234,6 +303,36 @@ mod tests {
     }
 
     #[test]
+    fn oversized_files_are_refused() {
+        let dir = fixture(base(), true);
+        let mut big = base();
+        big["description"] = json!("x".repeat(MANIFEST_MAX_BYTES as usize));
+        fs::write(dir.path().join("widget.json"), big.to_string()).unwrap();
+        assert!(matches!(
+            load(dir.path()),
+            Err(ManifestError::TooLarge("widget.json", _))
+        ));
+
+        let dir = fixture(base(), true);
+        let js = vec![b' '; SCRIPT_MAX_BYTES as usize + 1];
+        fs::write(dir.path().join("widget.js"), js).unwrap();
+        assert!(matches!(
+            load(dir.path()),
+            Err(ManifestError::TooLarge("widget.js", _))
+        ));
+    }
+
+    #[test]
+    fn widget_js_folder_is_not_a_file() {
+        let dir = fixture(base(), false);
+        fs::create_dir(dir.path().join("widget.js")).unwrap();
+        assert!(matches!(
+            load(dir.path()),
+            Err(ManifestError::NotAFile("widget.js"))
+        ));
+    }
+
+    #[test]
     fn unknown_format_version_is_error() {
         let mut j = base();
         j["formatVersion"] = json!(2);
@@ -264,5 +363,19 @@ mod tests {
         j["settings"] = json!([{"key": "unit", "label": "Unit", "kind": "select", "options": []}]);
         let dir = fixture(j, true);
         assert!(matches!(load(dir.path()), Err(ManifestError::Invalid(_))));
+    }
+
+    #[test]
+    fn secret_setting_has_no_default() {
+        let mut j = base();
+        j["settings"] = json!([
+            {"key": "apiKey", "label": "API key", "kind": "secret", "default": "sk-author"}
+        ]);
+        let dir = fixture(j, true);
+        assert!(matches!(load(dir.path()), Err(ManifestError::Invalid(_))));
+        let mut j = base();
+        j["settings"] = json!([{"key": "apiKey", "label": "API key", "kind": "secret"}]);
+        let dir = fixture(j, true);
+        assert!(load(dir.path()).is_ok());
     }
 }

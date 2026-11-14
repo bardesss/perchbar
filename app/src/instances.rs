@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, SettingKind};
 
 /// Lowest allowed group rotation interval in seconds; smaller values are raised.
 pub const MIN_GROUP_INTERVAL_SECS: u32 = 3;
@@ -71,9 +71,13 @@ fn random_id(prefix: &str) -> String {
     format!("{prefix}{:08x}", rand::random::<u32>())
 }
 
+/// The manifest's defaults. Secret fields never get one: secrets live in
+/// the secret store, never in instances.json (validation also refuses a
+/// default on a secret field).
 fn manifest_defaults(m: &Manifest) -> Map<String, Value> {
     m.settings
         .iter()
+        .filter(|f| f.kind != SettingKind::Secret)
         .filter_map(|f| f.default.clone().map(|d| (f.key.clone(), d)))
         .collect()
 }
@@ -182,7 +186,23 @@ impl Instances {
                 .retain(|m| instance_ids.contains(m) && grouped.insert(m.clone()));
             g.interval = g.interval.max(MIN_GROUP_INTERVAL_SECS);
         }
-        self.groups.retain(|g| !g.members.is_empty());
+        // A group needs two members to rotate. One left alone takes the
+        // group's place in the order; an empty group just goes.
+        let mut dissolved: Vec<(String, String)> = Vec::new();
+        self.groups.retain(|g| match g.members.as_slice() {
+            [] => false,
+            [only] => {
+                dissolved.push((g.id.clone(), only.clone()));
+                false
+            }
+            _ => true,
+        });
+        for (group_id, member) in dissolved {
+            grouped.remove(&member);
+            for id in self.order.iter_mut().filter(|id| **id == group_id) {
+                id.clone_from(&member);
+            }
+        }
 
         let top_level: Vec<&str> = self
             .instances
@@ -269,6 +289,26 @@ mod tests {
     }
 
     #[test]
+    fn secret_defaults_never_reach_settings() {
+        // Manifest validation refuses this; built directly, it still must
+        // not put a value in instances.json or the run settings.
+        let m: Manifest = serde_json::from_value(json!({
+            "id": "w", "name": "W", "formatVersion": 1,
+            "settings": [
+                {"key": "apiKey", "label": "API key", "kind": "secret", "default": "sk-author"},
+                {"key": "unit", "label": "Unit", "kind": "text", "default": "C"}
+            ]
+        }))
+        .unwrap();
+        let mut data = Instances::default();
+        data.new_instance(&m);
+        let i = data.instances[0].clone();
+        assert!(!i.settings.contains_key("apiKey"));
+        assert_eq!(i.settings["unit"], json!("C"));
+        assert!(!data.effective_settings(&i, &m).contains_key("apiKey"));
+    }
+
+    #[test]
     fn normalize_keeps_unknown_widget_instances_and_drops_empty_groups() {
         let mut data = Instances {
             instances: vec![
@@ -276,7 +316,11 @@ mod tests {
                 inst("inst-00000002", "gone"),
             ],
             groups: vec![
-                group("grp-00000001", &["inst-00000002", "inst-ffffffff"], 8),
+                group(
+                    "grp-00000001",
+                    &["inst-00000002", "inst-ffffffff", "inst-00000001"],
+                    8,
+                ),
                 group("grp-00000002", &[], 8),
             ],
             order: vec!["grp-00000001".into()],
@@ -284,10 +328,37 @@ mod tests {
         data.normalize(&known(&["weather"]));
         assert_eq!(data.instances.len(), 2);
         assert_eq!(data.groups.len(), 1);
-        assert_eq!(data.groups[0].members, ["inst-00000002"]);
+        assert_eq!(data.groups[0].members, ["inst-00000002", "inst-00000001"]);
+        assert_eq!(data.order, vec!["grp-00000001".to_string()]);
+    }
+
+    #[test]
+    fn normalize_dissolves_one_member_groups_in_place() {
+        let mut data = Instances {
+            instances: vec![
+                inst("inst-00000001", "w"),
+                inst("inst-00000002", "w"),
+                inst("inst-00000003", "w"),
+            ],
+            groups: vec![
+                group("grp-00000001", &["inst-00000002", "inst-ffffffff"], 8),
+                group("grp-00000002", &["inst-00000003"], 8),
+            ],
+            order: vec![
+                "inst-00000001".into(),
+                "grp-00000001".into(),
+                "grp-00000002".into(),
+            ],
+        };
+        data.normalize(&known(&["w"]));
+        assert!(data.groups.is_empty());
         assert_eq!(
             data.order,
-            vec!["grp-00000001".to_string(), "inst-00000001".to_string()]
+            vec![
+                "inst-00000001".to_string(),
+                "inst-00000002".to_string(),
+                "inst-00000003".to_string()
+            ]
         );
     }
 
@@ -346,13 +417,14 @@ mod tests {
                 inst("inst-0000000a", "w"),
             ],
             groups: vec![
-                group("grp-../../x", &["inst-0000000a"], 8),
-                group("grp-0000000b", &["inst-0000000a"], 8),
+                group("grp-../../x", &["inst-0000000a", "inst-0000000c"], 8),
+                group("grp-0000000b", &["inst-0000000a", "inst-0000000c"], 8),
             ],
             order: vec!["../../evil".into()],
         };
+        data.instances.push(inst("inst-0000000c", "w"));
         data.normalize(&known(&["w"]));
-        assert_eq!(data.instances.len(), 1);
+        assert_eq!(data.instances.len(), 2);
         assert_eq!(data.groups.len(), 1);
         assert_eq!(data.groups[0].id, "grp-0000000b");
         assert_eq!(data.order, vec!["grp-0000000b".to_string()]);
@@ -361,12 +433,20 @@ mod tests {
     #[test]
     fn normalize_dedupes_ids_and_clamps_interval() {
         let mut data = Instances {
-            instances: vec![inst("inst-00000001", "w"), inst("inst-00000001", "w")],
-            groups: vec![group("grp-00000001", &["inst-00000001"], 1)],
+            instances: vec![
+                inst("inst-00000001", "w"),
+                inst("inst-00000001", "w"),
+                inst("inst-00000002", "w"),
+            ],
+            groups: vec![group(
+                "grp-00000001",
+                &["inst-00000001", "inst-00000002"],
+                1,
+            )],
             order: vec!["grp-00000001".into(), "grp-00000001".into()],
         };
         data.normalize(&known(&["w"]));
-        assert_eq!(data.instances.len(), 1);
+        assert_eq!(data.instances.len(), 2);
         assert_eq!(data.groups[0].interval, 3);
         assert_eq!(data.order, vec!["grp-00000001".to_string()]);
     }

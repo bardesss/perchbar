@@ -1,5 +1,6 @@
 //! The taskbar strip: model, layout, rendering and the window that shows it.
 
+mod flyout;
 pub mod icons;
 pub mod image;
 pub mod layout;
@@ -10,8 +11,6 @@ pub mod theme;
 mod uia;
 mod window;
 
-use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::thread::JoinHandle;
 
@@ -24,18 +23,20 @@ pub enum StripEvent {
 }
 
 /// Starts the strip thread. Send events on the channel's sender, then call
-/// [`wake`] so the thread notices them. `names` maps widget folders to their
-/// manifest names (for the "+N" menu); `on_quit` runs on the strip thread
+/// [`wake`] so the thread notices them. `on_quit` runs on the strip thread
 /// when the user picks "Quit Perchbar", before the strip tears down.
+/// `on_open_settings` runs on the strip thread to open the settings window,
+/// focused on an instance or not; it must return at once, since the strip
+/// never waits on anything.
 pub fn spawn(
     rx: Receiver<StripEvent>,
     sched: SchedulerHandle,
-    names: HashMap<PathBuf, String>,
     on_quit: impl FnOnce() + Send + 'static,
+    on_open_settings: impl Fn(Option<String>) + Send + Sync + 'static,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("perchbar-strip".into())
-        .spawn(move || window::run(rx, sched, names, Box::new(on_quit)))
+        .spawn(move || window::run(rx, sched, Box::new(on_quit), Box::new(on_open_settings)))
         .expect("cannot spawn the strip thread")
 }
 
@@ -54,8 +55,6 @@ pub(crate) struct RenderKey {
     /// Sorted (instance id, shown frame).
     pub frames: Vec<(String, usize)>,
     pub hover: Option<String>,
-    /// The slot dimmed briefly after a click.
-    pub pressed: Option<String>,
     pub dark: bool,
     pub dpi: u32,
     /// Taskbar height in pixels.

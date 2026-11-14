@@ -1,11 +1,14 @@
 //! Pure strip layout: where each slot goes, how wide it is, which frame or
-//! group member is showing, and which slots overflow into "+N".
-//! No Win32 code here; text measurement is injected through [`Measure`].
+//! group member is showing, which slots overflow into "+N", and where the
+//! "+N" flyout and its rows go.
+//! No Win32 calls here; text measurement is injected through [`Measure`].
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use windows::Win32::Foundation::RECT;
 
 use crate::display::{Block, Frame, Output, TextSize};
 use crate::strip::model::{Slot, SlotKind, SlotState, StripModel};
@@ -29,6 +32,19 @@ pub const MIN_APP_GAP_DIP: f32 = 8.0;
 pub const EMPTY_SLOT_DIP: f32 = 24.0;
 /// Frame rotation period when a widget does not set `rotate`.
 pub const DEFAULT_ROTATE_SECS: u32 = 6;
+
+/// Inner padding of the "+N" flyout around its rows.
+pub const FLYOUT_PAD_DIP: f32 = 8.0;
+/// Space between two flyout rows.
+pub const FLYOUT_SPACING_DIP: f32 = 4.0;
+/// The flyout is never narrower than this.
+pub const FLYOUT_MIN_WIDTH_DIP: f32 = 160.0;
+/// Rows shown at once; more scroll with the wheel.
+pub const FLYOUT_MAX_ROWS: usize = 12;
+/// Height of one flyout row.
+pub const FLYOUT_ROW_DIP: f32 = 40.0;
+/// Space between the flyout and the "+N" item.
+pub const FLYOUT_GAP_DIP: f32 = 8.0;
 
 /// DIPs to device pixels.
 pub fn px(dip: f32, scale: f32) -> i32 {
@@ -465,6 +481,105 @@ pub fn hit_test(layout: &StripLayout, x_dip: f32) -> Option<Hit> {
         .as_ref()
         .filter(|o| inside(o.x_dip, o.width_dip))
         .map(|_| Hit::Overflow)
+}
+
+/// The screen edge the taskbar sits on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edge {
+    Top,
+    Bottom,
+}
+
+/// The edge of `monitor` that `taskbar` is closer to.
+pub fn taskbar_edge(taskbar: RECT, monitor: RECT) -> Edge {
+    if taskbar.top - monitor.top < monitor.bottom - taskbar.bottom {
+        Edge::Top
+    } else {
+        Edge::Bottom
+    }
+}
+
+/// The flyout's width for rows `rows` DIPs wide: the widest row plus
+/// padding, at least [`FLYOUT_MIN_WIDTH_DIP`].
+pub fn flyout_width_dip(rows: &[f32]) -> f32 {
+    let widest = rows.iter().copied().fold(0.0, f32::max);
+    (widest + 2.0 * FLYOUT_PAD_DIP).max(FLYOUT_MIN_WIDTH_DIP)
+}
+
+/// Where the "+N" flyout goes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlyoutGeometry {
+    /// The window in screen pixels.
+    pub rect: RECT,
+    /// The visible rows in client pixels, top to bottom; at most
+    /// [`FLYOUT_MAX_ROWS`].
+    pub rows: Vec<RECT>,
+}
+
+/// Lays out the flyout for rows `rows` DIPs wide: stacked with
+/// [`FLYOUT_PAD_DIP`] around them and [`FLYOUT_SPACING_DIP`] between them,
+/// as wide as the widest row plus padding (at least
+/// [`FLYOUT_MIN_WIDTH_DIP`]), [`FLYOUT_GAP_DIP`] above the anchor for a
+/// bottom taskbar (below it for a top one), right-aligned to it and kept
+/// inside `work`. `anchor` is the "+N" item in screen pixels.
+pub fn flyout_geometry(
+    rows: &[f32],
+    row_height_dip: f32,
+    scale: f32,
+    anchor: RECT,
+    work: RECT,
+    taskbar_edge: Edge,
+) -> FlyoutGeometry {
+    let shown = rows.len().min(FLYOUT_MAX_ROWS);
+    let width_dip = flyout_width_dip(rows);
+    let height_dip = 2.0 * FLYOUT_PAD_DIP
+        + shown as f32 * row_height_dip
+        + shown.saturating_sub(1) as f32 * FLYOUT_SPACING_DIP;
+    let (w, h) = (px(width_dip, scale), px(height_dip, scale));
+    let gap = px(FLYOUT_GAP_DIP, scale);
+
+    // Right-aligned to the anchor, then shifted inside the work area (its
+    // left edge wins when the flyout is wider than the work area).
+    let left = (anchor.right - w).min(work.right - w).max(work.left);
+    let top = match taskbar_edge {
+        Edge::Bottom => (anchor.top - gap - h).max(work.top),
+        Edge::Top => (anchor.bottom + gap).min(work.bottom - h).max(work.top),
+    };
+    let row_rects = (0..shown)
+        .map(|i| {
+            let y = FLYOUT_PAD_DIP + i as f32 * (row_height_dip + FLYOUT_SPACING_DIP);
+            RECT {
+                left: px(FLYOUT_PAD_DIP, scale),
+                top: px(y, scale),
+                right: px(width_dip - FLYOUT_PAD_DIP, scale),
+                bottom: px(y + row_height_dip, scale),
+            }
+        })
+        .collect();
+    FlyoutGeometry {
+        rect: RECT {
+            left,
+            top,
+            right: left + w,
+            bottom: top + h,
+        },
+        rows: row_rects,
+    }
+}
+
+/// The hidden slots `overflow` as flyout rows, in that order: placed like
+/// strip slots, at x 0 with their strip width.
+pub fn flyout_rows(
+    model: &StripModel,
+    rot: &RotationState,
+    overflow: &[String],
+    m: &dyn Measure,
+) -> Vec<PlacedSlot> {
+    overflow
+        .iter()
+        .filter_map(|id| model.slots.iter().find(|s| &s.id == id))
+        .map(|slot| place(slot, 0.0, slot_width(slot, m), rot))
+        .collect()
 }
 
 #[cfg(test)]
@@ -963,5 +1078,118 @@ mod tests {
         rot.tick(&model(vec![btc("s1")]), Instant::now());
         assert!(rot.group_index.is_empty());
         assert!(rot.frame_index.is_empty());
+    }
+
+    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
+        RECT {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn flyout_above_bottom_taskbar() {
+        let work = rect(0, 0, 2560, 1552);
+        let anchor = rect(2300, 1552, 2330, 1600);
+        let g = flyout_geometry(&[100.0, 120.0], 40.0, 1.0, anchor, work, Edge::Bottom);
+        assert_eq!(g.rect.bottom, anchor.top - px(FLYOUT_GAP_DIP, 1.0));
+        assert_eq!(g.rect.right, anchor.right);
+        // 8 + 40 + 4 + 40 + 8; 160 wide (the minimum).
+        assert_eq!(g.rect.bottom - g.rect.top, 100);
+        assert_eq!(g.rect.right - g.rect.left, 160);
+        assert_eq!(g.rows, [rect(8, 8, 152, 48), rect(8, 52, 152, 92)]);
+    }
+
+    #[test]
+    fn flyout_below_top_taskbar() {
+        let work = rect(0, 48, 1920, 1080);
+        let anchor = rect(1500, 0, 1530, 48);
+        let g = flyout_geometry(&[100.0], 40.0, 1.5, anchor, work, Edge::Top);
+        assert_eq!(g.rect.top, anchor.bottom + px(FLYOUT_GAP_DIP, 1.5));
+        assert_eq!(g.rect.right, anchor.right);
+        assert_eq!(g.rect.bottom - g.rect.top, px(8.0 + 40.0 + 8.0, 1.5));
+    }
+
+    #[test]
+    fn flyout_clamped_to_work_area() {
+        let work = rect(0, 0, 1920, 1032);
+        let anchor = rect(10, 1032, 40, 1080);
+        let g = flyout_geometry(&[200.0], 40.0, 1.0, anchor, work, Edge::Bottom);
+        assert!(g.rect.left >= work.left);
+        assert_eq!(g.rect.left, 0);
+        assert_eq!(g.rect.right, 216);
+        // A secondary monitor left of the primary one has negative x.
+        let work = rect(-1920, 0, 0, 1040);
+        let anchor = rect(-1915, 1040, -1890, 1080);
+        let g = flyout_geometry(&[200.0], 40.0, 1.0, anchor, work, Edge::Bottom);
+        assert_eq!((g.rect.left, g.rect.right), (-1920, -1704));
+        assert_eq!(g.rect.bottom, 1040 - px(FLYOUT_GAP_DIP, 1.0));
+        // Too tall for the space above: kept inside the top of the work area.
+        let work = rect(0, 900, 1920, 1032);
+        let g = flyout_geometry(
+            &[200.0; 5],
+            40.0,
+            1.0,
+            rect(500, 1032, 530, 1080),
+            work,
+            Edge::Bottom,
+        );
+        assert_eq!(g.rect.top, 900);
+    }
+
+    #[test]
+    fn flyout_width_is_widest_row() {
+        let work = rect(0, 0, 2560, 1552);
+        let anchor = rect(2300, 1552, 2330, 1600);
+        let g = flyout_geometry(&[80.0, 150.0], 40.0, 1.5, anchor, work, Edge::Bottom);
+        assert_eq!(
+            g.rect.right - g.rect.left,
+            ((150.0_f32 + 16.0) * 1.5).round() as i32
+        );
+        // Rows span the inner width.
+        assert!(g
+            .rows
+            .iter()
+            .all(|r| r.left == px(8.0, 1.5) && r.right == px(158.0, 1.5)));
+        // Narrow rows still get the 160 DIP minimum.
+        let g = flyout_geometry(&[80.0, 140.0], 40.0, 1.5, anchor, work, Edge::Bottom);
+        assert_eq!(g.rect.right - g.rect.left, px(160.0, 1.5));
+    }
+
+    #[test]
+    fn flyout_caps_visible_rows() {
+        let work = rect(0, 0, 2560, 1552);
+        let anchor = rect(2300, 1552, 2330, 1600);
+        let g = flyout_geometry(&[100.0; 20], 40.0, 1.0, anchor, work, Edge::Bottom);
+        assert_eq!(g.rows.len(), FLYOUT_MAX_ROWS);
+        assert_eq!(FLYOUT_MAX_ROWS, 12);
+        assert_eq!(g.rect.bottom - g.rect.top, 16 + 12 * 40 + 11 * 4);
+    }
+
+    #[test]
+    fn taskbar_edge_from_its_monitor() {
+        let mon = rect(0, 0, 1920, 1080);
+        assert_eq!(taskbar_edge(rect(0, 1032, 1920, 1080), mon), Edge::Bottom);
+        assert_eq!(taskbar_edge(rect(0, 0, 1920, 48), mon), Edge::Top);
+    }
+
+    #[test]
+    fn flyout_rows_are_the_hidden_slots_in_order() {
+        let m = model(vec![btc("a"), btc("b"), btc("c")]);
+        let rows = flyout_rows(
+            &m,
+            &RotationState::default(),
+            &["c".into(), "b".into()],
+            &Fake,
+        );
+        let ids: Vec<&str> = rows.iter().map(|p| p.slot_id.as_str()).collect();
+        assert_eq!(ids, ["c", "b"]);
+        assert_eq!(rows[0].width_dip, 11.0 * 7.0 + 2.0 * SLOT_PAD_DIP);
+        assert_eq!(
+            rows[0].frame.as_ref().map(|f| f.instance_id.as_str()),
+            Some("c")
+        );
     }
 }

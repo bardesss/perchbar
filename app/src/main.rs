@@ -2,16 +2,17 @@
 // Explorer or at sign-in. Debug builds keep the console for log output.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use perchbar::commands::AppState;
+use perchbar::prefs::{self, Autostart, NoAutostart, RegistryAutostart};
 use perchbar::sandbox::ReqwestClient;
 use perchbar::scheduler::Scheduler;
+use perchbar::settings_window::{self, ExitDecision, StateBridge};
 use perchbar::strip::{self, StripEvent};
-use perchbar::{instances, logger, paths, setup};
+use perchbar::{logger, paths, setup};
 
 /// Takes the session-wide `Local\Perchbar` mutex. Returns false when another
 /// Perchbar already holds it. The handle is never closed: the mutex lives
@@ -61,38 +62,35 @@ fn main() {
         paths::data_dir().display()
     );
 
-    let widgets_dir = paths::widgets_dir();
-    match setup::install_bundled(&widgets_dir) {
-        Ok(copied) if !copied.is_empty() => log::info!("installed templates: {copied:?}"),
-        Ok(_) => {}
-        Err(e) => log::warn!("cannot install bundled templates: {e}"),
+    // Dev and test runs (PERCHBAR_DATA_DIR set) must not register themselves
+    // in the real Run key.
+    let dev_mode = std::env::var_os(paths::DATA_DIR_ENV).is_some_and(|v| !v.is_empty());
+    let exe = std::env::current_exe();
+    let autostart: Arc<dyn Autostart + Send + Sync> = match &exe {
+        Ok(exe) if !dev_mode => Arc::new(RegistryAutostart { exe: exe.clone() }),
+        _ => Arc::new(NoAutostart),
+    };
+    match &exe {
+        Ok(exe) => {
+            if dev_mode {
+                log::info!("autostart skipped in dev mode");
+            }
+            prefs::startup(&paths::prefs_file(), autostart.as_ref(), exe);
+        }
+        Err(e) => log::warn!("cannot find own exe, Start with Windows unchanged: {e}"),
     }
 
-    let widgets = setup::load_widgets(&widgets_dir);
-    let known: HashSet<String> = widgets.keys().cloned().collect();
-    let names: HashMap<PathBuf, String> = widgets
-        .values()
-        .map(|(m, dir)| (dir.clone(), m.name.clone()))
-        .collect();
-    let mut data = instances::load(&paths::instances_file());
-    // No file after loading: a first run, or a corrupt file that `load` moved
-    // aside. A saved empty strip (the user removed everything) stays empty.
-    let first_run = !paths::instances_file().exists();
-    data.normalize(&known);
-    if first_run && setup::seed_first_run(&mut data, &widgets) {
-        log::info!("first run: added the default widgets");
-        if let Err(e) = instances::save(&paths::instances_file(), &data) {
-            log::warn!("cannot save {}: {e}", paths::instances_file().display());
-        }
-    }
-    log::info!(
-        "{} widget(s), {} instance(s)",
-        widgets.len(),
-        data.instances.len()
-    );
+    let setup::Boot {
+        widgets,
+        data,
+        secrets: secret_store,
+    } = setup::boot(&paths::data_dir());
 
     let (tx, rx) = mpsc::channel();
     let publish_tx = tx.clone();
+    let (bridge, bridge_rx) = StateBridge::new();
+    // The same store, shared with the settings commands.
+    let sched_secrets = secret_store.clone();
     // The scheduler spawns onto the runtime it starts in, and its runner needs
     // a multi-thread runtime; Tauri's global runtime is one.
     let sched = tauri::async_runtime::block_on(async move {
@@ -100,24 +98,53 @@ fn main() {
             widgets,
             data,
             Arc::new(ReqwestClient::new()),
+            sched_secrets,
             move |model| {
                 // Runs on scheduler threads under the publish lock: never block.
                 let _ = publish_tx.send(StripEvent::Model(model));
                 strip::wake();
+                bridge.notify();
             },
         )
     });
+    let state = AppState::new(
+        sched.clone(),
+        secret_store,
+        sched.logbook(),
+        autostart,
+        paths::data_dir(),
+    );
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .manage(state)
+        .invoke_handler(settings_window::invoke_handler())
         .build(tauri::generate_context!())
         .expect("failed to build Perchbar");
-    let handle = app.handle().clone();
+    settings_window::spawn_state_bridge(app.handle(), bridge_rx);
+    let quit_handle = app.handle().clone();
+    let open_handle = app.handle().clone();
     // "Quit Perchbar" in the strip's menu: an explicit exit code, which the
     // ExitRequested handler below lets through.
-    let mut strip_thread = Some(strip::spawn(rx, sched, names, move || handle.exit(0)));
+    let mut strip_thread = Some(strip::spawn(
+        rx,
+        sched,
+        move || quit_handle.exit(0),
+        // Queued for the main thread; the strip never waits.
+        move |focus| {
+            let app = open_handle.clone();
+            let queued = open_handle.run_on_main_thread(move || settings_window::open(&app, focus));
+            if let Err(e) = queued {
+                log::warn!("cannot open the settings window: {e}");
+            }
+        },
+    ));
 
     app.run(move |_app, event| match event {
-        // Perchbar has no windows; only an explicit exit (code Some) quits.
-        tauri::RunEvent::ExitRequested { api, code, .. } if code.is_none() => {
+        // Closing the settings window must not end Perchbar; only an
+        // explicit exit (code Some) quits.
+        tauri::RunEvent::ExitRequested { api, code, .. }
+            if settings_window::exit_decision(code) == ExitDecision::Prevent =>
+        {
             api.prevent_exit();
         }
         tauri::RunEvent::Exit => {

@@ -47,6 +47,17 @@ Windows already puts weather and stock prices on your taskbar. Perchbar lets you
 
 Run the same widget more than once (a clock for each office), or group several widgets so they take turns in one spot.
 
+## Settings
+
+Click a widget to open its settings (a click on a group moves it to the next widget; right-click and choose **Widget settings** instead). **Open Perchbar settings** in the same menu opens the window without a widget picked. From there you add, configure, reorder, group and hide widgets, and turn **Start with Windows** on or off. API keys and other secrets are encrypted for your Windows account and never written to the settings file.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/settings-dark.png">
+    <img src="docs/images/settings-light.png" width="640" alt="The Perchbar settings window with a list of widgets and the settings of a world clock">
+  </picture>
+</p>
+
 ## Make your own
 
 A widget is a folder with two small files. This one shows the time in a city:
@@ -63,15 +74,18 @@ export default async function update({ settings, time }) {
 
 You don't need to be a developer. Point your own AI assistant (ChatGPT, Claude, Copilot or any other) at this repo and describe what you want. The templates in [`widgets/`](widgets) are written as examples for exactly that. Bring your own icon too: drop an SVG or PNG in the widget folder, and Perchbar can tint it to match the taskbar.
 
+To try your widget, open the settings window, choose **Add widget**, then **Load from folder**. Perchbar shows what the widget asks for (the websites it may reach, the files it may read and the sources it uses) and installs it only after you approve. The folder is used where it is, so after an edit you press **Reload** and see the change. If an edit asks for a new website or file, the widget waits until you choose **Allow**. **Remove widget** takes it off Perchbar but never deletes your folder.
+
+A widget folder you copy by hand into Perchbar's `widgets` folder also needs one **Allow** before it can use the network or files. The built-in templates are approved for you.
+
 Made something good? Share it with a pull request, and it can land in the catalog for everyone.
 
 ## Status
 
-Perchbar is in early development. The taskbar strip, the sandbox and the first two templates work today. Next up:
+Perchbar is in early development. The taskbar strip, the sandbox, the settings window and the first two templates work today. Next up:
 
-1. A settings window to add, configure, reorder and hide widgets.
-2. A catalog in this repo, browsable from the app, plus a Share button that turns your widget into a pull request.
-3. The remaining templates and a guide for writing widgets with AI.
+1. A catalog in this repo, browsable from the app, plus a Share button that turns your widget into a pull request.
+2. The remaining templates and a guide for writing widgets with AI.
 
 ## Install
 
@@ -81,15 +95,19 @@ The builds are not code-signed yet, so Windows SmartScreen may say "Windows prot
 
 ## Build from source
 
-You need Windows 11 and [Rust](https://rustup.rs).
+You need Windows 11, [Rust](https://rustup.rs) and [Node.js](https://nodejs.org) 22 or newer.
 
 ```bash
 git clone https://github.com/bardesss/perchbar.git
 cd perchbar
+npm --prefix ui ci
+npm --prefix ui run build
 cargo run -p perchbar --release
 ```
 
-On first start you get a Bitcoin price and a world clock. Settings live in `%APPDATA%\Perchbar\instances.json` until the settings window arrives.
+The settings window is built from `ui/` into `ui/dist`, which the Rust build embeds. Run the two npm commands again after changing anything in `ui/`.
+
+On first start you get a Bitcoin price and a world clock, and Perchbar turns on Start with Windows (switch it off in the settings window). Everything Perchbar stores lives in `%APPDATA%\Perchbar`: the widget list in `instances.json`, encrypted secrets in `secrets\` and the log in `perchbar.log`. Set `PERCHBAR_DATA_DIR` to use another folder while you test; such runs never register themselves to start with Windows.
 
 ## Security
 

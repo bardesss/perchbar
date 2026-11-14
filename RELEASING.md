@@ -13,6 +13,15 @@
 
 The workflow fails if the tag does not match the version in both files.
 
+The Rust build embeds the settings window from `ui/dist`. The workflow builds it with Node 22 before the Rust steps; for a local build run these first:
+
+```bash
+npm --prefix ui ci
+npm --prefix ui run build
+```
+
+`cargo tauri build` (run in `app/`) also runs both through `beforeBuildCommand`.
+
 To build without releasing, run the **Release** workflow by hand from the Actions tab. The files are attached to the run as an artifact.
 
 Builds are not code-signed yet, so SmartScreen warns on first run.

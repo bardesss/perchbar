@@ -30,9 +30,12 @@
       return String(v);
     }
   };
-  const log = (...args) => {
-    hostLog(args.map(show).join(" "));
-  };
+  const logAt =
+    (level) =>
+    (...args) => {
+      hostLog(args.map(show).join(" "), level);
+    };
+  const log = logAt("info");
 
   const group = (digits) => digits.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
   const number = (n, decimals = 0) => {
@@ -56,7 +59,12 @@
   const percent = (fraction, decimals = 0) => number(Number(fraction) * 100, decimals) + "%";
   g.format = Object.freeze({ number, money, percent });
 
-  g.console = Object.freeze({ log });
+  g.console = Object.freeze({
+    log,
+    info: log,
+    warn: logAt("warn"),
+    error: logAt("error"),
+  });
 
   g.fetch = async function fetch(url, init = {}) {
     const headers = Object.entries(init.headers ?? {}).map(([k, v]) => [String(k), String(v)]);
